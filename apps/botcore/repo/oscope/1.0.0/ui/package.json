@@ -1,0 +1,9 @@
+{
+  "name": "oscope-service-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular UI bundle for the oscope service (Option B) — canvas scope renderer + controls.",
+  "dependencies": { "lucide-react": "^0.344.0" },
+  "rlx": { "entry": "View.tsx", "sdk": "^1.0" }
+}

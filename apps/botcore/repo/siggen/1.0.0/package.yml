@@ -1,0 +1,35 @@
+name: siggen
+title: Signal Generator
+description: |
+  Bus signal / function generator. Emits configurable waveforms —
+  sine, square, triangle, sawtooth, noise, DC, and a digital clock — on
+  per-channel topics (/siggen/{id}/ch/{waveId} → {value, ts}). A bench
+  function-generator for the bus: pair it with the oscope service to
+  exercise traces + triggers without any hardware, or drive any other
+  consumer.
+
+  Implements the signal_source capability — list_signals advertises the
+  streaming topics so a consumer's channel picker can discover them.
+  Pure-Python (stdlib math/random); runs in its own subprocess venv.
+language: python
+status: development
+author: CloudSeeder
+tags: [signal, generator, test, waveform, signal_source]
+icon: icon.svg
+
+implements: [signal_source]
+
+# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md).
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/siggen/1.0.0"
+
+entry:
+  argv: [python, -m, siggen_service]

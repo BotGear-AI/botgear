@@ -1,0 +1,39 @@
+name: oscope
+title: Oscilloscope
+description: |
+  An oscilloscope for the bus. Each channel binds to any signal — a
+  generic (topic, field) pair — so it plots arduino/raspi pins, joystick
+  axes, siggen waves, or any sensor, digital or analog. Traces render on
+  a canvas (analog overlaid, digital as stacked logic rows) with a
+  timebase, cursors, and measurements.
+
+  Edge/level triggering is evaluated in the service and PUBLISHED on the
+  bus (/oscope/{id}/trigger), so a trigger becomes a first-class signal
+  other services (brain, scripts, servos) can react to — a trigger-out
+  for the whole runtime. run / stop / single-shot supported.
+
+  requires the signal_source capability for source discovery, but any
+  streaming topic works via manual (topic, field) binding. Subprocess
+  service; pure-Python.
+language: python
+status: development
+author: CloudSeeder
+tags: [instrument, oscilloscope, scope, signal, trigger]
+icon: icon.svg
+
+requires: [signal_source]
+
+# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md).
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/oscope/1.0.0"
+
+entry:
+  argv: [python, -m, oscope_service]
