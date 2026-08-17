@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rlx_input"
 version = "0.1.0"
-description = "Shared keyboard (and future mouse/gamepad) capability for botcore: the KeyboardServiceBase control interface (capture/scope/suppress + keymap→bus-action bindings) + the canonical key-event schema every keyboard service type publishes, so their bus shape can't drift across browser- and host-captured backends."
+description = "Shared keyboard (and future mouse/gamepad) capability for botgear: the KeyboardServiceBase control interface (capture/scope/suppress + keymap→bus-action bindings) + the canonical key-event schema every keyboard service type publishes, so their bus shape can't drift across browser- and host-captured backends."
 requires-python = ">=3.10"
 # No hard deps: rlx_bus (SubprocessService/ServiceConfig) and pydantic are
 # already installed into every service venv by runtime/installer.py before

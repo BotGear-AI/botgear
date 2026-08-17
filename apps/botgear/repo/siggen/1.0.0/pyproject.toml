@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "siggen_service"
+version = "1.0.0"
+description = "botgear siggen service — a bus signal/function generator (sine/square/triangle/sawtooth/noise/dc/clock). Implements the signal_source capability so a scope can discover + plot it. Pure-Python; no hardware."
+requires-python = ">=3.10"
+dependencies = [
+    # rlx_bus (WebSocket bus client) is pre-installed into every
+    # subprocess venv by runtime/installer.py. Waveforms need only the
+    # stdlib (math/random), so there are no extra runtime deps.
+]
+
+[project.scripts]
+siggen_service = "siggen_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rlx_bus"
 version = "0.1.0"
-description = "WebSocket bus client for botcore subprocess services. Provides BusClient for connecting back to the parent backend's /v1/ws endpoint, subscribing to topics, and publishing messages — with auto-reconnect and a bounded outbound queue that buffers publishes while disconnected."
+description = "WebSocket bus client for botgear subprocess services. Provides BusClient for connecting back to the parent backend's /v1/ws endpoint, subscribing to topics, and publishing messages — with auto-reconnect and a bounded outbound queue that buffers publishes while disconnected."
 requires-python = ">=3.10"
 dependencies = [
     "websockets>=12,<14",

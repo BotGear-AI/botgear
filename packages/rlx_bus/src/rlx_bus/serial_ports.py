@@ -47,7 +47,7 @@ def scan_port_holders() -> Dict[str, List[Dict[str, Any]]]:
                            "name": "python"}, ...]}
 
     ``proxy_id`` is recovered from the process's
-    ``BOTCORE_PROXY_ID`` env var (set by the runtime's
+    ``BOTGEAR_PROXY_ID`` env var (set by the runtime's
     ``process_manager.py`` when spawning a subprocess service).
     ``service_type`` is parsed out of cmdline (it's the python
     ``-m`` module name like ``arduino_service``). Non-RLX
@@ -111,7 +111,7 @@ def scan_port_holders() -> Dict[str, List[Dict[str, Any]]]:
                     with open(f"{proc_dir}/{entry}/environ", "rb") as fh:
                         env_blob = fh.read()
                     for var in env_blob.split(b"\x00"):
-                        if var.startswith(b"BOTCORE_PROXY_ID="):
+                        if var.startswith(b"BOTGEAR_PROXY_ID="):
                             proxy_id = var.split(b"=", 1)[1].decode("utf-8", "replace")
                             break
                 except (FileNotFoundError, PermissionError):

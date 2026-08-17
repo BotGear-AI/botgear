@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rlx_audio"
 version = "0.1.0"
-description = "Shared audio capabilities for botcore: microphone (capture), speaker (playback), and speech (text-to-speech) service bases + the canonical audio-frame schema they all share, so their bus shape can't drift."
+description = "Shared audio capabilities for botgear: microphone (capture), speaker (playback), and speech (text-to-speech) service bases + the canonical audio-frame schema they all share, so their bus shape can't drift."
 requires-python = ">=3.10"
 # No hard deps: rlx_bus (SubprocessService/ServiceConfig) and pydantic are
 # already installed into every service venv by runtime/installer.py before

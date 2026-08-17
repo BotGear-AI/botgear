@@ -18,7 +18,7 @@ import jwt
 logger = logging.getLogger(__name__)
 
 # The single source of truth for the public dev fallback secret. Every consumer
-# (the signer here, server.py's refresh-token hasher, botcore's subprocess
+# (the signer here, server.py's refresh-token hasher, botgear's subprocess
 # auth, etc.) MUST resolve through get_jwt_secret() rather than re-typing this
 # literal, so the fallback can never drift between call sites.
 FALLBACK_JWT_SECRET = "fallback_dev_key"

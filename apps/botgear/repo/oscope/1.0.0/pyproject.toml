@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oscope_service"
+version = "1.0.0"
+description = "botgear oscope service — an oscilloscope for the bus. Binds channels to any (topic, field) signal, ring-buffers + triggers them, publishes trigger events, and streams sample frames to a canvas trace UI. Pure-Python."
+requires-python = ">=3.10"
+dependencies = [
+    # rlx_bus is pre-installed into every subprocess venv by
+    # runtime/installer.py. The scope needs only the stdlib.
+]
+
+[project.scripts]
+oscope_service = "oscope_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

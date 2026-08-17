@@ -1,4 +1,4 @@
-"""Shared audio-device capability for botcore — microphones + speakers.
+"""Shared audio-device capability for botgear — microphones + speakers.
 
 Two capabilities, one shared control interface so a host-captured and a
 browser-captured device of the same kind are interchangeable:
@@ -362,7 +362,7 @@ class MicrophoneServiceBase(AudioDeviceServiceBase):
         return {"path": path, "bytes": nbytes, "duration_s": round(dur, 2)}
 
     def _recordings_dir(self) -> Path:
-        base = os.environ.get("BOTCORE_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
+        base = os.environ.get("BOTGEAR_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
         return Path(base) / "recordings"
 
     def _fresh_suggested_path(self) -> str:
@@ -1129,7 +1129,7 @@ class SpeechServiceBase(SubprocessService):
 
     @property
     def cache_dir(self) -> Path:
-        base = os.environ.get("BOTCORE_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
+        base = os.environ.get("BOTGEAR_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
         return Path(base) / self._type_name
 
     @property
@@ -1667,7 +1667,7 @@ class SttServiceBase(SubprocessService):
 
     @property
     def models_dir(self) -> Path:
-        base = os.environ.get("BOTCORE_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
+        base = os.environ.get("BOTGEAR_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
         return Path(base) / self._type_name / "models"
 
     @property

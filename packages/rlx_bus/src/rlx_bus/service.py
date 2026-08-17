@@ -1,6 +1,6 @@
 """SubprocessService — base class for subprocess services.
 
-Mirrors the shape of ``botcore.framework.Service`` so writing an
+Mirrors the shape of ``botgear.framework.Service`` so writing an
 in-process service and writing a subprocess service feels the same:
 
   * subclass and override ``on_start`` / ``on_stop``
@@ -11,7 +11,7 @@ in-process service and writing a subprocess service feels the same:
 
 The class handles the boilerplate every subprocess used to do by hand:
 
-  * read ``BOTCORE_PROXY_ID`` + ``BOTCORE_SERVICE_META_ID`` from
+  * read ``BOTGEAR_PROXY_ID`` + ``BOTGEAR_SERVICE_META_ID`` from
     env to derive identity + namespace
   * build a BusClient from env (token + backend URL)
   * register a retained hello announcement on
@@ -58,7 +58,7 @@ class SubprocessService:
 
     Class attributes you can override:
       * ``type_name``     — namespace for topics. Default: parsed from
-                            ``BOTCORE_SERVICE_META_ID`` (``arduino@1.0.0``
+                            ``BOTGEAR_SERVICE_META_ID`` (``arduino@1.0.0``
                             → ``arduino``). Falls back to ``proxy_id``.
       * ``heartbeat_interval_s`` — if > 0, base class publishes a
                             ``{ts: float}`` to ``/<type>/<proxy_id>/heartbeat``
@@ -94,7 +94,7 @@ class SubprocessService:
         # to /service_proxy/{id}/config_state and rebuilds this with the
         # backend's persisted values BEFORE on_start runs.
         self.config: ServiceConfig = self.config_class()
-        self.service_meta_id = os.environ.get("BOTCORE_SERVICE_META_ID")
+        self.service_meta_id = os.environ.get("BOTGEAR_SERVICE_META_ID")
         # type_name precedence: subclass override > parsed from meta id
         # > proxy_id (so a malformed env still produces a usable topic).
         cls_name = type(self).type_name
@@ -208,7 +208,7 @@ class SubprocessService:
         # Publish the discovery announcement so consumers can find this
         # stream without having to call /v1/stream. Retained so a late
         # subscriber gets the announcement immediately.
-        backend_url = os.environ.get("BOTCORE_BACKEND_URL") or ""
+        backend_url = os.environ.get("BOTGEAR_BACKEND_URL") or ""
         # Strip trailing slash + derive the http endpoint URL for each
         # transport. Hostname form survives docker-bridge IP changes.
         http_base = backend_url.rstrip("/")
@@ -252,7 +252,7 @@ class SubprocessService:
             "type": self._type_name,
             "version": type_version,
             "transport": "subprocess",
-            "runtime_id": os.environ.get("BOTCORE_RUNTIME_ID"),
+            "runtime_id": os.environ.get("BOTGEAR_RUNTIME_ID"),
             "pid": os.getpid(),
             "topics_root": f"/{self._type_name}/{self.proxy_id}",
             "topics": {
@@ -459,7 +459,7 @@ class SubprocessService:
 
     @classmethod
     async def _async_main(cls: Type["SubprocessService"]) -> int:
-        proxy_id = os.environ.get("BOTCORE_PROXY_ID", "?")
+        proxy_id = os.environ.get("BOTGEAR_PROXY_ID", "?")
         print(f"[{cls.__name__}] starting (proxy={proxy_id}, pid={os.getpid()})")
 
         bus = from_env()

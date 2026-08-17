@@ -1,4 +1,4 @@
-"""rlx_audio — shared audio-device capabilities for botcore services.
+"""rlx_audio — shared audio-device capabilities for botgear services.
 
     AudioDeviceServiceBase  common control interface (list/select/connect/
                             disconnect/mute/unmute/set_params + state).

@@ -1,4 +1,4 @@
-"""Shared keyboard capability for botcore.
+"""Shared keyboard capability for botgear.
 
 One control surface + one published event shape so a browser-captured and a
 host-captured keyboard are interchangeable to any consumer:

@@ -1,4 +1,4 @@
-"""Shared servo↔joint calibration — one primitive for every botcore
+"""Shared servo↔joint calibration — one primitive for every botgear
 service that drives or mirrors hardware servos (ik_solver,
 robot_kinematics, …).
 

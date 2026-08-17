@@ -62,7 +62,7 @@ class LocalAuthProvider(AuthProvider):
         # Optional data_dir for admin_password.txt co-location. Pulled
         # from the config dict (which is typically ``settings.model_dump()``)
         # so apps that already declare ``data_dir`` in their pydantic
-        # settings (continuous_mfa, botcore, …) get instance-local
+        # settings (continuous_mfa, botgear, …) get instance-local
         # password isolation without touching this constructor.
         self._data_dir = config.get("data_dir") if isinstance(config, dict) else None
 

@@ -1,6 +1,6 @@
 # rlx_bus
 
-WebSocket bus client for botcore subprocess services.
+WebSocket bus client for botgear subprocess services.
 
 Subprocess services use this to publish + subscribe to the parent
 backend's pub/sub bus from their own Python process. The wire grammar
@@ -24,8 +24,8 @@ pip install -e packages/rlx_bus
 ```python
 from rlx_bus import BusClient, from_env
 
-bus = from_env()                  # reads BOTCORE_SUBPROCESS_TOKEN
-                                  # + BOTCORE_BACKEND_URL
+bus = from_env()                  # reads BOTGEAR_SUBPROCESS_TOKEN
+                                  # + BOTGEAR_BACKEND_URL
 await bus.connect()
 
 # Subscribe (handler may be sync or async)
@@ -53,5 +53,5 @@ inbound:   {method: 'message' | 'ack' | 'error', topic, payload, ...}
 ## Auth
 
 The backend mints a long-lived JWT at boot and passes it via
-`BOTCORE_SUBPROCESS_TOKEN`. Same `JWT_SECRET_KEY` as user tokens,
+`BOTGEAR_SUBPROCESS_TOKEN`. Same `JWT_SECRET_KEY` as user tokens,
 same decode path on `/v1/ws`.

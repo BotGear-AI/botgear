@@ -231,11 +231,11 @@ def from_env(
     resolution: Optional[Tuple[int, int]] = None,
     fps: Optional[float] = None,
 ) -> Optional[Stream]:
-    """Construct a Stream from ``BOTCORE_BACKEND_URL`` +
-    ``BOTCORE_SUBPROCESS_TOKEN`` env vars — the same ones BusClient
+    """Construct a Stream from ``BOTGEAR_BACKEND_URL`` +
+    ``BOTGEAR_SUBPROCESS_TOKEN`` env vars — the same ones BusClient
     reads. Returns None when either isn't set (no runtime → no stream)."""
-    backend_url = os.environ.get("BOTCORE_BACKEND_URL")
-    token = os.environ.get("BOTCORE_SUBPROCESS_TOKEN")
+    backend_url = os.environ.get("BOTGEAR_BACKEND_URL")
+    token = os.environ.get("BOTGEAR_SUBPROCESS_TOKEN")
     if not backend_url or not token:
         return None
     return Stream(

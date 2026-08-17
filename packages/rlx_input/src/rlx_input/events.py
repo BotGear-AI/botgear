@@ -1,4 +1,4 @@
-"""Canonical key-event schema + keymap matching for botcore keyboards.
+"""Canonical key-event schema + keymap matching for botgear keyboards.
 
 Every keyboard service type — browser-captured or host-captured — publishes
 the SAME event shape on ``/keyboard/{id}/event`` so a consumer (teleop,

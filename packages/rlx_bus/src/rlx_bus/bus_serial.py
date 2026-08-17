@@ -1,5 +1,5 @@
 """Bus-backed serial port — a pyserial-compatible object whose
-reads + writes flow through a botcore ``serial`` service rather
+reads + writes flow through a botgear ``serial`` service rather
 than the OS device directly.
 
 Why

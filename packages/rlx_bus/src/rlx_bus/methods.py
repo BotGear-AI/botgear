@@ -6,7 +6,7 @@ stores metadata on the method object without changing behaviour, so
 direct Python calls still work the same.
 
 This module is the canonical home of the decorator. The backend's
-``botcore.framework.methods`` re-exports it so in-process services
+``botgear.framework.methods`` re-exports it so in-process services
 (``framework.Service`` subclasses) and subprocess services
 (``rlx_bus.SubprocessService`` subclasses) share one definition.
 """

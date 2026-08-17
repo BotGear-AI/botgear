@@ -1,4 +1,4 @@
-"""WebSocket bus client used by botcore subprocess services.
+"""WebSocket bus client used by botgear subprocess services.
 
 Speaks the same wire grammar as the browser UI's wsClient:
 
@@ -10,7 +10,7 @@ disconnected don't drop on the floor — they're flushed on reconnect.
 Subscriptions are also remembered and re-sent after a reconnect.
 
 Auth is the ``?token=`` query param. The backend mints a long-lived JWT
-at boot and passes it via BOTCORE_SUBPROCESS_TOKEN. The /v1/ws
+at boot and passes it via BOTGEAR_SUBPROCESS_TOKEN. The /v1/ws
 endpoint decodes it through the same path it uses for browser user
 tokens, so no server-side auth changes are needed to add subprocess
 clients.
@@ -445,11 +445,11 @@ def from_env() -> Optional[BusClient]:
     Returns None when the env isn't present — typically because the
     subprocess wasn't launched by the backend (e.g. local dev runs).
     """
-    token = os.environ.get("BOTCORE_SUBPROCESS_TOKEN")
-    backend = os.environ.get("BOTCORE_BACKEND_URL")
+    token = os.environ.get("BOTGEAR_SUBPROCESS_TOKEN")
+    backend = os.environ.get("BOTGEAR_BACKEND_URL")
     if not token or not backend:
         print(
-            "[rlx_bus] missing BOTCORE_SUBPROCESS_TOKEN / BOTCORE_BACKEND_URL "
+            "[rlx_bus] missing BOTGEAR_SUBPROCESS_TOKEN / BOTGEAR_BACKEND_URL "
             "— subprocess has no bus access",
             file=sys.stderr,
         )

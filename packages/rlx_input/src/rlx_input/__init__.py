@@ -1,4 +1,4 @@
-"""rlx_input — shared input-device capabilities for botcore services.
+"""rlx_input — shared input-device capabilities for botgear services.
 
     KeyboardServiceBase   common control interface (capture/scope/suppress +
                           keymap→bus-action bindings + canonical event shape).

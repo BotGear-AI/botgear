@@ -1,11 +1,11 @@
-"""rlx_bus — WebSocket bus client + subprocess-service helpers for botcore.
+"""rlx_bus — WebSocket bus client + subprocess-service helpers for botgear.
 
 Public surface:
 
     BusClient            Construct manually with backend_url + token.
     from_env             Build a BusClient from process_manager-injected env vars.
     SubprocessService    Base class for subprocess services. Mirrors
-                         botcore.framework.Service so writing a service
+                         botgear.framework.Service so writing a service
                          feels the same regardless of transport.
     service_method       Decorator marking a callable as bus-routable + discoverable.
     MethodInfo           Per-method metadata returned by ``methods()``.
