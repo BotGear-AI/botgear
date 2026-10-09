@@ -8,8 +8,10 @@ Lifecycle:
   * capture loop reads frames in a worker thread (cv2 blocks), encodes
     to JPEG, pushes through the Stream object. Async-thread bridge keeps
     asyncio happy without polluting the hot path.
-  * /state retained: connected, resolution, observed_fps, dropped frames.
-  * /control accepts connect/disconnect/snapshot/set_resolution.
+  * Wire shape (``VideoState``, ``SnapshotPayload``, the filter pipeline
+    + catalog + index models) is declared below via ``state_schema``/
+    ``topic_schemas`` and introspected into
+    ``/runtime/runtime/types/video``, as are the ``control`` actions.
 
 Subprocess service so cv2's background threads + the V4L2 device handle
 stay isolated from the backend.
@@ -26,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field
 from rlx_bus import ServiceConfig, Stream, SubprocessService, service_method
 
 from .filters import Filter, build_filter, catalog as filter_catalog
@@ -41,7 +44,14 @@ class VideoConfig(ServiceConfig):
       * source       — anything cv2.VideoCapture accepts. Integer (camera
                        index e.g. 0), file path, or URL (rtsp://, http://).
                        Strings that parse as integers are treated as device
-                       indices automatically.
+                       indices automatically. ``stream:<stream_id>`` is a
+                       third form — consumes another service's MJPEG stream
+                       already published on this botgear runtime (e.g. an
+                       OAK-D camera feed: ``stream:oakd/oakd-1/rgb`` — see
+                       ``GET /v1/stream`` for the live id list). Resolved at
+                       connect time via ``_resolve_stream_source`` using
+                       this subprocess's own backend URL + auth token, so
+                       no credential is ever written into persisted config.
       * width/height — target resolution. Camera/codec may snap to nearest
                        supported. Null leaves cv2 default.
       * fps          — target capture fps. Null leaves cv2 default.
@@ -58,19 +68,163 @@ class VideoConfig(ServiceConfig):
     filters: List[Dict[str, Any]] = []
 
 
+_STREAM_SOURCE_PREFIX = "stream:"
+
+
+def _resolve_stream_source(stream_id: str) -> str:
+    """Build an authenticated MJPEG URL for another service's botgear
+    stream (e.g. ``oakd/oakd-1/rgb``). Uses THIS subprocess's own
+    ``BOTGEAR_BACKEND_URL``/``BOTGEAR_SUBPROCESS_TOKEN`` env vars — the
+    same long-lived Admin-scoped token every subprocess already gets from
+    ``process_manager`` (see ``subprocess_auth.py``) to talk to its own
+    bus connection — rather than a token baked into persisted config,
+    which would go stale across a ``JWT_SECRET_KEY`` rotation and sits in
+    a config file otherwise. cv2's ffmpeg backend opens this URL directly;
+    no separate HTTP client needed."""
+    base = os.environ.get("BOTGEAR_BACKEND_URL", "https://localhost:8998")
+    token = os.environ.get("BOTGEAR_SUBPROCESS_TOKEN", "")
+    return f"{base}/v1/stream/{stream_id}/mjpeg?token={token}"
+
+
 def _coerce_source(raw: str) -> Any:
-    """``"0"`` → ``0`` (device index). Everything else passes through."""
+    """``"0"`` → ``0`` (device index). ``"stream:<id>"`` → an authenticated
+    URL for another service's already-published botgear stream. Everything
+    else passes through unchanged (file path, rtsp://, plain http:// with
+    its own embedded auth, etc.)."""
     if raw is None:
         return 0
+    if isinstance(raw, str) and raw.startswith(_STREAM_SOURCE_PREFIX):
+        return _resolve_stream_source(raw[len(_STREAM_SOURCE_PREFIX):])
     try:
         return int(raw)
     except (TypeError, ValueError):
         return raw
 
 
+def _diagnose_open_failure(source: Any, display: Any = None) -> str:
+    """Human-readable reason ``cv2.VideoCapture(source)`` failed to open,
+    for the ``error`` field the UI renders as a red banner
+    (``ui/View.tsx`` reads ``state.error`` directly). cv2 itself only logs
+    a generic native warning to stderr and gives Python nothing — this
+    re-derives the likely cause from the filesystem when ``source`` maps
+    to a local device node, which covers the dominant real-world case:
+    the process's user isn't in the device's owning group (the same class
+    of host-setup gap AGENTS.md documents for ``dialout`` and the OAK-D
+    udev rule — a fresh account almost never has camera-group access
+    either). Best-effort and platform-guarded; never raises.
+
+    ``source`` drives the device-path detection (needs the *resolved*
+    value — an int index or ``/dev/...`` path); ``display`` is what goes
+    in the message text, defaulting to ``source``. Callers resolving a
+    ``stream:`` reference MUST pass the original, token-free config
+    value as ``display`` — the resolved URL embeds a bearer token and
+    must never end up in a user-visible error string."""
+    display = source if display is None else display
+    base = f"cv2.VideoCapture({display!r}) failed to open"
+    path = f"/dev/video{source}" if isinstance(source, int) else str(source)
+    if not path.startswith("/dev/"):
+        return f"{base} — not a local device path; check the URL/host is reachable and the stream format is supported"
+    if not os.path.exists(path):
+        return f"{base} — {path} does not exist (camera unplugged, or wrong index)"
+    try:
+        import grp
+        owner_group = grp.getgrgid(os.stat(path).st_gid).gr_name
+    except Exception:  # noqa: BLE001 — best-effort diagnostic, not core logic
+        owner_group = None
+    if not os.access(path, os.R_OK | os.W_OK):
+        group = owner_group or "the device's owning group"
+        return (
+            f"{base} — permission denied on {path} (owned by group "
+            f"'{group}'; the current user isn't a member). Fix: "
+            f"sudo usermod -aG {group} $USER, then log out/in (or restart "
+            f"this backend under sg {group} -c \"...\") and reconnect — "
+            f"group membership only applies to new processes."
+        )
+    return f"{base} — {path} exists and is readable, so it's likely already open in another process or missing a codec/backend cv2 needs"
+
+
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class VideoState(BaseModel):
+    """Retained on ``/video/{id}/state``."""
+    connected: bool
+    source: Optional[str]
+    resolution: Optional[List[int]] = Field(description="[width, height] actually negotiated")
+    declared_fps: Optional[float]
+    observed_fps: float
+    dropped: int
+    error: Optional[str]
+
+
+class SnapshotPayload(BaseModel):
+    """Published on ``/video/{id}/snapshot`` (event, matched by
+    ``request_id``) and — on success — retained on ``latest_snapshot``."""
+    request_id: Optional[str] = Field(description="Echo of the caller's request_id")
+    ts: float
+    resolution: Optional[List[int]] = Field(None, description="Success only")
+    jpeg_b64: Optional[str] = Field(None, description="Success only")
+    error: Optional[str] = Field(None, description="Failure only")
+
+
+class FilterEntry(BaseModel):
+    """One persisted filter spec, enriched from the catalog."""
+    model_config = ConfigDict(extra="allow")
+    id: Optional[str] = None
+    type: Optional[str] = None
+    enabled: Optional[bool] = None
+    params: Optional[Dict[str, Any]] = None
+    title: Optional[str] = None
+    publishes_telemetry: Optional[bool] = None
+    telemetry_topic: Optional[str] = Field(None, description="Full bus path; set only when publishes_telemetry")
+
+
+class FiltersPayload(BaseModel):
+    """Retained on ``/video/{id}/filters`` — the live pipeline, in order."""
+    filters: List[FilterEntry]
+
+
+class FilterCatalogEntry(BaseModel):
+    type: str
+    title: str
+    description: str
+    publishes_telemetry: bool
+    param_schema: List[Dict[str, Any]]
+    telemetry_schema: Optional[Dict[str, Any]] = Field(description="JSON Schema of /filter/{id} telemetry; null for effect filters")
+
+
+class FilterCatalogPayload(BaseModel):
+    """Retained (and re-announced on reconnect) on ``/video/{id}/filter_catalog``."""
+    filters: List[FilterCatalogEntry]
+
+
+class FilterIndexEntry(BaseModel):
+    """Retained on the GLOBAL ``/filter/index/{filter_id}`` (cleared with
+    null when the filter goes away) — wildcard ``/filter/index/+`` to
+    discover every telemetry filter across every video service."""
+    filter_id: str
+    type: Optional[str]
+    title: Optional[str]
+    video_proxy_id: str
+    runtime_id: Optional[str]
+    telemetry_topic: Optional[str]
+    enabled: bool
+
+
 class VideoService(SubprocessService):
     type_name = "video"
     config_class = VideoConfig
+    publishes = ["state", "snapshot", "latest_snapshot", "filters", "filter_catalog"]
+    state_schema = VideoState
+    topic_schemas = {
+        "snapshot": SnapshotPayload,
+        "latest_snapshot": SnapshotPayload,
+        "filters": FiltersPayload,
+        "filter_catalog": FilterCatalogPayload,
+        # Per-filter telemetry; its shape is per filter type — see that
+        # type's ``telemetry_schema`` in the catalog.
+        "filter/{filter_id}": {"type": "object", "description": "Filter-specific telemetry (see filter_catalog[].telemetry_schema)"},
+        "/filter/index/{filter_id}": FilterIndexEntry,
+    }
     heartbeat_interval_s = 5.0
 
     def __init__(self, proxy_id: str, bus) -> None:
@@ -127,13 +281,13 @@ class VideoService(SubprocessService):
         catalog_topic = self.resolve_topic(self.topic("filter_catalog"))
         self.bus.announce(
             catalog_topic,
-            lambda: {"filters": filter_catalog()},
+            lambda: FilterCatalogPayload(filters=filter_catalog()).model_dump(),
             retained=True,
         )
         # Initial publish for the already-connected case — ``announce``
         # only fires on (re)connect, and we're past the initial connect
         # by the time on_start runs.
-        await self.publish("filter_catalog", {"filters": filter_catalog()}, retained=True)
+        await self.publish("filter_catalog", FilterCatalogPayload(filters=filter_catalog()).model_dump(), retained=True)
 
         # Same pattern for the live filter pipeline — survives runtime
         # restart so the UI's FilterPipeline section gets it back on
@@ -144,7 +298,7 @@ class VideoService(SubprocessService):
         filters_topic = self.resolve_topic(self.topic("filters"))
         self.bus.announce(
             filters_topic,
-            lambda: {"filters": self._filters_announcement()},
+            lambda: FiltersPayload(filters=self._filters_announcement()).model_dump(exclude_unset=True),
             retained=True,
         )
 
@@ -219,15 +373,21 @@ class VideoService(SubprocessService):
             # here on every manual reconnect too.
             await asyncio.sleep(0.5)
 
+        # ``source`` (resolved — may embed a bearer token for a
+        # ``stream:`` reference) is used ONLY for the actual cv2 call.
+        # Every log line / state field / error message uses
+        # ``self.config.source`` (the persisted, token-free form)
+        # instead, so a subprocess-auth token never lands in the bus,
+        # the UI, or this process's stdout log.
         source = _coerce_source(self.config.source)
-        logger.info("%s: opening capture source=%r", self.proxy_id, source)
+        logger.info("%s: opening capture source=%r", self.proxy_id, self.config.source)
         cap = await asyncio.to_thread(cv2.VideoCapture, source)
         if not cap.isOpened():
             self._cap = None
             self._state.update({
                 "connected": False,
-                "source": str(source),
-                "error": f"cv2.VideoCapture({source!r}) failed to open",
+                "source": str(self.config.source),
+                "error": _diagnose_open_failure(source, display=self.config.source),
             })
             await self._publish_state()
             return
@@ -247,7 +407,7 @@ class VideoService(SubprocessService):
         self._cap = cap
         self._state.update({
             "connected": True,
-            "source": str(source),
+            "source": str(self.config.source),
             "resolution": [actual_w, actual_h],
             "declared_fps": actual_fps,
             "error": None,
@@ -450,7 +610,7 @@ class VideoService(SubprocessService):
     # ─── state publish ────────────────────────────────────────────────
 
     async def _publish_state(self) -> None:
-        await self.publish("state", dict(self._state), retained=True)
+        await self.publish("state", VideoState(**self._state).model_dump(), retained=True)
 
     # ─── control actions ──────────────────────────────────────────────
     @service_method("connect")
@@ -519,12 +679,11 @@ class VideoService(SubprocessService):
         """
         frame = self._latest_frame
         if frame is None or not self._state.get("connected"):
-            err_payload = {
-                "request_id": request_id,
-                "ts": time.time(),
-                "error": "no frame available; capture not connected",
-            }
-            await self.publish("snapshot", err_payload)
+            err_payload = SnapshotPayload(
+                request_id=request_id, ts=time.time(),
+                error="no frame available; capture not connected",
+            )
+            await self.publish("snapshot", err_payload.model_dump(exclude_none=True))
             return
 
         ok, buf = await asyncio.to_thread(
@@ -532,20 +691,16 @@ class VideoService(SubprocessService):
             [int(cv2.IMWRITE_JPEG_QUALITY), int(self.config.jpeg_quality)],
         )
         if not ok:
-            err_payload = {
-                "request_id": request_id,
-                "ts": time.time(),
-                "error": "cv2.imencode failed",
-            }
-            await self.publish("snapshot", err_payload)
+            err_payload = SnapshotPayload(request_id=request_id, ts=time.time(), error="cv2.imencode failed")
+            await self.publish("snapshot", err_payload.model_dump(exclude_none=True))
             return
 
-        payload = {
-            "request_id": request_id,
-            "ts": self._latest_frame_ts,
-            "resolution": [int(frame.shape[1]), int(frame.shape[0])],
-            "jpeg_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
-        }
+        payload = SnapshotPayload(
+            request_id=request_id,
+            ts=self._latest_frame_ts,
+            resolution=[int(frame.shape[1]), int(frame.shape[0])],
+            jpeg_b64=base64.b64encode(buf.tobytes()).decode("ascii"),
+        ).model_dump(exclude_none=True)
         # Publish on both topics. The event topic is what triggered
         # callers wait on (matched by request_id). The retained topic is
         # the "latest snapshot" cache for services that come up later.
@@ -647,7 +802,7 @@ class VideoService(SubprocessService):
         filter across every video service in the federation.
         """
         enriched = self._filters_announcement()
-        await self.publish("filters", {"filters": enriched}, retained=True)
+        await self.publish("filters", FiltersPayload(filters=enriched).model_dump(exclude_unset=True), retained=True)
         await self._reconcile_filter_index(enriched)
 
     async def _reconcile_filter_index(self, enriched: List[Dict[str, Any]]) -> None:
@@ -663,19 +818,16 @@ class VideoService(SubprocessService):
             if not fid or not s.get("publishes_telemetry"):
                 continue
             new_ids.add(fid)
-            await self.bus.publish(
-                f"/filter/index/{fid}",
-                {
-                    "filter_id": fid,
-                    "type": s.get("type"),
-                    "title": s.get("title"),
-                    "video_proxy_id": self.proxy_id,
-                    "runtime_id": os.environ.get("BOTGEAR_RUNTIME_ID"),
-                    "telemetry_topic": s.get("telemetry_topic"),
-                    "enabled": bool(s.get("enabled", True)),
-                },
-                retained=True,
+            entry = FilterIndexEntry(
+                filter_id=fid,
+                type=s.get("type"),
+                title=s.get("title"),
+                video_proxy_id=self.proxy_id,
+                runtime_id=os.environ.get("BOTGEAR_RUNTIME_ID"),
+                telemetry_topic=s.get("telemetry_topic"),
+                enabled=bool(s.get("enabled", True)),
             )
+            await self.bus.publish(f"/filter/index/{fid}", entry.model_dump(), retained=True)
         # Clear entries for filters that are gone (removed, or no longer
         # publishing telemetry after a type/config change).
         gone = self._filter_index_ids - new_ids

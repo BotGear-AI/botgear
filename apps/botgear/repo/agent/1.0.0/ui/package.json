@@ -1,0 +1,9 @@
+{
+  "name": "agent-service-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular UI bundle for the agent service (Option B) — run checked agent workflows, follow live runs, read reports.",
+  "dependencies": { "lucide-react": "^0.344.0" },
+  "rlx": { "entry": "View.tsx", "sdk": "^1.0" }
+}

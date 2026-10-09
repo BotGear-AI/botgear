@@ -168,7 +168,7 @@ def test_connect_peer_returns_pre_identification_state(seeded_runtime, monkeypat
 
     monkeypatch.setattr(
         "botgear.services.peer_service.peer_manager.connect",
-        lambda url: fake_pc,
+        lambda url, secret=None: fake_pc,
     )
     monkeypatch.setattr(
         "botgear.services.peer_service.peer_manager.peers",
@@ -193,7 +193,7 @@ def test_connect_peer_propagates_failures(monkeypatch):
     raises 500 with the error message — not a silent success."""
     from fastapi import HTTPException
 
-    def _boom(url):
+    def _boom(url, secret=None):
         raise ValueError("bad url")
     monkeypatch.setattr(
         "botgear.services.peer_service.peer_manager.connect", _boom)
@@ -204,11 +204,122 @@ def test_connect_peer_propagates_failures(monkeypatch):
     assert "bad url" in str(exc.value.detail)
 
 
+def test_connect_peer_with_secret_uses_option_b(seeded_runtime, monkeypatch, captured_peers):
+    """A 'secret' in the connect payload is passed straight through to
+    peer_manager.connect, and the persisted entry becomes {url, secret}
+    instead of a bare URL string — so a restart reconnects with the
+    SAME credential rather than silently downgrading to Option A."""
+    fake_pc = MagicMock()
+    fake_pc.remote_id = "worke"
+    fake_pc.url = "wss://worke.local:8998/v1/ws"
+    fake_pc.state = PeerState.CONNECTED
+
+    received: Dict[str, Any] = {}
+    def _connect(url, secret=None):
+        received["url"], received["secret"] = url, secret
+        return fake_pc
+    monkeypatch.setattr("botgear.services.peer_service.peer_manager.connect", _connect)
+    monkeypatch.setattr(
+        "botgear.services.peer_service.peer_manager.peers",
+        lambda: {"worke": {
+            "url": "wss://worke.local:8998/v1/ws", "remote_id": "worke",
+            "state": "connected", "upstream_subs": [], "auth": "api_key",
+        }},
+    )
+    monkeypatch.setattr(
+        "botgear.services.peer_service.peer_manager.peer_secret",
+        lambda url: "the-paired-secret",
+    )
+
+    out = peer_service.process_peer_request(
+        {"action": "connect", "url": "wss://worke.local:8998", "secret": "the-paired-secret"},
+        None, None,
+    )
+    assert received["url"] == "wss://worke.local:8998"
+    assert received["secret"] == "the-paired-secret"
+    assert out["metadata"]["auth"] == "api_key"
+    assert captured_peers["peers"] == [
+        {"url": "wss://worke.local:8998/v1/ws", "secret": "the-paired-secret"}
+    ]
+
+
+def test_connect_peer_without_secret_persists_bare_url(seeded_runtime, monkeypatch, captured_peers):
+    """No secret supplied — Option A, persisted entry stays a bare
+    URL string (backward-compatible shape, what boot autoconnect's
+    legacy branch expects)."""
+    fake_pc = MagicMock()
+    fake_pc.remote_id = "worke"
+    fake_pc.url = "wss://worke.local:8998/v1/ws"
+    fake_pc.state = PeerState.CONNECTED
+    monkeypatch.setattr(
+        "botgear.services.peer_service.peer_manager.connect",
+        lambda url, secret=None: fake_pc,
+    )
+    monkeypatch.setattr(
+        "botgear.services.peer_service.peer_manager.peers",
+        lambda: {"worke": {"url": "wss://worke.local:8998/v1/ws", "remote_id": "worke",
+                            "state": "connected", "upstream_subs": [], "auth": "shared_secret"}},
+    )
+    monkeypatch.setattr(
+        "botgear.services.peer_service.peer_manager.peer_secret", lambda url: None,
+    )
+
+    out = peer_service.process_peer_request(
+        {"action": "connect", "url": "wss://worke.local:8998"}, None, None)
+    assert out["metadata"]["auth"] == "shared_secret"
+    assert captured_peers["peers"] == ["wss://worke.local:8998/v1/ws"]
+
+
+def test_mint_peer_credential_creates_api_client_and_returns_secret(fresh_db):
+    out = peer_service.process_peer_request(
+        {"action": "mint_peer_credential", "label": "worke"}, None, None)
+    meta = out["metadata"]
+    assert meta["status"] == "success"
+    assert meta["label"] == "worke"
+    assert isinstance(meta["secret"], str) and len(meta["secret"]) > 20
+
+    rows = fresh_db.tables["api_client"]
+    assert len(rows) == 1
+    row = next(iter(rows.values()))
+    assert row["name"] == "peer:worke"
+    assert row["roles"] == ["Admin"]
+    assert row["secret"] == meta["secret"]
+
+
+def test_mint_peer_credential_requires_label():
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        peer_service.process_peer_request({"action": "mint_peer_credential"}, None, None)
+    assert exc.value.status_code == 400
+
+
 def test_unknown_action_is_400():
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
         peer_service.process_peer_request({"action": "bogus"}, None, None)
     assert exc.value.status_code == 400
+
+
+# ─────────────────────────────────────────────────────────────────────
+# process_peer_request — rescan
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_rescan_delegates_to_mdns_and_reports_restarted(monkeypatch):
+    """rescan rebuilds the mDNS engine in place (see mdns.rescan's
+    docstring — fixes the boot race where Wi-Fi/interfaces come up
+    after the runtime already started + snapshotted zero of them)."""
+    from botgear.runtime import mdns
+    monkeypatch.setattr(mdns, "rescan", lambda: True)
+    result = peer_service.process_peer_request({"action": "rescan"}, None, None)
+    assert result["metadata"] == {"status": "success", "action": "rescan", "restarted": True}
+
+
+def test_rescan_reports_noop_when_mdns_never_started(monkeypatch):
+    from botgear.runtime import mdns
+    monkeypatch.setattr(mdns, "rescan", lambda: False)
+    result = peer_service.process_peer_request({"action": "rescan"}, None, None)
+    assert result["metadata"] == {"status": "noop", "action": "rescan", "restarted": False}
 
 
 # ─────────────────────────────────────────────────────────────────────

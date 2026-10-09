@@ -1,8 +1,16 @@
 allowed:
   # Conversation I/O — the operator's channel into this workflow. Text via
-  # chat, or audio via stt_local.listen (in) + speech_local.speak (out);
-  # whichever is running is surfaced. Each topic root needs its own rule.
+  # chat/discord/slack/google_chat (the `messaging` capability — see
+  # docs/TODO_MESSAGING.md), or audio via stt_local.listen (in) +
+  # speech_local.speak (out); whichever is running is surfaced. Each
+  # topic root needs its own rule.
   - topic: /chat/*/control
+    actions: [listen, speak]
+  - topic: /discord/*/control
+    actions: [listen, speak]
+  - topic: /slack/*/control
+    actions: [listen, speak]
+  - topic: /google_chat/*/control
     actions: [listen, speak]
   - topic: /speech/*/control
     actions: [speak]

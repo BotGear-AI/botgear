@@ -17,8 +17,11 @@ from typing import Dict, List, Optional
 
 import yaml
 
+from botgear.agent_surface.excludes import shared_excludes
+from botgear.agent_surface.policy import load_policy_file
+
 from brain.schemas import (
-    AllowedTools, ExitOnPhrase, LoopOnTimeout, RunConfiguration,
+    AllowedTools, EchoFilter, ExitOnPhrase, LoopBreaker, LoopOnTimeout, RunConfiguration,
     ToolPattern, ToolTerminationCondition,
     Workflow, WorkflowInput, WorkflowStep,
 )
@@ -155,11 +158,16 @@ def _load_workflow_dir(name: str, wf_dir: Path) -> Workflow:
     if isinstance(eop_raw, dict):
         eop_matches = eop_raw.get("matches")
         if isinstance(eop_matches, list) and all(isinstance(m, str) for m in eop_matches):
+            eop_listen_topic = eop_raw.get("listen_topic")
+            if isinstance(eop_listen_topic, list) and not all(isinstance(t, str) for t in eop_listen_topic):
+                eop_listen_topic = None  # malformed list entry — coerce to None like any other bad field
+            elif not isinstance(eop_listen_topic, (str, list)):
+                eop_listen_topic = None
             exit_on_phrase = ExitOnPhrase(
                 matches=eop_matches,
                 case_insensitive=bool(eop_raw.get("case_insensitive", True)),
                 whole_message=bool(eop_raw.get("whole_message", True)),
-                listen_topic=eop_raw.get("listen_topic") if isinstance(eop_raw.get("listen_topic"), str) else None,
+                listen_topic=eop_listen_topic,
             )
 
     # Loop-on-timeout fast-path (LoopOnTimeout).
@@ -172,6 +180,24 @@ def _load_workflow_dir(name: str, wf_dir: Path) -> Workflow:
                 field=lot_raw["field"],
                 value=lot_raw.get("value"),
             )
+
+    # Self-echo backstop (EchoFilter). ``echo_filter: false`` disables it;
+    # a mapping overrides individual knobs; anything else keeps defaults.
+    ef_raw = raw.get("echo_filter")
+    if ef_raw is False:
+        echo_filter = EchoFilter(enabled=False)
+    elif isinstance(ef_raw, dict):
+        echo_filter = EchoFilter(**{k: v for k, v in ef_raw.items() if k in EchoFilter.model_fields})
+    else:
+        echo_filter = EchoFilter()
+
+    lb_raw = raw.get("loop_breaker")
+    if lb_raw is False:
+        loop_breaker = LoopBreaker(enabled=False)
+    elif isinstance(lb_raw, dict):
+        loop_breaker = LoopBreaker(**{k: v for k, v in lb_raw.items() if k in LoopBreaker.model_fields})
+    else:
+        loop_breaker = LoopBreaker()
 
     # ``preferred_backend`` (since 2026-06-04) replaces the legacy
     # ``model`` field which was misnamed — it picked the adapter
@@ -194,11 +220,22 @@ def _load_workflow_dir(name: str, wf_dir: Path) -> Workflow:
         configurations=configurations,
         exit_on_phrase=exit_on_phrase,
         loop_on_timeout=loop_on_timeout,
+        speak_wait=bool(raw.get("speak_wait", True)),
+        echo_filter=echo_filter,
+        loop_breaker=loop_breaker,
+        resume_on_done=bool(raw.get("resume_on_done", True)),
+        stamp_time=bool(raw.get("stamp_time", True)),
+        fast_reflex=bool(raw.get("fast_reflex", False)),
+        lazy_tools_threshold=int(raw.get("lazy_tools_threshold", 120)),
         message_window_size=raw.get("message_window_size") if isinstance(raw.get("message_window_size"), int) else None,
         max_steps=int(raw.get("max_steps", 8)),
         timeout_seconds=int(raw.get("timeout_seconds", 120)),
         max_tokens_per_run=raw.get("max_tokens_per_run"),
         requires_human_approval=bool(raw.get("requires_human_approval", False)),
+        lazy_tools=bool(raw.get("lazy_tools", False)),
+        always_loaded_prefixes=[
+            p for p in (raw.get("always_loaded_prefixes") or []) if isinstance(p, str)
+        ],
         inputs=inputs,
         steps=steps,
         context=list(raw.get("context") or []),
@@ -210,17 +247,18 @@ def _load_workflow_dir(name: str, wf_dir: Path) -> Workflow:
     )
 
 
+def _load_shared_excludes() -> List[ToolPattern]:
+    """The hard excludes every ``default_policy: allow`` workflow inherits.
+    They're botgear-wide (they bind every mind, not just brain), so they
+    live in ``botgear/agent_surface/excludes.py``."""
+    return shared_excludes()
+
+
 def _load_allowed_tools(path: Path) -> AllowedTools:
-    if not path.is_file():
-        # Default-deny — no allowed list, no blocked list. Workflow
-        # without a allowed_tools.yaml can't call ANYTHING. That's a
-        # safe + obvious failure mode for a misconfigured workflow.
-        return AllowedTools()
-    raw = yaml.safe_load(path.read_text()) or {}
-    return AllowedTools(
-        allowed=[ToolPattern(**p) for p in (raw.get("allowed") or [])],
-        blocked=[ToolPattern(**p) for p in (raw.get("blocked") or [])],
-    )
+    """Parse a workflow's ``allowed_tools.yaml`` (missing = default-deny,
+    nothing callable). ``default_policy: allow`` merges in the shared hard
+    excludes — see ``botgear.agent_surface.policy.policy_from_dict``."""
+    return load_policy_file(path)
 
 
 def _read_optional(path: Path) -> str:

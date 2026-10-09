@@ -5,15 +5,13 @@ Wraps the existing ``runtime/script_runner.py`` so script execution is
 addressable through the bus instead of only via the
 ``POST /v1/script/{id}/run`` HTTP endpoint.
 
-Bus topics
-----------
-
-  /python/{id}/state    retained — {scripts: [...], recent_runs: [...]}
-  /python/{id}/output             — {run_id, stream: 'stdout'|'stderr'|'meta',
-                                     line/event/...}; one msg per script line
-  /python/{id}/result             — {run_id, exit_code, duration_ms, ts}
-                                    published when a run finishes (or times out)
-  /python/{id}/control            — incoming @service_method actions
+Wire shape is declared in code below (``PythonState``,
+``OutputPayload``, ``ResultPayload`` via ``state_schema``/
+``topic_schemas``) — introspected into ``/runtime/runtime/types/python``.
+``control`` actions are discoverable the same way, off their
+@service_method signatures. ``output`` is actually published by
+``runtime/script_runner.py`` onto this service's topic; its model here
+documents that runner's frames.
 
 Shares storage with the legacy Scripts page (the ``script`` TinyDB
 table) — scripts created there appear here, and vice versa.
@@ -31,6 +29,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, ConfigDict, Field
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -51,10 +50,62 @@ class PythonConfig(ServiceConfig):
     pass
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class RunRecord(BaseModel):
+    """One entry of ``/state``'s ``recent_runs`` (newest first, capped
+    at RECENT_RUNS_LIMIT). Terminal fields fill in when the run ends."""
+    run_id: str
+    script_name: Optional[str]
+    script_id: Optional[str]
+    started_at: float
+    status: str = Field(description="'running' | 'completed' | 'timeout' | 'error'")
+    timeout_s: float
+    exit_code: Optional[int] = None
+    duration_ms: Optional[int] = None
+    finished_at: Optional[float] = None
+
+
+class PythonState(BaseModel):
+    """Retained on ``/python/{id}/state``. ``scripts`` are raw rows of
+    the shared ``script`` table (see the Scripts page) — shape owned
+    there, not here."""
+    scripts: List[Dict[str, Any]]
+    recent_runs: List[RunRecord]
+
+
+class OutputPayload(BaseModel):
+    """Published on ``/python/{id}/output`` by script_runner — one frame
+    per stdout/stderr line, plus ``meta`` lifecycle frames
+    (``start`` → optional ``timeout`` → ``end`` | ``error``). Fields
+    beyond ``stream``/``run_id`` depend on the frame kind."""
+    model_config = ConfigDict(extra="allow")
+    stream: str = Field(description="'stdout' | 'stderr' | 'meta'")
+    run_id: str
+    line: Optional[str] = Field(None, description="stdout/stderr frames")
+    event: Optional[str] = Field(None, description="meta frames: 'start' | 'timeout' | 'end' | 'error'")
+    script_id: Optional[str] = Field(None, description="meta start/end")
+    exit_code: Optional[int] = Field(None, description="meta end")
+    elapsed_ms: Optional[int] = Field(None, description="meta end")
+    timeout_seconds: Optional[float] = Field(None, description="meta timeout")
+    error: Optional[str] = Field(None, description="meta error")
+    timestamp: Optional[str] = Field(None, description="ISO-8601, meta start/end")
+
+
+class ResultPayload(BaseModel):
+    """Published on ``/python/{id}/result`` once per run, when it ends."""
+    run_id: str
+    status: str = Field(description="'completed' | 'timeout' | 'error'")
+    exit_code: Optional[int]
+    duration_ms: int
+
+
 class PythonService(Service):
     """Bus-facing wrapper around script_runner. See module docstring."""
 
     config_class = PythonConfig
+    state_schema = PythonState
+    topic_schemas = {"output": OutputPayload, "result": ResultPayload}
     publishes = ["state", "output", "result"]
 
     def __init__(self, meta, config) -> None:
@@ -119,10 +170,11 @@ class PythonService(Service):
 
     # ─── state ───────────────────────────────────────────────────────
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "scripts": self._list_scripts(),
-            "recent_runs": list(self._recent_runs),
-        }
+        state = PythonState(
+            scripts=self._list_scripts(),
+            recent_runs=[RunRecord(**r) for r in self._recent_runs],
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         self.publish("state", self._snapshot(), retained=True)
@@ -390,10 +442,11 @@ class PythonService(Service):
                     entry["duration_ms"] = duration_ms
                     entry["finished_at"] = time.time()
                     break
-            self.publish("result", {
-                "run_id": run_id, "status": status, "exit_code": exit_code,
-                "duration_ms": duration_ms,
-            })
+            result = ResultPayload(
+                run_id=run_id, status=status, exit_code=exit_code,
+                duration_ms=duration_ms,
+            )
+            self.publish("result", result.model_dump())
             await self._publish_state()
             return
 

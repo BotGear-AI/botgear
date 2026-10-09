@@ -2,8 +2,9 @@
 """Unit tests for the joystick subprocess service.
 
 Two layers:
-  * pure poller helpers (quantize_axis, inputs_changed) — the deadzone +
-    change-detection logic that gates what reaches the bus. No pygame.
+  * pure poller helpers (quantize_axis, inputs_changed,
+    should_publish_input) — the deadzone + change-detection +
+    heartbeat logic that gates what reaches the bus. No pygame.
   * JoystickService @service_method actions + poller callbacks, driven
     with a fake poller + no-op bus, so we assert on the state/input the
     service publishes without opening a real device.
@@ -53,6 +54,42 @@ def test_inputs_changed():
     assert poller_mod.inputs_changed(a, b) is True           # a button changed
     c = {**a, "axes": [0.5]}
     assert poller_mod.inputs_changed(a, c) is True           # an axis moved
+
+
+def test_should_publish_input_on_actual_change_regardless_of_heartbeat():
+    a = {"axes": [0.0], "buttons": [0], "hats": [], "balls": []}
+    b = {**a, "axes": [0.5]}
+    # last_publish == now: heartbeat interval hasn't elapsed at all, but
+    # a real change still publishes immediately.
+    assert poller_mod.should_publish_input(
+        a, b, now=10.0, last_publish=10.0, heartbeat_interval_s=0.2,
+    ) is True
+
+
+def test_should_publish_input_suppressed_when_unchanged_and_within_heartbeat():
+    a = {"axes": [0.5], "buttons": [0], "hats": [], "balls": []}
+    assert poller_mod.should_publish_input(
+        a, dict(a), now=10.1, last_publish=10.0, heartbeat_interval_s=0.2,
+    ) is False
+
+
+def test_should_publish_input_heartbeats_a_held_steady_stick():
+    """The bug this exists to fix: a stick held at a CONSTANT non-zero
+    deflection (the ordinary case while driving, not an edge case) must
+    still republish at the heartbeat rate — otherwise a downstream
+    liveness watchdog (motor_control's input_source timeout) sees
+    "unchanged" as "gone silent" and zeros the channel mid-drive."""
+    held = {"axes": [-0.99], "buttons": [0], "hats": [], "balls": []}
+    assert poller_mod.should_publish_input(
+        held, dict(held), now=10.3, last_publish=10.0, heartbeat_interval_s=0.2,
+    ) is True
+
+
+def test_should_publish_input_first_read_always_publishes():
+    a = {"axes": [0.0], "buttons": [0], "hats": [], "balls": []}
+    assert poller_mod.should_publish_input(
+        None, a, now=0.0, last_publish=0.0, heartbeat_interval_s=0.2,
+    ) is True
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -188,3 +225,69 @@ async def test_detach_clears_attachment(js):
 async def test_error_surfaces_in_state(js):
     await js._on_error("attached device disconnected")
     assert _states(js)[-1]["last_error"] == "attached device disconnected"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# auto-connect — background retry loop
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_auto_connect_enable_starts_task_and_persists_config(js):
+    assert js.config.autoreconnect is False
+    await js.m_set_auto_connect(enabled=True)
+    assert js.config.autoreconnect is True
+    assert js._auto_connect_task is not None
+    assert not js._auto_connect_task.done()
+    js._stop_auto_connect_loop()  # don't leak a running task past the test
+
+
+@pytest.mark.asyncio
+async def test_set_auto_connect_disable_stops_task(js):
+    await js.m_set_auto_connect(enabled=True)
+    await js.m_set_auto_connect(enabled=False)
+    assert js.config.autoreconnect is False
+    assert js._auto_connect_task is None
+
+
+@pytest.mark.asyncio
+async def test_detach_stops_auto_connect_task(js):
+    await js.m_set_auto_connect(enabled=True)
+    await js.m_detach()
+    assert js.config.autoreconnect is False
+    assert js._auto_connect_task is None
+
+
+@pytest.mark.asyncio
+async def test_attach_arms_auto_connect_loop(js):
+    await js._on_attached(_DEVICE)
+    assert js._auto_connect_task is not None
+    js._stop_auto_connect_loop()
+
+
+def test_find_reconnect_target_prefers_guid_over_index(js):
+    # Stale index (from before a replug) shouldn't matter once a GUID
+    # match is available at a different index.
+    js.config = js.config.merge_dict({"last_guid": "abc123", "last_index": 7})
+    js._devices = [{**_DEVICE, "index": 3, "guid": "abc123"}]
+    assert js._find_reconnect_target() == 3
+
+
+def test_find_reconnect_target_waits_when_guid_absent(js):
+    js.config = js.config.merge_dict({"last_guid": "abc123", "last_index": 0})
+    js._devices = []  # target not currently plugged in
+    assert js._find_reconnect_target() is None
+
+
+def test_find_reconnect_target_falls_back_to_index_without_guid(js):
+    js.config = js.config.merge_dict({"last_guid": None, "last_index": 2})
+    assert js._find_reconnect_target() == 2
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reports_retrying_when_detached_with_autoreconnect(js):
+    js._device = None
+    js.config = js.config.merge_dict({"autoreconnect": True})
+    assert js._snapshot()["retrying"] is True
+    js.config = js.config.merge_dict({"autoreconnect": False})
+    assert js._snapshot()["retrying"] is False

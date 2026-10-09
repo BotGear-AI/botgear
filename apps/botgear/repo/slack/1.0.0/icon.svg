@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="24" height="24">
+  <title>slack</title>
+  <!-- Generic hash/channel-style chat bubble — deliberately NOT the
+       Slack trademarked logo. Lucide-style, matches every other
+       service icon's stroke convention. -->
+  <path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-8l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" />
+  <path d="M9 8v6" />
+  <path d="M15 8v6" />
+  <path d="M7 10h10" />
+  <path d="M7 12h10" />
+</svg>

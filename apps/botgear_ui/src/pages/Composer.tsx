@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type MouseEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   Background,
@@ -25,7 +25,7 @@ import {
   type Viewport,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { CircleDot, Package, Plus, Share2 } from 'lucide-react'
+import { Package, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, Plus, Share2, SquareDot, X } from 'lucide-react'
 import { useState as useReactState } from 'react'
 
 import { useWsClient, useApiFetch } from '../contexts/ActiveRuntimeContext'
@@ -33,7 +33,7 @@ import Banner from '../components/Banner'
 import InstallProgress, { type InstallProgressState } from '../components/InstallProgress'
 import { useInstallProgress } from '../runtime/useInstallProgress'
 import InstallWizard from '../components/InstallWizard'
-import ConfigWizard from '../components/ConfigWizard'
+import ConfigWizard, { hasConfigSchema } from '../components/ConfigWizard'
 import type { Workspace } from '../models/Workspace'
 import type { ServiceMeta } from '../models/ServiceMeta'
 import type { ServiceProxy } from '../models/ServiceProxy'
@@ -79,6 +79,110 @@ function genId(): string {
 const DRAG_MIME_META = 'application/x-rlx-service-meta'
 const DRAG_MIME_PROXY = 'application/x-rlx-service-proxy'
 
+// Resizable side drawers (Registry left, Inspector right). Each is pulled
+// wider/narrower via a drag handle on its canvas-facing edge. `direction` is
+// which way the pointer moves to WIDEN the panel: +1 when the handle is on
+// the panel's right edge (Registry), -1 when it's on the left (Inspector).
+// `initial` matches the old fixed widths (w-60 / w-72). Widths persist in px.
+interface PanelResizeConfig {
+  storageKey: string
+  min: number
+  max: number
+  initial: number
+  direction: 1 | -1
+}
+const REGISTRY_RESIZE: PanelResizeConfig = { storageKey: 'rlx:composer:registryWidth', min: 180, max: 560, initial: 240, direction: 1 }
+const INSPECTOR_RESIZE: PanelResizeConfig = { storageKey: 'rlx:composer:inspectorWidth', min: 220, max: 560, initial: 288, direction: -1 }
+const clampPanelWidth = (cfg: PanelResizeConfig, w: number) => Math.min(cfg.max, Math.max(cfg.min, Math.round(w)))
+
+interface PanelResize {
+  cfg: PanelResizeConfig
+  width: number
+  resizing: boolean
+  reset: () => void
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => void
+  onKeyDown: (e: ReactKeyboardEvent<HTMLDivElement>) => void
+}
+
+function useResizablePanel(cfg: PanelResizeConfig): PanelResize {
+  const [width, setWidth] = useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem(cfg.storageKey))
+      return Number.isFinite(n) && n > 0 ? clampPanelWidth(cfg, n) : cfg.initial
+    } catch { return cfg.initial }
+  })
+  const [resizing, setResizing] = useState(false)
+  useEffect(() => {
+    try {
+      if (width === cfg.initial) localStorage.removeItem(cfg.storageKey)
+      else localStorage.setItem(cfg.storageKey, String(width))
+    } catch { /* ignore */ }
+  }, [cfg, width])
+
+  const widthRef = useRef(width)
+  widthRef.current = width
+  // Tears down an in-flight drag's window listeners — also runs on unmount
+  // so a drag interrupted by navigation doesn't leak them.
+  const endDragRef = useRef<(() => void) | null>(null)
+  useEffect(() => () => endDragRef.current?.(), [])
+
+  const onPointerDown = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const startX = e.clientX
+    const startWidth = widthRef.current
+    setResizing(true)
+    const onMove = (ev: PointerEvent) =>
+      setWidth(clampPanelWidth(cfg, startWidth + cfg.direction * (ev.clientX - startX)))
+    const end = () => {
+      setResizing(false)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', end)
+      window.removeEventListener('pointercancel', end)
+      endDragRef.current = null
+    }
+    endDragRef.current = end
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', end)
+    window.addEventListener('pointercancel', end)
+  }, [cfg])
+
+  const onKeyDown = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const step = e.shiftKey ? 48 : 16
+    // ArrowRight moves the handle right: widens the Registry, narrows the Inspector.
+    if (e.key === 'ArrowRight') setWidth((w) => clampPanelWidth(cfg, w + cfg.direction * step))
+    else if (e.key === 'ArrowLeft') setWidth((w) => clampPanelWidth(cfg, w - cfg.direction * step))
+    else if (e.key === 'Home') setWidth(cfg.min)
+    else if (e.key === 'End') setWidth(cfg.max)
+    else return
+    e.preventDefault()
+  }, [cfg])
+
+  const reset = useCallback(() => setWidth(cfg.initial), [cfg])
+  return { cfg, width, resizing, reset, onPointerDown, onKeyDown }
+}
+
+// The drag handle itself. Zero layout width (the aside's own border is the
+// visible divider); the ::after widens the grab area to ~8px around it.
+function PanelResizeHandle({ panel, label }: { panel: PanelResize; label: string }) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuemin={panel.cfg.min}
+      aria-valuemax={panel.cfg.max}
+      aria-valuenow={panel.width}
+      tabIndex={0}
+      title="Drag to resize · double-click to reset"
+      onPointerDown={panel.onPointerDown}
+      onDoubleClick={panel.reset}
+      onKeyDown={panel.onKeyDown}
+      className={`relative z-10 w-0 shrink-0 cursor-col-resize touch-none outline-none after:absolute after:inset-y-0 after:-left-1 after:-right-1 after:transition-colors hover:after:bg-sky-500/40 focus-visible:after:bg-sky-500/40 ${panel.resizing ? 'after:bg-sky-500/60' : ''}`}
+    />
+  )
+}
+
 
 // Position record persisted into workspace.node_positions[pid]. Extended
 // with optional width/height so a user's resize survives across reloads
@@ -105,6 +209,11 @@ interface ProxyNodeData extends Record<string, unknown> {
   onAction?: (proxyId: string, action: ProxyAction) => void
   isSingleton?: boolean
   configurable?: boolean
+  // Full-screen slot — see ComposerViewProps for the contract. Lives here
+  // (rather than as view_full-local state) so picking a different service
+  // in the registry while one is maximized can swap the slot to it.
+  isMaximized?: boolean
+  onSetMaximized?: (proxyId: string, maximized: boolean) => void
 }
 
 // Single dispatch point — every shape registered in
@@ -123,6 +232,8 @@ function ProxyNode(props: { data: ProxyNodeData; selected: boolean }) {
     onAction: props.data.onAction,
     isSingleton: props.data.isSingleton,
     configurable: props.data.configurable,
+    isMaximized: props.data.isMaximized,
+    onSetMaximized: props.data.onSetMaximized,
   }
   // Anchor points for derived route edges. Data flows left→right
   // (target handle on the left edge, source on the right). Kept subtle —
@@ -304,51 +415,62 @@ function GhostNode({ data, selected }: { data: GhostNodeData; selected: boolean 
 const NODE_TYPES = { proxy: ProxyNode, ghost: GhostNode }
 
 
-// Layout helper for the Cluster button. Spreads N node positions
-// across concentric hex-style rings around (0, 0):
+// Layout helper for the Grid button. Packs the nodes into a tight rectangle
+// centred on (0, 0):
+// sorted by proxy id (numeric-aware, so "arm-2" < "arm-10"), filled in
+// rows left → right, top → bottom.
 //
-//   * Ring 0 holds 1 node (the centre)
-//   * Ring k≥1 holds up to 6·k nodes, evenly spaced, on a circle of
-//     radius ``k · _CLUSTER_RING_STEP``
-//
-// Returned positions are TOP-LEFT corners of the node bounding box
-// (React Flow's coordinate convention) — pre-offset by half the
-// typical view_min pill size so the visual centres land on the
-// circle, not the corners. Pill size is content-dependent so we
-// approximate; on the rare wide-pill case (long proxy id) the
-// node still ends up near origin.
-const _CLUSTER_RING_STEP = 130          // pixels between adjacent rings
-const _CLUSTER_PILL_OFFSET_X = 70       // ≈ half of typical view_min pill width
-const _CLUSTER_PILL_OFFSET_Y = 15       // ≈ half of typical view_min pill height
+// Pills are content-sized, so each COLUMN is as wide as its widest pill
+// (estimated from the label — nothing is measured yet, the nodes are about
+// to be switched to view_min) and rows are one pill tall. The column count
+// is chosen so the packed block comes out roughly _GRID_TARGET_ASPECT wide
+// per tall, which suits a landscape canvas and keeps fit-zoom high.
+const _GRID_PILL_H = 34                 // view_min pill height incl. action buttons
+const _GRID_GAP_X = 12
+const _GRID_GAP_Y = 10
+const _GRID_TARGET_ASPECT = 1.5
 
-function _computeClusterPositions(n: number): Array<{ x: number; y: number }> {
-  const positions: Array<{ x: number; y: number }> = []
-  if (n <= 0) return positions
-  positions.push({
-    x: 0 - _CLUSTER_PILL_OFFSET_X,
-    y: 0 - _CLUSTER_PILL_OFFSET_Y,
-  })
-  let placed = 1
-  let ring = 1
-  while (placed < n) {
-    const capacity = 6 * ring
-    const radius = ring * _CLUSTER_RING_STEP
-    const onThisRing = Math.min(capacity, n - placed)
-    for (let i = 0; i < onThisRing; i++) {
-      // Start angle at -π/2 so ring 1 puts its first node at "12
-      // o'clock" — visually more pleasing than the right-hand
-      // 3-o'clock start that comes out of plain trig.
-      const angle = (2 * Math.PI * i) / onThisRing - Math.PI / 2
-      positions.push({
-        x: Math.round(Math.cos(angle) * radius) - _CLUSTER_PILL_OFFSET_X,
-        y: Math.round(Math.sin(angle) * radius) - _CLUSTER_PILL_OFFSET_Y,
-      })
-    }
-    placed += onThisRing
-    ring++
-  }
-  return positions
+// icon 16 + gap 8 + px-3 24 + border 2 + room for the two action buttons a
+// stopped, configurable service shows (2 × 26) + label at ~6.7px/char (text-xs).
+// Over-estimating just adds air; under-estimating would overlap pills.
+function _estimatePillWidth(label: string): number {
+  return Math.max(140, Math.round(102 + label.length * 6.7))
 }
+
+function _computeGridLayout(
+  items: Array<{ id: string; label: string }>,
+): { positions: Map<string, { x: number; y: number }>; width: number; height: number } {
+  const positions = new Map<string, { x: number; y: number }>()
+  const n = items.length
+  if (n === 0) return { positions, width: 0, height: 0 }
+  const sorted = [...items].sort((a, b) =>
+    a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' }),
+  )
+  const widths = sorted.map((it) => _estimatePillWidth(it.label))
+  const avgW = widths.reduce((a, b) => a + b, 0) / n
+  const cols = Math.min(
+    n,
+    Math.max(1, Math.round(Math.sqrt((n * _GRID_TARGET_ASPECT * (_GRID_PILL_H + _GRID_GAP_Y)) / (avgW + _GRID_GAP_X)))),
+  )
+  const rows = Math.ceil(n / cols)
+  const colWidths = Array<number>(cols).fill(0)
+  widths.forEach((w, i) => { colWidths[i % cols] = Math.max(colWidths[i % cols], w) })
+  const colX: number[] = []
+  let x = 0
+  for (const w of colWidths) { colX.push(x); x += w + _GRID_GAP_X }
+  const width = x - _GRID_GAP_X
+  const height = rows * _GRID_PILL_H + (rows - 1) * _GRID_GAP_Y
+  const left = -Math.round(width / 2)
+  const top = -Math.round(height / 2)
+  sorted.forEach((it, i) => {
+    positions.set(it.id, {
+      x: left + colX[i % cols],
+      y: top + Math.floor(i / cols) * (_GRID_PILL_H + _GRID_GAP_Y),
+    })
+  })
+  return { positions, width, height }
+}
+
 
 export default function Composer() {
   return (
@@ -397,6 +519,8 @@ function ComposerInner() {
   // install-time inputs) is started, the install wizard opens here instead
   // of installing immediately (M3).
   const [pendingInstall, setPendingInstall] = useState<{ proxyId: string; meta: ServiceMeta } | null>(null)
+  // Rename dialog target (UI-only pseudo-action 'rename_service').
+  const [pendingRename, setPendingRename] = useState<string | null>(null)
   // Per-instance config wizard (M4). `thenStart` distinguishes the
   // first-Start gate (configure → start) from an inspector "Configure"
   // (save only).
@@ -417,16 +541,103 @@ function ComposerInner() {
   // them forward across rebuilds.
   const nodesRef = useRef<Node<ProxyNodeData>[]>([])
   useEffect(() => { nodesRef.current = nodes }, [nodes])
+  // Mirror `selected` the same way, for the derivation effect below to
+  // read `selected` is which node — see its `wasSelected` comment for
+  // why this has to be the single source of truth rather than each
+  // node's own carried-forward `.selected` flag.
+  const selectedRef = useRef<string | null>(null)
+  useEffect(() => { selectedRef.current = selected }, [selected])
+
+  // Full-screen slot — which proxy (if any) is maximized to fill the
+  // canvas. Lives at the page level, not as view_full-local state, so at
+  // most one node holds it at a time and the page can reassign it (e.g.
+  // onRegistrySelect below swaps it to a newly-picked service instead of
+  // leaving the old one maximized underneath). Persisted across refresh
+  // the same way showRoutes is.
+  const MAXIMIZED_STORAGE_KEY = 'rlx:composer:maximizedProxyId'
+  const [maximizedProxyId, setMaximizedProxyId] = useState<string | null>(() => {
+    try { return localStorage.getItem(MAXIMIZED_STORAGE_KEY) } catch { return null }
+  })
+  useEffect(() => {
+    try {
+      if (maximizedProxyId) localStorage.setItem(MAXIMIZED_STORAGE_KEY, maximizedProxyId)
+      else localStorage.removeItem(MAXIMIZED_STORAGE_KEY)
+    } catch { /* ignore */ }
+  }, [maximizedProxyId])
+  // Mirrored the same way as selectedRef, for the derivation effect's
+  // build-time `wasMaximized` — keeps that effect's deps from having to
+  // include maximizedProxyId (the dedicated sync effect further below
+  // handles updates to already-built nodes).
+  const maximizedProxyIdRef = useRef<string | null>(null)
+  useEffect(() => { maximizedProxyIdRef.current = maximizedProxyId }, [maximizedProxyId])
+  // Claim/release the slot. Claiming for one proxy implicitly releases
+  // whatever else held it — enforced here so every call site (this title
+  // bar's maximize button, Escape, onRegistrySelect) gets "at most one
+  // maximized node" for free rather than having to coordinate themselves.
+  const onSetMaximized = useCallback((proxyId: string, maximized: boolean) => {
+    setMaximizedProxyId((prev) => (maximized ? proxyId : (prev === proxyId ? null : prev)))
+  }, [])
+  const onSetMaximizedRef = useRef<((proxyId: string, maximized: boolean) => void) | null>(null)
+  onSetMaximizedRef.current = onSetMaximized
 
   // Canvas search. The input lives in the page header (right of the
-  // breadcrumb); a blank query shows everything, otherwise non-matching
-  // service nodes are hidden (ReactFlow hides their connected edges too).
-  // The same query also filters the Registry palette list. Matches an
-  // instance's name / id / service type.
-  const [searchQuery, setSearchQuery] = useState('')
-  const filteredNodes = useMemo(() => {
+  // breadcrumb); a blank query (and no pinned filter badges) shows
+  // everything, otherwise non-matching service nodes are hidden (ReactFlow
+  // hides their connected edges too). The same needles also filter the
+  // Registry palette list. Matches an instance's name / id / service type.
+  //
+  // Persisted the same way as showRoutes/registryOpen below — localStorage,
+  // not the workspace row — since this is a per-browser view preference
+  // (what I'm currently focused on), not canvas content other devices/
+  // collaborators viewing this workspace should see (unlike node_positions/
+  // edges, which live on the workspace).
+  const searchStateKey = 'rlx:composer:searchFilters'
+  const initialSearchState = (() => {
+    try {
+      const raw = localStorage.getItem(searchStateKey)
+      if (!raw) return { query: '', tags: [] as string[] }
+      const parsed = JSON.parse(raw)
+      return {
+        query: typeof parsed.query === 'string' ? parsed.query : '',
+        tags: Array.isArray(parsed.tags) ? parsed.tags.filter((t: unknown) => typeof t === 'string') : [],
+      }
+    } catch {
+      return { query: '', tags: [] as string[] }
+    }
+  })()
+  const [searchQuery, setSearchQuery] = useState(initialSearchState.query)
+  // Pinned filters ("badges") to the right of the search box. Typing a
+  // query narrows the canvas live (see filterNeedles below); clicking the
+  // + button pins the current query so multiple searches can be combined
+  // (OR'd together) instead of the box only ever holding one at a time.
+  const [filterTags, setFilterTags] = useState<string[]>(initialSearchState.tags)
+  useEffect(() => {
+    try {
+      if (searchQuery === '' && filterTags.length === 0) localStorage.removeItem(searchStateKey)
+      else localStorage.setItem(searchStateKey, JSON.stringify({ query: searchQuery, tags: filterTags }))
+    } catch { /* ignore — localStorage unavailable (quota, private mode) */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, filterTags])
+  const addFilterTag = useCallback(() => {
     const q = searchQuery.trim().toLowerCase()
-    if (q === '') return nodes   // blank query → show everything
+    if (q === '') return
+    setFilterTags((tags) => (tags.includes(q) ? tags : [...tags, q]))
+    setSearchQuery('')
+  }, [searchQuery])
+  const removeFilterTag = useCallback((tag: string) => {
+    setFilterTags((tags) => tags.filter((t) => t !== tag))
+  }, [])
+  // The live search box is folded into the needle set so a still-being-typed
+  // query previews alongside any already-pinned badges rather than fighting
+  // them. Empty when there's nothing to filter on, in which case everything
+  // shows.
+  const filterNeedles = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (q === '') return filterTags
+    return filterTags.includes(q) ? filterTags : [...filterTags, q]
+  }, [searchQuery, filterTags])
+  const filteredNodes = useMemo(() => {
+    if (filterNeedles.length === 0) return nodes   // nothing to filter on → show everything
     return nodes.map((n) => {
       // Proxy nodes carry the full ServiceProxy; ghost nodes (a workspace
       // member whose backend proxy is gone) carry only proxyId. Match
@@ -439,12 +650,12 @@ function ComposerInner() {
         .filter(Boolean)
         .join(' ')
         .toLowerCase()
-      const hidden = !hay.includes(q)
+      const hidden = !filterNeedles.some((needle) => hay.includes(needle))
       // Preserve object identity when visibility is unchanged so RF doesn't
       // treat it as a brand-new node on every keystroke.
       return n.hidden === hidden ? n : { ...n, hidden }
     })
-  }, [nodes, searchQuery])
+  }, [nodes, filterNeedles])
   // Edges are persisted on the workspace row (workspace.edges). Loaded on
   // mount, mutated via React Flow's onEdgesChange / onConnect, and pushed
   // back to the server through the debounced persistWorkspace path.
@@ -467,6 +678,52 @@ function ComposerInner() {
       else localStorage.setItem(showRoutesKey, '0')
     } catch { /* ignore */ }
   }, [showRoutes])
+
+  // Registry (left) / Inspector (right) panel visibility — collapsible so
+  // the canvas can reclaim their width. Persisted the same way as
+  // showRoutes above. '0' = hidden; absent/anything else = shown.
+  const registryOpenKey = 'rlx:composer:registryOpen'
+  const [registryOpen, setRegistryOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem(registryOpenKey) !== '0' } catch { return true }
+  })
+  useEffect(() => {
+    try {
+      if (registryOpen) localStorage.removeItem(registryOpenKey)
+      else localStorage.setItem(registryOpenKey, '0')
+    } catch { /* ignore */ }
+  }, [registryOpen])
+  // Drawer widths — pulled wider/narrower via the drag handle on each
+  // panel's canvas-facing edge (see useResizablePanel).
+  const registryPanel = useResizablePanel(REGISTRY_RESIZE)
+  const inspectorPanel = useResizablePanel(INSPECTOR_RESIZE)
+  const inspectorOpenKey = 'rlx:composer:inspectorOpen'
+  const [inspectorOpen, setInspectorOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem(inspectorOpenKey) !== '0' } catch { return true }
+  })
+  useEffect(() => {
+    try {
+      if (inspectorOpen) localStorage.removeItem(inspectorOpenKey)
+      else localStorage.setItem(inspectorOpenKey, '0')
+    } catch { /* ignore */ }
+  }, [inspectorOpen])
+  // Cmd/Ctrl+B and Cmd/Ctrl+Alt+B — VSCode's own Primary/Secondary Sidebar
+  // toggles, reused here since they're already muscle memory for anyone
+  // who's used it. Skipped while focus is in a text field (the header
+  // search box included) so typing "b" isn't hijacked.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== 'b') return
+      const tag = (document.activeElement as HTMLElement | null)?.tagName
+      const editable = (document.activeElement as HTMLElement | null)?.isContentEditable
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || editable) return
+      e.preventDefault()
+      if (e.altKey) setInspectorOpen((v) => !v)
+      else setRegistryOpen((v) => !v)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
   // A selected route edge → the (source,target) pair whose underlying
   // links the Inspector shows + offers to remove.
   const [selectedRoute, setSelectedRoute] = useState<{ source: string; target: string } | null>(null)
@@ -624,7 +881,23 @@ function ComposerInner() {
       // would fire ``onSelectionChange`` with an empty nodes array —
       // wiping our ``selected`` state and the Inspector along with
       // it. The next.push below carries the flag forward.
-      const wasSelected = !!existing?.selected
+      //
+      // Derived from ``selectedRef`` (the single-select source of
+      // truth), NOT from ``existing?.selected``. React Flow gives a
+      // selected node +1000 z-index, so any node left wrongly flagged
+      // selected floats above everything unselected. Reading the flag
+      // off ``existing`` (a node object mirrored into ``nodesRef`` by
+      // its own separate, later-running effect) meant a node the user
+      // had selected earlier could still read back as selected here if
+      // this effect ran — as it does, on every ``allProxies`` bus
+      // update — before that mirror effect caught up: once
+      // resurrected, the stray ``true`` had nothing left to clear it,
+      // since the OTHER sync effect only fires when ``selected`` itself
+      // changes. Symptom: clicking a node correctly raised it, but also
+      // dragged one or more previously-clicked-but-long-since-deselected
+      // nodes up with it, ahead of nodes that were never touched.
+      const wasSelected = pid === selectedRef.current
+      const wasMaximized = pid === maximizedProxyIdRef.current
       const proxy = byId.get(pid)
       if (proxy) {
         const meta = catalog.find((m) => `${m.name}@${m.version}` === proxy.service_meta_id)
@@ -660,6 +933,8 @@ function ComposerInner() {
             onAction: dispatchProxyActionRef.current ?? (() => {}),
             isSingleton,
             configurable,
+            isMaximized: wasMaximized,
+            onSetMaximized: onSetMaximizedRef.current ?? (() => {}),
           },
           deletable: false,
         })
@@ -703,6 +978,26 @@ function ComposerInner() {
     })
   }, [selected])
 
+  // Sync the full-screen slot the same way ``selected`` is synced above —
+  // when ``maximizedProxyId`` changes (whether from this node's own
+  // maximize button, Escape, or onRegistrySelect reassigning the slot),
+  // every proxy node's ``data.isMaximized`` is patched to match: the new
+  // holder flips on, whatever previously held it flips off.
+  useEffect(() => {
+    setNodes((prev) => {
+      let changed = false
+      const next = prev.map((n) => {
+        if (n.type !== 'proxy') return n
+        const data = n.data as ProxyNodeData
+        const want = n.id === maximizedProxyId
+        if ((data.isMaximized ?? false) === want) return n
+        changed = true
+        return { ...n, data: { ...data, isMaximized: want } }
+      })
+      return changed ? next : prev
+    })
+  }, [maximizedProxyId])
+
   // removeGhost is defined below (it depends on persistWorkspace), but the
   // node-derivation effect above needs to reference it. Stash through a ref
   // so we don't re-derive nodes every render just because the handler
@@ -717,7 +1012,7 @@ function ComposerInner() {
   // each full-view node — dispatchProxyAction depends on apiFetch +
   // selected, but the node-data callback needs to stay identity-stable
   // so the node memoisation doesn't re-render on every keystroke.
-  const dispatchProxyActionRef = useRef<((id: string, action: ProxyAction, config?: Record<string, unknown>) => void) | null>(null)
+  const dispatchProxyActionRef = useRef<((id: string, action: ProxyAction, config?: Record<string, unknown>, knownProxy?: ServiceProxy) => void) | null>(null)
 
   // Remove a ghost member from the current workspace (drops the id from
   // service_proxy_ids and the matching node_positions entry).
@@ -753,6 +1048,17 @@ function ComposerInner() {
   const setNodeViewType = useCallback(
     (proxyId: string, next: string) => {
       if (!workspace) return
+      // Leaving Full for any other shape must release the canvas-
+      // maximize slot if this proxy holds it. Min/Basic/Name&type
+      // don't read isMaximized and never render the maximized portal
+      // or its Restore/Escape handling, so without this a node
+      // switched away from Full while maximized leaves the slot
+      // stranded — claimed by a proxy nothing can un-claim until a
+      // different node steals it via its own maximize. Functional
+      // no-op when this proxy doesn't hold the slot (or next IS Full).
+      if (next !== 'view_full') {
+        setMaximizedProxyId((prev) => (prev === proxyId ? null : prev))
+      }
       // Whether this shape wants its persisted width/height kept is
       // declared per-view via ``ComposerViewDefinition.preservesSize``
       // — only resizable shapes (today: view_full) opt in. Everything
@@ -1121,7 +1427,7 @@ function ComposerInner() {
     for (const l of links) {
       if (!l.source_proxy_id || !l.target_proxy_id) continue
       if (!present.has(l.source_proxy_id) || !present.has(l.target_proxy_id)) continue
-      const key = `${l.source_proxy_id} ${l.target_proxy_id}`
+      const key = `${l.source_proxy_id}\u0000${l.target_proxy_id}`
       const agg = byPair.get(key)
       if (agg) {
         agg.count += 1
@@ -1180,28 +1486,42 @@ function ComposerInner() {
   const reactFlowInstance = useReactFlow()
   const canvasRef = useRef<HTMLDivElement | null>(null)
 
-  // Cluster — minimize every proxy node to view_min and arrange them
-  // in concentric rings around the canvas origin, then drive the
-  // viewport to (0, 0). Useful when the canvas has drifted (panels
-  // scattered out of view, or you've installed a dozen services and
-  // they're spread across kilopixels). Persists in the same shape as
-  // the existing view-change + position-change paths so a reload
-  // keeps the cluster.
-  const clusterAtOrigin = useCallback(() => {
+  // Grid — minimize every proxy node to view_min and pack them into a tight
+  // rectangle around the canvas origin (sorted by proxy id, rows left →
+  // right), then drive the viewport there. Useful when the canvas has
+  // drifted (panels scattered out of view, or you've installed a dozen
+  // services and they're spread across kilopixels). Zooms out just enough
+  // to keep the whole block in view — never above 1.0, and never below
+  // React Flow's default minZoom (0.5), which would clamp anyway. Persists
+  // in the same shape as the existing view-change + position-change paths
+  // so a reload keeps the result.
+  const gridAtOrigin = useCallback(() => {
     if (!workspace) return
     const proxyNodes = nodes.filter((n) => n.type === 'proxy')
     if (proxyNodes.length === 0) return
-    const positions = _computeClusterPositions(proxyNodes.length)
-    const nextViewport: Viewport = { x: 0, y: 0, zoom: 1.0 }
+    const { positions, width, height } = _computeGridLayout(
+      proxyNodes.map((n) => {
+        const proxy = (n.data as ProxyNodeData).proxy
+        return { id: n.id, label: proxy.name ?? proxy.id ?? n.id }
+      }),
+    )
+    const el = canvasRef.current
+    const fit = el && width > 0 && height > 0
+      ? Math.min((el.clientWidth * 0.9) / width, (el.clientHeight * 0.9) / height)
+      : 1
+    const zoom = Math.min(1, Math.max(0.5, fit))
+    const nextViewport: Viewport = { x: 0, y: 0, zoom }
     setWorkspace((prev) => {
       if (!prev) return prev
       const viewTypes = { ...((prev.node_view_types ?? {}) as Record<string, string>) }
       const nodePositions = { ...((prev.node_positions ?? {}) as Record<string, Position>) }
-      proxyNodes.forEach((n, i) => {
+      proxyNodes.forEach((n) => {
+        const pos = positions.get(n.id)
+        if (!pos) return
         viewTypes[n.id] = DEFAULT_VIEW_ID
         // Drop any stored width/height — view_min content-sizes
         // (matches the existing setNodeViewType cleanup path).
-        nodePositions[n.id] = { x: positions[i].x, y: positions[i].y }
+        nodePositions[n.id] = { x: pos.x, y: pos.y }
       })
       const updated: Workspace = {
         ...prev,
@@ -1215,9 +1535,8 @@ function ComposerInner() {
     setNodes((prev) =>
       prev.map((n) => {
         if (n.type !== 'proxy') return n
-        const idx = proxyNodes.findIndex((p) => p.id === n.id)
-        if (idx < 0) return n
-        const pos = positions[idx]
+        const pos = positions.get(n.id)
+        if (!pos) return n
         // Strip width/height (same logic as setNodeViewType) so RF
         // re-measures content size on the next render.
         const { width: _w, height: _h, style, ...rest } = n
@@ -1237,12 +1556,13 @@ function ComposerInner() {
     // Re-centre the viewport on origin with a brief tween so the
     // operator visually tracks where the cluster lives.
     try {
-      reactFlowInstance.setCenter?.(0, 0, { zoom: 1.0, duration: 400 })
+      reactFlowInstance.setCenter?.(0, 0, { zoom, duration: 400 })
     } catch {
       // ReactFlowProvider isn't mounted yet (shouldn't happen here,
       // but be defensive). Ignore.
     }
   }, [workspace, nodes, persistWorkspace, reactFlowInstance])
+
 
   // Suggest a default proxy name when opening the install dialog.
   // Counts existing proxies of the same service type to pick the next
@@ -1302,6 +1622,19 @@ function ComposerInner() {
       setSelected(proxyId)
       const node = reactFlowInstance.getNode(proxyId)
       if (!node) return
+      // If some node is already maximized full-screen, picking a
+      // different service from the registry swaps it into that slot —
+      // "this panel now shows service Y" rather than leaving the old
+      // one maximized and making the operator go find + promote Y
+      // themselves. Promote to Full first if it isn't already there
+      // (the slot only means anything while the node is in that shape).
+      if (maximizedProxyId && maximizedProxyId !== proxyId) {
+        const currentViewId = normalizeComposerViewId(
+          (workspace?.node_view_types as Record<string, string> | undefined)?.[proxyId],
+        )
+        if (currentViewId !== 'view_full') setNodeViewType(proxyId, 'view_full')
+        setMaximizedProxyId(proxyId)
+      }
       // Node anchor in ReactFlow is its top-left; center on the
       // midpoint so the node sits in the middle of the viewport.
       // Width/height may not yet be measured for off-screen nodes —
@@ -1314,7 +1647,7 @@ function ComposerInner() {
       const zoom = reactFlowInstance.getZoom()
       reactFlowInstance.setCenter(cx, cy, { zoom, duration: 400 })
     },
-    [reactFlowInstance],
+    [reactFlowInstance, maximizedProxyId, workspace, setNodeViewType],
   )
 
   const onCanvasDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
@@ -1386,8 +1719,8 @@ function ComposerInner() {
   // "+ Add Service" dialog. Returns true on success; sets a banner + false
   // on any failure. Caller owns the busy flag + dialog teardown.
   const createAndAttach = useCallback(
-    async (meta: ServiceMeta, proxyName: string, position: Position): Promise<boolean> => {
-      if (!workspace?.id) return false
+    async (meta: ServiceMeta, proxyName: string, position: Position): Promise<ServiceProxy | null> => {
+      if (!workspace?.id) return null
       // Pre-flight against the server's authoritative list — our local
       // allProxies may be stale (another tab created this name, or the
       // lifecycle event hasn't arrived yet).
@@ -1395,7 +1728,7 @@ function ComposerInner() {
       if (serverProxies?.some((p) => p.id === proxyName)) {
         setAllProxies(serverProxies)
         setError(`A proxy named '${proxyName}' already exists`)
-        return false
+        return null
       }
       const result = await apiFetch<ServiceRequest>('/v1/service-request', {
         method: 'POST',
@@ -1417,7 +1750,7 @@ function ComposerInner() {
           } catch { /* soft fail — reconciler + periodic resync catch up */ }
         }
         setError(result.result ?? 'install failed')
-        return false
+        return null
       }
       const newProxy = await apiFetch<ServiceProxy>(
         `/v1/service-proxy/${encodeURIComponent(proxyName)}`,
@@ -1446,7 +1779,7 @@ function ComposerInner() {
       // whose config already names a controller) — re-derive routes so
       // its edges appear without a manual refresh.
       void refreshLinks()
-      return true
+      return newProxy
     },
     [workspace, apiFetch, persistWorkspace, refreshLinks],
   )
@@ -1465,8 +1798,8 @@ function ComposerInner() {
       setInstalling(true)
       setError(null)
       try {
-        const ok = await createAndAttach(pendingDrop.meta, proxyName, pendingDrop.position)
-        if (ok) {
+        const proxy = await createAndAttach(pendingDrop.meta, proxyName, pendingDrop.position)
+        if (proxy) {
           setPendingDrop(null)
           setDropName('')
         }
@@ -1494,6 +1827,18 @@ function ComposerInner() {
   // ``thenStart`` it also fires start_service (via the ref so call order
   // with dispatchProxyAction doesn't matter), which runs the install +
   // start pipeline + may open the install/config wizard.
+  //
+  // The freshly-created proxy is passed straight through to
+  // dispatchProxyAction as ``knownProxy`` rather than letting it re-derive
+  // status from the ``allProxies`` closure: this call happens in the same
+  // synchronous continuation as createAndAttach's setAllProxies(), and React
+  // hasn't re-rendered yet, so dispatchProxyActionRef.current would still be
+  // the PREVIOUS render's closure — allProxies there doesn't have the new
+  // placeholder yet, isPlaceholderStart evaluates false, and start_service
+  // proceeds without ever calling watchProgress. The server installs the
+  // type regardless (it doesn't need the client's state), which is exactly
+  // the "service menu says installing, but no progress panel ever showed"
+  // symptom — passing the known-fresh proxy here closes that gap.
   const addServiceInstance = useCallback(
     async (meta: ServiceMeta, proxyName: string, thenStart: boolean) => {
       const name = proxyName.trim()
@@ -1504,10 +1849,10 @@ function ComposerInner() {
       setInstalling(true)
       setError(null)
       try {
-        const ok = await createAndAttach(meta, name, canvasCenter())
-        if (ok) {
+        const newProxy = await createAndAttach(meta, name, canvasCenter())
+        if (newProxy) {
           setAddServiceOpen(false)
-          if (thenStart) dispatchProxyActionRef.current?.(name, 'start_service')
+          if (thenStart) dispatchProxyActionRef.current?.(name, 'start_service', undefined, newProxy)
         }
       } catch (err) {
         if (err instanceof Error) setError(err.message)
@@ -1591,14 +1936,26 @@ function ComposerInner() {
       proxyId: string,
       action: ProxyAction,
       config?: Record<string, unknown>,
+      // Passed by callers (addServiceInstance) that already hold a
+      // just-created/just-fetched proxy fresher than the allProxies closure
+      // could possibly be in the same synchronous continuation — see the
+      // comment on addServiceInstance for why that staleness is real, not
+      // theoretical. Falls back to the normal allProxies lookup otherwise.
+      knownProxy?: ServiceProxy,
     ) => {
       // 'configure_service' is UI-only — open the per-instance config
       // wizard (save without starting) instead of posting a request. Lets
       // the operator configure a placeholder before pressing Play.
       if (action === 'configure_service') {
-        const proxy = allProxies.find((p) => p.id === proxyId)
+        const proxy = knownProxy ?? allProxies.find((p) => p.id === proxyId)
         const meta = catalog.find((m) => `${m.name}@${m.version}` === proxy?.service_meta_id)
         if (proxy && meta) setPendingConfig({ proxyId, meta, proxy, thenStart: false })
+        return
+      }
+      // 'rename_service' is UI-only too — open the Rename dialog, which
+      // previews (dry_run) and then posts the real request itself.
+      if (action === 'rename_service') {
+        setPendingRename(proxyId)
         return
       }
       // Install-wizard gate: first Start of a placeholder whose type isn't
@@ -1606,7 +1963,7 @@ function ComposerInner() {
       // the wizard instead of installing immediately. `config` present means
       // the wizard already ran (or none was needed), so skip the gate.
       if (action === 'start_service' && !config) {
-        const proxy = allProxies.find((p) => p.id === proxyId)
+        const proxy = knownProxy ?? allProxies.find((p) => p.id === proxyId)
         const meta = catalog.find((m) => `${m.name}@${m.version}` === proxy?.service_meta_id)
         const wizardSteps = Array.isArray(meta?.wizard_steps) ? (meta!.wizard_steps as Array<{ fields?: unknown[] }>) : []
         const needsWizard =
@@ -1619,9 +1976,12 @@ function ComposerInner() {
           return
         }
         // Config gate (M4): first Start of an unconfigured instance whose
-        // type declares per-instance config fields opens the config wizard.
+        // type declares per-instance config fields (config_schema — the
+        // general, introspected path — or the legacy config_steps) opens
+        // the config wizard.
         const configSteps = Array.isArray(meta?.config_steps) ? (meta!.config_steps as Array<{ fields?: unknown[] }>) : []
-        const needsConfig = !proxy?.configured && configSteps.some((s) => (s.fields ?? []).length > 0)
+        const needsConfig =
+          !proxy?.configured && (hasConfigSchema(meta?.config_schema) || configSteps.some((s) => (s.fields ?? []).length > 0))
         if (needsConfig && meta && proxy) {
           setPendingConfig({ proxyId, meta, proxy, thenStart: true })
           return
@@ -1670,7 +2030,7 @@ function ComposerInner() {
       // missed if we waited for the response.
       const isPlaceholderStart =
         action === 'start_service' &&
-        allProxies.find((p) => p.id === proxyId)?.status === 'placeholder'
+        (knownProxy ?? allProxies.find((p) => p.id === proxyId))?.status === 'placeholder'
       const requestId = isPlaceholderStart ? genId() : undefined
       if (isPlaceholderStart && requestId) {
         watchProgress(proxyId, `/service_request/${requestId}/progress`, requestId)
@@ -1712,23 +2072,63 @@ function ComposerInner() {
   )
   dispatchProxyActionRef.current = dispatchProxyAction
 
+  // Rename (opened via the 'rename_service' pseudo-action below, from the
+  // REGISTRY row / view_full title bar / Inspector). POST
+  // /v1/service-proxy/{id}/rename re-keys everything that uses the name as
+  // identity — yml, registry slot, row, workspace layout, other services'
+  // bindings — and publishes old→uninstalled / new lifecycle +
+  // /workspace/+/changed. We apply the same swap locally right away so the
+  // canvas, selection and maximize slot don't flicker through a "proxy
+  // vanished" state while those events arrive.
+  const requestRename = useCallback(
+    async (oldId: string, newName: string) => {
+      const report = await apiFetch<{ proxy: ServiceProxy }>(
+        `/v1/service-proxy/${encodeURIComponent(oldId)}/rename`,
+        { method: 'POST', body: JSON.stringify({ new_name: newName }) },
+      )
+      setAllProxies((prev) => prev.filter((p) => p.id !== oldId && p.id !== newName).concat([report.proxy]))
+      setWorkspace((prev) => {
+        if (!prev) return prev
+        const rekey = <T,>(m: Record<string, T> | undefined | null) =>
+          m && oldId in m
+            ? Object.fromEntries(Object.entries(m).map(([k, v]) => [k === oldId ? newName : k, v]))
+            : m
+        return {
+          ...prev,
+          service_proxy_ids: (prev.service_proxy_ids ?? []).map((id: string) => (id === oldId ? newName : id)),
+          node_positions: rekey(prev.node_positions as Record<string, Position> | undefined) ?? prev.node_positions,
+          node_view_types: (rekey(prev.node_view_types as Record<string, unknown> | undefined) ?? prev.node_view_types) as Workspace['node_view_types'],
+        }
+      })
+      setSelected((cur) => (cur === oldId ? newName : cur))
+      setMaximizedProxyId((cur) => (cur === oldId ? newName : cur))
+      void refreshLinks()
+    },
+    [apiFetch, refreshLinks],
+  )
+
   // Persist per-instance config without starting (inspector "Configure").
-  // Mirrors TopicRemapSection's read-merge-write so we never clobber other
-  // service_config keys; marks the instance configured.
+  // Goes through the yml-aware POST /service-proxy/{id}/config — NOT a
+  // generic PUT to the service_proxy row. For a subprocess service, that
+  // row's service_config is a stale, unread mirror; the subprocess only
+  // ever starts from the active config-set's <proxy_id>.yml. A plain PUT
+  // here looked like it worked (the row reflected the new values) but
+  // silently never reached the file the service actually reads on its
+  // next start — see AGENTS.md's config-sets notes / runtime/boot.py.
   const saveProxyConfig = useCallback(async (proxyId: string, config: Record<string, unknown>) => {
     setSavingConfig(true)
     setError(null)
     try {
-      const current = await apiFetch<ServiceProxy>(`/v1/service-proxy/${encodeURIComponent(proxyId)}`)
-      const nextConfig = { ...(current.service_config ?? {}), ...config }
-      const next: ServiceProxy = { ...current, service_config: nextConfig, configured: true }
-      await apiFetch(`/v1/service-proxy/${encodeURIComponent(proxyId)}`, {
-        method: 'PUT',
-        body: JSON.stringify(next),
-      })
-      setAllProxies((prev) => prev.map((p) => (p.id === proxyId ? { ...p, ...next } : p)))
+      const result = await apiFetch<{ ok: boolean }>(
+        `/v1/service-proxy/${encodeURIComponent(proxyId)}/config`,
+        { method: 'POST', body: JSON.stringify({ config }) },
+      )
+      if (!result.ok) throw new Error('Config save failed')
+      setAllProxies((prev) =>
+        prev.map((p) => (p.id === proxyId ? { ...p, configured: true } : p)),
+      )
       // Config may have changed a controller/input binding — re-derive
-      // routes. (This PUT path doesn't broadcast config_state, so the
+      // routes. (This path doesn't broadcast config_state, so the
       // wildcard subscription won't catch it.)
       void refreshLinks()
     } catch (e) {
@@ -1752,12 +2152,28 @@ function ComposerInner() {
         <div className="flex items-center gap-3">
           <button
             type="button"
+            onClick={() => setRegistryOpen((v) => !v)}
+            className="rounded border border-slate-700 p-1.5 text-slate-300 hover:border-slate-500 hover:text-white"
+            title={registryOpen ? 'Hide registry panel (⌘B)' : 'Show registry panel (⌘B)'}
+            aria-label={registryOpen ? 'Hide registry panel' : 'Show registry panel'}
+          >
+            {registryOpen ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeftOpen className="h-4 w-4" />}
+          </button>
+          <button
+            type="button"
             onClick={() => navigate('/workspaces')}
             className="text-sm text-slate-400 hover:text-slate-200"
           >
             ← Workspaces
           </button>
-          <h1 className="text-base font-semibold">{workspace?.name ?? workspaceId}</h1>
+          {/* The pinned live workspace is always named "Runtime" — showing
+              that title here is redundant chrome (there's only ever one,
+              you're always looking at it by default) and just eats header
+              space. Saved views are the case where the name actually
+              disambiguates between several, so keep it there. */}
+          {!isRuntime && (
+            <h1 className="text-base font-semibold">{workspace?.name ?? workspaceId}</h1>
+          )}
           {isRuntime ? (
             <span className="rounded bg-emerald-900 px-2 py-0.5 text-xs font-medium text-emerald-200">
               live
@@ -1770,14 +2186,59 @@ function ComposerInner() {
               saved view
             </span>
           )}
-          <input
-            type="search"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search services…"
-            aria-label="Search services on the canvas"
-            className="ml-1 w-56 rounded border border-slate-700 bg-slate-950 px-2.5 py-1 text-sm text-slate-200 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none"
-          />
+          {/* Discoverable "add service" affordance. Used to float over the
+              canvas top-left; moved into the header so it's part of the
+              app's menu chrome rather than overlapping node content near
+              the canvas origin. (Dragging a palette row still works for
+              power users; this is the obvious path for everyone else.)
+              Placed just left of the search field per user request. */}
+          <button
+            type="button"
+            onClick={() => { setError(null); setAddServiceOpen(true) }}
+            className="ml-1 flex items-center gap-1.5 rounded border border-slate-700 px-3 py-1.5 text-sm font-medium text-slate-200 hover:border-sky-500 hover:text-white"
+          >
+            <Plus className="h-4 w-4" />
+            Add Service
+          </button>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); addFilterTag() }
+              }}
+              placeholder="Search services…"
+              aria-label="Search services on the canvas"
+              className="w-56 rounded border border-slate-700 bg-slate-950 px-2.5 py-1 text-sm text-slate-200 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={addFilterTag}
+              disabled={searchQuery.trim() === '' || filterTags.includes(searchQuery.trim().toLowerCase())}
+              title="Pin this search as a canvas filter badge"
+              aria-label="Add search as a filter badge"
+              className="rounded border border-slate-700 p-1 text-slate-300 hover:border-sky-500 hover:text-sky-300 disabled:opacity-40 disabled:hover:border-slate-700 disabled:hover:text-slate-300"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+            {filterTags.map((tag) => (
+              <span
+                key={tag}
+                className="flex items-center gap-1 rounded-full bg-sky-900/60 px-2 py-0.5 text-xs font-medium text-sky-200"
+              >
+                {tag}
+                <button
+                  type="button"
+                  onClick={() => removeFilterTag(tag)}
+                  aria-label={`Remove filter ${tag}`}
+                  className="text-sky-300 hover:text-white"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            ))}
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -1801,6 +2262,15 @@ function ComposerInner() {
               Save subset…
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => setInspectorOpen((v) => !v)}
+            className="rounded border border-slate-700 p-1.5 text-slate-300 hover:border-slate-500 hover:text-white"
+            title={inspectorOpen ? 'Hide inspector panel (⌘⌥B)' : 'Show inspector panel (⌘⌥B)'}
+            aria-label={inspectorOpen ? 'Hide inspector panel' : 'Show inspector panel'}
+          >
+            {inspectorOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
+          </button>
         </div>
       </header>
 
@@ -1814,10 +2284,13 @@ function ComposerInner() {
         {/* Palette aside — REPO (service types) and REGISTRY (existing
             instances managed by the runtime). REPO drags trigger the
             install dialog; REGISTRY drags attach in place. */}
-        <aside className="w-60 shrink-0 overflow-y-auto border-r border-slate-800 bg-slate-900/60">
+        <aside
+          style={{ width: registryOpen ? registryPanel.width : 0 }}
+          className={`${registryOpen ? 'border-r' : 'border-r-0'} shrink-0 overflow-x-hidden overflow-y-auto border-slate-800 bg-slate-900/60 ${registryPanel.resizing ? '' : 'transition-[width] duration-150'}`}
+        >
           {/* REGISTRY — existing runtime instances; drag one onto the canvas
               to attach it. Adding a NEW service from the catalog now lives on
-              the canvas's "+ Add Service" button, which replaced the old
+              the header's "+ Add Service" button, which replaced the old
               CATALOG palette tab. */}
           <div className="flex border-b border-slate-800 bg-slate-900">
             <span className="flex-1 px-3 py-2 text-xs font-semibold tracking-wider text-sky-300 border-b-2 border-sky-400">
@@ -1834,10 +2307,14 @@ function ComposerInner() {
               onSelect={onRegistrySelect}
               selectedId={selected}
               busyProxyId={busyProxyId}
-              query={searchQuery}
+              needles={filterNeedles}
             />
           </div>
         </aside>
+
+        {/* Drag handle on the registry drawer's right edge — pull to widen
+            or narrow it; double-click resets. Only present while open. */}
+        {registryOpen && <PanelResizeHandle panel={registryPanel} label="Resize registry panel" />}
 
         {/* Canvas */}
         <main
@@ -1846,17 +2323,6 @@ function ComposerInner() {
           onDragOver={onCanvasDragOver}
           onDrop={onCanvasDrop}
         >
-          {/* Discoverable "add service" affordance — overlays the canvas
-              top-left. (Dragging a palette row still works for power
-              users; this is the obvious path for everyone else.) */}
-          <button
-            type="button"
-            onClick={() => { setError(null); setAddServiceOpen(true) }}
-            className="absolute left-3 top-3 z-10 flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-900/90 px-3 py-1.5 text-sm font-medium text-slate-200 shadow-lg backdrop-blur hover:border-sky-500 hover:text-white"
-          >
-            <Plus className="h-4 w-4" />
-            Add Service
-          </button>
           {/* Defer mounting ReactFlow until the workspace is loaded.
               defaultViewport + fitView are both initial-only props — if we
               render with workspace=null, the saved pan/zoom is lost and
@@ -1886,17 +2352,17 @@ function ComposerInner() {
             >
               <Background gap={20} />
               <Controls>
-                {/* Cluster — minimise every panel to its view_min pill +
-                    arrange them in concentric rings around the canvas
-                    origin, then drive the viewport to (0, 0). Lets the
-                    operator rein in a sprawl after dragging panels
-                    far apart, or just to see everything at a glance. */}
+                {/* Grid — minimise every panel to its view_min pill and pack
+                    them into a tight rectangle centred on the canvas origin:
+                    sorted by proxy id, filled in rows left → right. Lets the
+                    operator rein in a sprawl after dragging panels far
+                    apart, or just to see everything at a glance. */}
                 <ControlButton
-                  onClick={clusterAtOrigin}
-                  title="Cluster all panels at origin"
-                  aria-label="Cluster all panels at origin"
+                  onClick={gridAtOrigin}
+                  title="Arrange all panels in a grid (sorted by id)"
+                  aria-label="Arrange all panels in a grid"
                 >
-                  <CircleDot />
+                  <SquareDot />
                 </ControlButton>
                 {/* Toggle the derived data-flow routes layer. */}
                 <ControlButton
@@ -1916,8 +2382,15 @@ function ComposerInner() {
           )}
         </main>
 
+        {/* Drag handle on the inspector drawer's left edge — mirror of the
+            registry's. Only present while open. */}
+        {inspectorOpen && <PanelResizeHandle panel={inspectorPanel} label="Resize inspector panel" />}
+
         {/* Inspector */}
-        <aside className="w-72 shrink-0 overflow-y-auto border-l border-slate-800 bg-slate-900/60 p-3">
+        <aside
+          style={{ width: inspectorOpen ? inspectorPanel.width : 0 }}
+          className={`${inspectorOpen ? 'border-l p-3' : 'border-l-0 p-0'} shrink-0 overflow-x-hidden overflow-y-auto border-slate-800 bg-slate-900/60 ${inspectorPanel.resizing ? '' : 'transition-[width] duration-150'}`}
+        >
           <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
             Inspector
           </h2>
@@ -1950,7 +2423,7 @@ function ComposerInner() {
               configurable={(() => {
                 const m = catalog.find((c) => `${c.name}@${c.version}` === selectedProxy.service_meta_id)
                 const steps = Array.isArray(m?.config_steps) ? (m!.config_steps as Array<{ fields?: unknown[] }>) : []
-                return steps.some((s) => (s.fields ?? []).length > 0)
+                return hasConfigSchema(m?.config_schema) || steps.some((s) => (s.fields ?? []).length > 0)
               })()}
               onConfigure={() => {
                 const m = catalog.find((c) => `${c.name}@${c.version}` === selectedProxy.service_meta_id)
@@ -1999,6 +2472,20 @@ function ComposerInner() {
       )}
 
 
+      {/* Rename dialog — opened via the 'rename_service' pseudo-action from
+          the REGISTRY row, view_full title bar or Inspector. requestRename
+          applies the local state swap itself (see its definition), so onDone
+          just closes the dialog. */}
+      {pendingRename && (
+        <RenameDialog
+          oldName={pendingRename}
+          nameTaken={(n) => allProxies.some((p) => p.id === n.trim())}
+          onRequest={(n) => requestRename(pendingRename, n)}
+          onCancel={() => setPendingRename(null)}
+          onDone={() => setPendingRename(null)}
+        />
+      )}
+
       {/* Install dialog — shown after a service type is dropped */}
       {pendingDrop && (
         <InstallDialog
@@ -2019,6 +2506,8 @@ function ComposerInner() {
           catalog={latestCatalog}
           suggestName={suggestProxyName}
           nameTaken={(n) => allProxies.some((p) => p.id === n.trim())}
+          findExisting={(n) => allProxies.find((p) => p.id === n.trim())}
+          progressFor={(n) => installProgress[n.trim()]}
           installing={installing}
           error={error}
           onCancel={() => { setAddServiceOpen(false); setError(null) }}
@@ -2058,7 +2547,7 @@ interface RegistryTabProps {
   loading: boolean
   items: ServiceProxy[]
   onDragStart: (event: DragEvent<HTMLLIElement>, proxy: ServiceProxy) => void
-  onAction: (proxyId: string, action: 'start_service' | 'stop_service' | 'release_service') => void
+  onAction: (proxyId: string, action: 'start_service' | 'stop_service' | 'release_service' | 'rename_service') => void
   // Click on a row body — selects the proxy in the canvas and pans/zooms
   // the viewport to centre on its node. Action buttons stopPropagation
   // so they don't double-fire this.
@@ -2068,12 +2557,13 @@ interface RegistryTabProps {
   // and canvas selection is visible at a glance.
   selectedId: string | null
   busyProxyId: string | null
-  // The shared canvas/registry search query. The input now lives in the
-  // page header (not in this tab); this just filters the instance list.
-  query: string
+  // The shared canvas/registry search needles (live query + any pinned
+  // filter badges, OR'd together). The input now lives in the page header
+  // (not in this tab); this just filters the instance list.
+  needles: string[]
 }
 
-function RegistryTab({ loading, items, onDragStart, onAction, onSelect, selectedId, busyProxyId, query }: RegistryTabProps) {
+function RegistryTab({ loading, items, onDragStart, onAction, onSelect, selectedId, busyProxyId, needles }: RegistryTabProps) {
   // ``view`` is the row-level UX router: rows are draggable AND expose
   // inline Start/Release affordances. Without inline actions, a service
   // that's status=installed has no way to be started from the runtime
@@ -2081,18 +2571,17 @@ function RegistryTab({ loading, items, onDragStart, onAction, onSelect, selected
   // dragging an installed one onto it shows briefly then disappears once
   // the workspace re-derives.
   // Filter by id / type / status — the registry can hold many instances.
-  // ``query`` is the shared search from the page header (passed as a prop).
+  // ``needles`` is the shared search from the page header (passed as a prop).
   const shown = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    if (!q) return items
-    return items.filter((p) =>
-      [p.id, p.name, p.service_meta_id, p.status]
+    if (needles.length === 0) return items
+    return items.filter((p) => {
+      const hay = [p.id, p.name, p.service_meta_id, p.status]
         .filter(Boolean)
         .join(' ')
         .toLowerCase()
-        .includes(q),
-    )
-  }, [items, query])
+      return needles.some((needle) => hay.includes(needle))
+    })
+  }, [items, needles])
   return (
     <>
       <p className="mb-2 text-[10px] text-slate-500">
@@ -2106,7 +2595,7 @@ function RegistryTab({ loading, items, onDragStart, onAction, onSelect, selected
         </div>
       )}
       {!loading && items.length > 0 && shown.length === 0 && (
-        <div className="text-xs text-slate-500">No instances match “{query.trim()}”.</div>
+        <div className="text-xs text-slate-500">No instances match “{needles.join(', ')}”.</div>
       )}
       <ul className="space-y-1">
         {shown.map((proxy) => {
@@ -2115,6 +2604,7 @@ function RegistryTab({ loading, items, onDragStart, onAction, onSelect, selected
           const tone = STATUS_TONE[status] ?? STATUS_TONE.stopped
           const running = status === 'running' || status === 'starting'
           const startable = status === 'placeholder' || status === 'installed' || status === 'stopped' || status === 'error'
+          const renamable = !running && status !== 'installing' && status !== 'stopping'
           const busy = busyProxyId === id
           const isSelected = selectedId === id
           return (
@@ -2177,12 +2667,142 @@ function RegistryTab({ loading, items, onDragStart, onAction, onSelect, selected
                     release
                   </button>
                 )}
+                {/* renamable is broader than startable (it also covers e.g.
+                    an uninstalled type) and matches the backend's actual
+                    refusal condition (only running/starting + singletons),
+                    so it's the right gate for this button specifically. */}
+                {renamable && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={(e) => { e.stopPropagation(); onAction(id, 'rename_service') }}
+                    className="rounded border border-slate-700 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-sky-300 hover:border-sky-500 disabled:opacity-40"
+                  >
+                    rename
+                  </button>
+                )}
               </div>
             </li>
           )
         })}
       </ul>
     </>
+  )
+}
+
+// Mirrors the backend's lifecycle.validate_proxy_name — a service name is used
+// as a filename, a bus topic segment and a URL segment, so keep it to
+// lowercase letters, digits, '-' and '_', starting with a letter, <= 63 chars.
+const PROXY_NAME_MAX_LEN = 63
+const PROXY_NAME_RE = /^[a-z][a-z0-9_-]*$/
+
+function proxyNameError(name: string): string | null {
+  if (!name) return null
+  if (name.length > PROXY_NAME_MAX_LEN) return `Name is too long (max ${PROXY_NAME_MAX_LEN} characters).`
+  if (!PROXY_NAME_RE.test(name)) {
+    return "Use lowercase letters, digits, '-' and '_', starting with a letter (e.g. sabertooth-1)."
+  }
+  return null
+}
+
+/** Rename a stopped service — POST /v1/service-proxy/{id}/rename. The
+ *  backend refuses while running or for a singleton; those surface as the
+ *  thrown error's message. */
+function RenameDialog({
+  oldName,
+  nameTaken,
+  onRequest,
+  onCancel,
+  onDone,
+}: {
+  oldName: string
+  nameTaken: (name: string) => boolean
+  onRequest: (newName: string) => Promise<void>
+  onCancel: () => void
+  onDone: () => void
+}) {
+  const [name, setName] = useReactState(oldName)
+  const [busy, setBusy] = useReactState(false)
+  const [error, setError] = useReactState<string | null>(null)
+
+  const trimmed = name.trim()
+  const unchanged = trimmed === oldName
+  const invalid = proxyNameError(trimmed)
+  const taken = !unchanged && trimmed.length > 0 && nameTaken(trimmed)
+  const nameOk = trimmed.length > 0 && !unchanged && !invalid && !taken
+
+  const run = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      await onRequest(trimmed)
+      onDone()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-4"
+      onClick={(e) => { if (e.target === e.currentTarget && !busy) onCancel() }}
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (!nameOk || busy) return
+          void run()
+        }}
+        className="w-full max-w-lg space-y-4 rounded-lg border border-slate-700 bg-slate-900 p-5 shadow-2xl"
+      >
+        <header>
+          <div className="font-mono text-xs text-slate-500">{oldName}</div>
+          <h2 className="mt-0.5 text-base font-semibold text-slate-100">Rename service</h2>
+          <p className="mt-1 text-xs text-slate-400">
+            Moves its config, registry entry and canvas layout to the new name and updates
+            unambiguous references in other services' configs. The service must be stopped.
+          </p>
+        </header>
+
+        <label className="block space-y-1 text-sm">
+          <span className="text-slate-300">New name</span>
+          <input
+            type="text"
+            autoFocus
+            value={name}
+            onChange={(e) => { setName(e.target.value); setError(null) }}
+            disabled={busy}
+            className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none focus:border-sky-500 disabled:opacity-60"
+          />
+          {taken && <span className="block text-xs text-amber-400">A service with this name already exists.</span>}
+          {invalid && <span className="block text-xs text-amber-400">{invalid}</span>}
+        </label>
+
+        {error && <Banner tone="error">{error}</Banner>}
+
+        <footer className="flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="rounded border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:border-slate-500 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={!nameOk || busy}
+            className="rounded bg-sky-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? 'Renaming…' : `Rename to ${trimmed}`}
+          </button>
+        </footer>
+      </form>
+    </div>
   )
 }
 
@@ -2197,7 +2817,8 @@ function InstallDialog({
   nameTaken,
 }: InstallDialogProps) {
   const trimmed = name.trim()
-  const canSubmit = trimmed.length > 0 && !nameTaken && !installing
+  const nameInvalid = proxyNameError(trimmed)
+  const canSubmit = trimmed.length > 0 && !nameTaken && !nameInvalid && !installing
   return (
     <div
       role="dialog"
@@ -2261,6 +2882,9 @@ function InstallDialog({
               A proxy with this name already exists.
             </span>
           )}
+          {nameInvalid && (
+            <span className="block text-xs text-amber-400">{nameInvalid}</span>
+          )}
         </label>
 
         {error && <Banner tone="error">{error}</Banner>}
@@ -2294,6 +2918,14 @@ function AddServiceDialog(props: {
   catalog: ServiceMeta[]
   suggestName: (meta: ServiceMeta) => string
   nameTaken: (name: string) => boolean
+  // A taken name isn't always someone else's stale proxy — it's often
+  // the very instance THIS dialog just asked to create/start (the local
+  // allProxies cache catches up to the placeholder row mid-submit, or
+  // the user re-opened the dialog while an earlier install is still
+  // running). These let the taken-name message show what's actually
+  // happening instead of a dead-end "already exists".
+  findExisting: (name: string) => ServiceProxy | undefined
+  progressFor: (name: string) => InstallProgressState | undefined
   installing: boolean
   error: string | null
   onCancel: () => void
@@ -2324,7 +2956,8 @@ function AddServiceDialog(props: {
 
   const trimmed = name.trim()
   const taken = trimmed.length > 0 && props.nameTaken(trimmed)
-  const canSubmit = !!selected && trimmed.length > 0 && !taken && !props.installing
+  const nameInvalid = proxyNameError(trimmed)
+  const canSubmit = !!selected && trimmed.length > 0 && !taken && !nameInvalid && !props.installing
 
   return (
     <div
@@ -2399,7 +3032,28 @@ function AddServiceDialog(props: {
                 disabled={!selected || props.installing}
                 className="w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none focus:border-sky-500 disabled:opacity-50"
               />
-              {taken && <span className="block text-xs text-amber-400">A proxy with this name already exists.</span>}
+              {nameInvalid && (
+                <span className="block text-xs text-amber-400">{nameInvalid}</span>
+              )}
+              {taken && (() => {
+                const existing = props.findExisting(trimmed)
+                const prog = props.progressFor(trimmed)
+                if (prog && prog.overall === 'running') {
+                  return (
+                    <div className="mt-1">
+                      <p className="mb-1 text-xs text-amber-400">
+                        '{trimmed}' already exists and is installing:
+                      </p>
+                      <InstallProgress state={prog} />
+                    </div>
+                  )
+                }
+                return (
+                  <span className="block text-xs text-amber-400">
+                    A proxy named '{trimmed}' already exists{existing?.status ? ` (status: ${existing.status})` : ''}. Pick a different name.
+                  </span>
+                )
+              })()}
             </label>
           </div>
         </div>
@@ -2448,30 +3102,31 @@ function visibleActions(status: string | undefined): {
   start: boolean
   stop: boolean
   release: boolean
+  rename: boolean
 } {
   switch (status) {
     case 'placeholder':
     case 'installed':
     case 'stopped':
     case 'error':
-      return { start: true, stop: false, release: true }
+      return { start: true, stop: false, release: true, rename: true }
     case 'running':
-      return { start: false, stop: true, release: false }
+      return { start: false, stop: true, release: false, rename: false }
     case 'starting':
     case 'stopping':
     case 'installing':
-      return { start: false, stop: false, release: false }
+      return { start: false, stop: false, release: false, rename: false }
     default:
       // Unknown / fresh row: at least let the user release it so a
       // stuck proxy can be cleared from the registry.
-      return { start: false, stop: false, release: true }
+      return { start: false, stop: false, release: true, rename: false }
   }
 }
 
 interface InspectorPanelProps {
   proxy: ServiceProxy
   busy: boolean
-  onAction: (action: 'start_service' | 'stop_service' | 'release_service') => void
+  onAction: (action: 'start_service' | 'stop_service' | 'release_service' | 'rename_service') => void
   install?: InstallProgressState
   onRetryInstall?: () => void
   onDismissInstall?: () => void
@@ -2589,6 +3244,9 @@ function InspectorPanel({ proxy, busy, onAction, install, onRetryInstall, onDism
           )}
           {configurable && onConfigure && actions.start && (
             <ActionButton label="Configure" tone="secondary" disabled={busy} onClick={onConfigure} />
+          )}
+          {actions.rename && (
+            <ActionButton label="Rename" tone="secondary" disabled={busy} onClick={() => onAction('rename_service')} />
           )}
         </div>
       )}

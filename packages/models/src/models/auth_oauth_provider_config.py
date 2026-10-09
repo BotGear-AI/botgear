@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class AuthOauthProviderConfig(BaseModel):
     id: Optional[str] = Field("default", json_schema_extra={"example":"default"})
@@ -26,7 +25,7 @@ class AuthOauthProviderConfig(BaseModel):
     userinfo_url: Optional[str] = Field(None, description="OAuth2 UserInfo endpoint", json_schema_extra={"example":"https://provider.com/oauth2/userinfo"})
     logout_url: Optional[str] = Field(None, description="OAuth2 logout endpoint", json_schema_extra={"example":"https://provider.com/oauth2/logout"})
     extra_auth_params: Optional[dict[str, str]] = Field({}, description="Extra auth params", json_schema_extra={"example":{"access_type":"offline"}})
-    client_secret: Optional[str] = Field(None, description="OAuth2 Client Secret", json_schema_extra={"example":"your-client-secret"})
+    client_secret: Optional[str] = Field(None, exclude=True, description="OAuth2 Client Secret", json_schema_extra={"example":"your-client-secret"})
 
 # managed
     @classmethod

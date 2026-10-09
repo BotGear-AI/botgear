@@ -91,15 +91,17 @@ interface ListWorkflowsReply {
 
 // One backend descriptor as returned by get_backends. ``fields`` is
 // per-backend specific — ollama has base_url+model, anthropic/openai add
-// has_credential, mock has nothing.
+// has_credential, claude_agent has model (+ max_usd_per_run; it uses the
+// backend user's Claude Code login, no key), mock has nothing.
 interface BackendDescriptor {
-  name: 'mock' | 'ollama' | 'anthropic' | 'openai'
+  name: 'mock' | 'ollama' | 'anthropic' | 'openai' | 'claude_agent'
   kind: 'stub' | 'local' | 'cloud'
   configured: boolean
   fields: {
     base_url?: string
     model?: string
     has_credential?: boolean
+    max_usd_per_run?: number
   }
 }
 
@@ -147,6 +149,60 @@ interface ActiveRunSummary {
   // actually running, not what's in the yaml.
   backend?: string
   model_id?: string | null
+  // Live view of what the run is doing (brain republishes on change).
+  phase?: 'starting' | 'thinking' | 'listening' | 'speaking' | 'calling' | string | null
+  phase_detail?: string | null
+  phase_since?: string | null
+  last_heard?: string | null
+  last_heard_at?: string | null
+  silent_listens?: number
+  steps_used?: number
+  tool_calls?: number
+  started_at?: string | null
+}
+
+interface RunLogReply {
+  run_id: string
+  error?: string
+  steps?: StepRecord[]
+  tool_calls?: ToolCallMsg[]
+}
+
+// One human line for "what is this run doing right now".
+function hhmmss(iso?: string | null): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString()
+}
+
+function describeRunPhase(r: ActiveRunSummary): string {
+  const heard = r.last_heard
+    ? ` · last heard “${r.last_heard.length > 60 ? `${r.last_heard.slice(0, 60)}…` : r.last_heard}” at ${hhmmss(r.last_heard_at)}`
+    : ' · nothing heard yet'
+  switch (r.phase) {
+    case 'listening':
+      return `listening for speech${r.silent_listens ? ` (${r.silent_listens} silent)` : ''}${heard}`
+    case 'thinking':
+      return `thinking — waiting on the model since ${hhmmss(r.phase_since)}`
+    case 'speaking':
+      return 'speaking'
+    case 'calling':
+      return `calling ${r.phase_detail ?? 'a tool'}`
+    case 'starting':
+      return 'starting'
+    default:
+      return r.status
+  }
+}
+
+// Status dot for a run — a STATUS, deliberately not a ▶ glyph (that
+// reads as a play/run control). Same colours as the run card.
+function RunDot({ phase }: { phase?: string | null }) {
+  const tone = phase === 'thinking' ? 'animate-pulse bg-sky-400'
+    : phase === 'speaking' ? 'animate-pulse bg-emerald-400'
+      : phase === 'listening' ? 'animate-pulse bg-amber-400'
+        : 'bg-slate-400'
+  return <span aria-hidden className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${tone}`} />
 }
 
 interface BrainState {
@@ -378,7 +434,7 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
     [],
   )
 
-  // ── file browser state (stone A of TODO_BRAIN_VIEWER.md) ─────────
+  // ── file browser state (stone A; see README.md's "Workspace file browser (UI)") ─────────
   const apiFetch = useApiFetch()
   const [tree, setTree] = useState<FileTreeResponse | null>(null)
   // Currently-highlighted tree entry. Drives what the right pane
@@ -534,9 +590,9 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
     return parts.length >= 2 && parts[0] === 'workflows' ? parts[1] : null
   }, [selectedEntry])
 
-  // An EXAMPLE is a bundled (shipped, read-only) workflow. Examples
-  // aren't run directly — the operator duplicates one to an editable
-  // workspace copy first. Derived from the tree entry's source so it
+  // An EXAMPLE is a bundled (shipped, read-only) workflow. Examples run
+  // directly (the API allows it) but can't be edited — the operator
+  // duplicates one to an editable workspace copy to change it. Derived from the tree entry's source so it
   // works whether the folder or a file within it is selected.
   const selectedIsExample = !!selectedWorkflowName && selectedEntry?.source === 'bundled'
 
@@ -1595,6 +1651,10 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
   // the panel after a run started still sees something live.
   const activeRunsList = state.active_runs ?? []
   const targetRunId = followedRunId ?? activeRunsList[0]?.run_id ?? null
+  const targetActiveRun = activeRunsList.find((r) => r.run_id === targetRunId) ?? null
+  // Bumped by Follow so following the run you're already on still
+  // re-loads its history instead of leaving the log empty.
+  const [backfillTick, setBackfillTick] = useState(0)
 
   useEffect(() => {
     if (!targetRunId) {
@@ -1603,6 +1663,10 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
       setToolCalls([])
       return
     }
+    // New target (or Follow re-pressed): start clean; the backfill below
+    // refills from the run dir.
+    setSteps([])
+    setToolCalls([])
     const stepsTopic = `/brain/${proxyId}/runs/${targetRunId}/steps`
     const resultTopic = `/brain/${proxyId}/runs/${targetRunId}/result`
     const toolCallsTopic = `/brain/${proxyId}/runs/${targetRunId}/tool_calls`
@@ -1623,8 +1687,27 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
       const rec = f.payload as ToolCallMsg
       setToolCalls((prev) => [...prev.slice(-99), rec])
     })
-    return () => { offSteps(); offResult(); offToolCalls() }
-  }, [proxyId, targetRunId, wsClient])
+    // The step + tool-call topics are live-only: following a run that's
+    // already going would show nothing until its NEXT step. Backfill the
+    // recent history from the run dir, then merge whatever streamed in
+    // meanwhile (deduped by ts + step / tool_call_id).
+    let cancelled = false
+    void dispatch<RunLogReply>('get_run_log', { run_id: targetRunId, limit: 100 })
+      .then((log) => {
+        if (cancelled || !log || log.error) return
+        const stepKey = (x: StepRecord) => `${x.ts}|${x.step}`
+        setSteps((live) => {
+          const seen = new Set((log.steps ?? []).map(stepKey))
+          return [...(log.steps ?? []), ...live.filter((x) => !seen.has(stepKey(x)))].slice(-100)
+        })
+        setToolCalls((live) => {
+          const seen = new Set((log.tool_calls ?? []).map((x) => x.tool_call_id))
+          return [...(log.tool_calls ?? []), ...live.filter((x) => !seen.has(x.tool_call_id))].slice(-100)
+        })
+      })
+      .catch(() => { /* older brain without get_run_log — live stream only */ })
+    return () => { cancelled = true; offSteps(); offResult(); offToolCalls() }
+  }, [proxyId, targetRunId, wsClient, dispatch, backfillTick])
 
   // ─── workflow_events: always-on subscription ─────────────────────
   //
@@ -1730,15 +1813,16 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                 setOutputTab('steps')
                 setOutputCollapsed(false)
               }}
-              className="nodrag nopan flex items-baseline gap-2 rounded border border-emerald-900/60 bg-emerald-950/30 px-2 py-0.5 text-[10px] text-emerald-300 hover:bg-emerald-900/40 hover:text-emerald-200"
-              title={`Focus output pane on ${r0.run_id} — running ${cfg}`}
+              className="nodrag nopan flex items-center gap-2 rounded px-2 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800/60"
+              title={`${r0.workflow} is ${describeRunPhase(r0)} — click to show its steps below (${cfg})`}
             >
-              <span>▶</span>
+              <RunDot phase={r0.phase} />
+              <span className="text-slate-500">running</span>
               <span className="font-mono">{r0.workflow}</span>
-              <span className="font-mono text-emerald-500/80">[{cfg}]</span>
-              <span className="font-mono text-emerald-500/70">{r0.run_id}</span>
+              <span className="font-mono text-slate-500">[{cfg}]</span>
+              <span className="font-mono text-slate-500">{r0.run_id}</span>
               {activeRunsList.length > 1 && (
-                <span className="text-emerald-500/70">+{activeRunsList.length - 1}</span>
+                <span className="text-slate-500">+{activeRunsList.length - 1}</span>
               )}
             </button>
           )
@@ -1851,7 +1935,7 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
       )}
 
       {/* Files ─────────────────────────────────────────────────────
-          Stone A of docs/TODO_BRAIN_VIEWER.md. Two-pane layout — tree
+          Stone A (see README.md's "Workspace file browser (UI)"). Two-pane layout — tree
           on the left, viewer on the right. Double-click a file to open.
 
           The tree merges per-instance workspace files with bundled
@@ -1899,7 +1983,7 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
             }))
           }
           const backendNames = backends.length === 0
-            ? ['mock', 'ollama', 'anthropic', 'openai']
+            ? ['mock', 'ollama', 'anthropic', 'openai', 'claude_agent']
             : backends.map((b) => b.name)
           const runBackendDescriptor = backends.find((b) => b.name === effectiveBackend)
           const runBackendConfigured = effectiveBackend === 'mock'
@@ -1977,18 +2061,18 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                   <span className="text-[11px] text-slate-500">select a workflow to run</span>
                 ) : selectedIsExample ? (
                   <span
-                    className="flex min-w-0 items-center gap-1 rounded border border-amber-700 bg-amber-950/40 px-2 py-0.5 text-[11px] text-amber-300"
-                    title={`${wf.name} is a read-only example — duplicate it to run.`}
+                    className="flex min-w-0 items-center gap-1 text-[11px] text-slate-400"
+                    title={`The Run button will execute the bundled example ${wf.name}. Examples are read-only — duplicate to edit.`}
                   >
-                    <span className="shrink-0">example — duplicate to run:</span>
+                    <span className="shrink-0 text-slate-500">selected (example):</span>
                     <span className="truncate font-mono font-medium">{wf.name}</span>
                   </span>
                 ) : (
                   <span
-                    className="flex min-w-0 items-center gap-1 rounded border border-emerald-700 bg-emerald-950/40 px-2 py-0.5 text-[11px] text-emerald-300"
+                    className="flex min-w-0 items-center gap-1 text-[11px] text-slate-400"
                     title={`The Run button will execute ${wf.name}`}
                   >
-                    <span className="shrink-0">▶ will run:</span>
+                    <span className="shrink-0 text-slate-500">selected:</span>
                     <span className="truncate font-mono font-medium">{wf.name}</span>
                   </span>
                 )}
@@ -2130,22 +2214,6 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                     <StopIcon size={11} />
                     <span>Stop</span>
                   </button>
-                ) : selectedIsExample ? (
-                  // Examples are read-only templates — never run directly.
-                  // Offer "Duplicate to run" instead (creates an editable
-                  // workspace copy, then it's ready to run).
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setDuplicateTarget({ sourcePath: `workflows/${wfName}`, srcName: wfName })
-                    }}
-                    className="nodrag nopan flex items-center gap-1 rounded bg-emerald-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-emerald-500"
-                    title="Examples can't run directly — duplicate this example to an editable workspace workflow, then run it."
-                  >
-                    <CopyIcon size={11} />
-                    <span>Duplicate to run</span>
-                  </button>
                 ) : (
                   <button
                     type="button"
@@ -2159,6 +2227,22 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                   >
                     <PlayIcon size={11} />
                     <span>Run</span>
+                  </button>
+                )}
+                {/* Examples run directly but stay read-only — editing
+                    requires an editable workspace copy. */}
+                {!activeRun && selectedIsExample && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setDuplicateTarget({ sourcePath: `workflows/${wfName}`, srcName: wfName })
+                    }}
+                    className="nodrag nopan flex items-center gap-1 rounded border border-slate-700 px-2 py-0.5 text-[11px] text-slate-300 hover:border-slate-500"
+                    title="Examples are read-only — duplicate this example to an editable workspace workflow."
+                  >
+                    <CopyIcon size={11} />
+                    <span>Duplicate</span>
                   </button>
                 )}
               </div>
@@ -2370,8 +2454,10 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                         section below; this is just a "yes it's
                         running" indicator inside the workflow pane. */}
                     {activeRun && (
-                      <div className="rounded border border-emerald-900/60 bg-emerald-950/30 px-2 py-1 text-[11px] text-emerald-300">
-                        ▶ <span className="font-mono">{activeRun.run_id}</span> · {activeRun.status}
+                      <div className="flex items-center gap-1.5 px-1 py-0.5 text-[11px] text-slate-400">
+                        <RunDot phase={activeRun.phase} />
+                        <span className="font-mono">{activeRun.run_id}</span>
+                        <span className="truncate">· {describeRunPhase(activeRun)}</span>
                       </div>
                     )}
 
@@ -2568,7 +2654,7 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                     <div className="flex shrink-0 gap-1">
                       <button
                         type="button"
-                        onClick={(e) => { e.stopPropagation(); setFollowedRunId(r.run_id); setSteps([]); setRunResult(null) }}
+                        onClick={(e) => { e.stopPropagation(); setFollowedRunId(r.run_id); setRunResult(null); setBackfillTick((n) => n + 1) }}
                         className="nodrag nopan rounded border border-slate-700 px-2 py-1 text-[10px] text-slate-300 hover:border-slate-500"
                       >
                         Follow
@@ -2600,6 +2686,12 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                       </button>
                     </div>
                   </div>
+                  {r.phase && (
+                    <div className="mt-1 flex items-center gap-1.5 text-[10px] text-slate-400" title={`${r.steps_used ?? 0} model steps · ${r.tool_calls ?? 0} tool calls`}>
+                      <RunDot phase={r.phase} />
+                      <span className="truncate">{describeRunPhase(r)}</span>
+                    </div>
+                  )}
                 </li>
               )
             })}
@@ -2758,7 +2850,11 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
             </div>
           ))}
           {steps.length === 0 && (eventsByRunId[targetRunId ?? ''] ?? []).length === 0 ? (
-            <div className="px-1 text-slate-600">no steps yet — pick a workflow and press Run</div>
+            <div className="px-1 text-slate-600">
+              {targetActiveRun
+                ? `no model steps yet — run ${targetActiveRun.run_id} is ${describeRunPhase(targetActiveRun)}. Steps appear here when the model acts.`
+                : 'no steps yet — pick a workflow and press Run'}
+            </div>
           ) : (
             steps.map((s, i) => {
               const verdictBad = s.verdict && !s.verdict.allowed
@@ -3515,6 +3611,7 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                             onSubmit={(e) => { e.preventDefault(); void applyBackend(b.name, isActive) }}
                             className="mt-2 flex flex-col gap-1 border-t border-slate-800 pt-2"
                           >
+                            {'base_url' in b.fields && (
                             <label className="flex items-center gap-2 text-[10px]">
                               <span className="w-20 shrink-0 text-slate-500">base_url</span>
                               <input
@@ -3525,6 +3622,7 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                                 className="nodrag nopan flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-100 focus:border-slate-500 focus:outline-none"
                               />
                             </label>
+                            )}
                             <label className="flex items-center gap-2 text-[10px]">
                               <span className="w-20 shrink-0 text-slate-500">model</span>
                               <input
@@ -3535,7 +3633,14 @@ export default function BrainFullView({ proxy }: { proxy: ServiceProxy }) {
                                 className="nodrag nopan flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-100 focus:border-slate-500 focus:outline-none"
                               />
                             </label>
-                            {b.kind === 'cloud' && (
+                            {b.name === 'claude_agent' && (
+                              <div className="text-[10px] text-slate-500">
+                                Uses the backend user’s Claude Code login (no key).
+                                Spend cap ${b.fields.max_usd_per_run ?? '—'} per run (brain config).
+                                Conversation and tool results leave this host.
+                              </div>
+                            )}
+                            {b.kind === 'cloud' && 'has_credential' in b.fields && (
                               <label className="flex items-center gap-2 text-[10px]">
                                 <span className="w-20 shrink-0 text-slate-500">api_key</span>
                                 <input

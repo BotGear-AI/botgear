@@ -10,6 +10,7 @@
 // per-instance wizard_config already uses — rather than JSON-Schema/RJSF
 // (deferred; see docs/TODO_INSTALL_WIZARD.md).
 import { useMemo, useState } from 'react'
+import { Eye, EyeOff } from 'lucide-react'
 import type { ServiceMeta } from '../models/ServiceMeta'
 
 export interface WizardField {
@@ -184,6 +185,7 @@ export function FieldInput({
   onChange: (v: unknown) => void
 }) {
   const label = field.title ?? field.id
+  const [visible, setVisible] = useState(false)
   if (field.type === 'boolean') {
     return (
       <label className="flex items-start gap-2 text-xs text-slate-300">
@@ -211,18 +213,37 @@ export function FieldInput({
     )
   }
   const numeric = field.type === 'integer' || field.type === 'number'
-  const inputType = field.type === 'password' ? 'password' : numeric ? 'number' : 'text'
+  const isPassword = field.type === 'password'
+  const inputType = isPassword ? (visible ? 'text' : 'password') : numeric ? 'number' : 'text'
+  const input = (
+    <input
+      type={inputType}
+      autoComplete={isPassword ? 'new-password' : undefined}
+      value={String(value ?? '')}
+      onChange={(e) => onChange(numeric ? (e.target.value === '' ? '' : Number(e.target.value)) : e.target.value)}
+      className={`w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 text-slate-100 ${isPassword ? 'pr-8' : ''}`}
+    />
+  )
   return (
     <label className="block text-xs text-slate-300">
       <span className="mb-1 block">{label}</span>
       {field.description && <span className="mb-1 block text-[10px] text-slate-500">{field.description}</span>}
-      <input
-        type={inputType}
-        autoComplete={field.type === 'password' ? 'new-password' : undefined}
-        value={String(value ?? '')}
-        onChange={(e) => onChange(numeric ? (e.target.value === '' ? '' : Number(e.target.value)) : e.target.value)}
-        className="w-full rounded border border-slate-700 bg-slate-800 px-2 py-1 text-slate-100"
-      />
+      {isPassword ? (
+        <span className="relative block">
+          {input}
+          <button
+            type="button"
+            tabIndex={-1}
+            onClick={() => setVisible((v) => !v)}
+            title={visible ? 'Hide value' : 'Show value'}
+            className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:text-slate-200"
+          >
+            {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </button>
+        </span>
+      ) : (
+        input
+      )}
     </label>
   )
 }

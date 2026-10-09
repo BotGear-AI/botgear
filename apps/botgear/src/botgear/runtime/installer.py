@@ -232,6 +232,7 @@ def install_pip(
     rlx_audio_path = _rlx_audio_local_path()
     rlx_input_path = _rlx_input_local_path()
     rlx_servo_cal_path = _rlx_servo_cal_local_path()
+    rlx_messaging_path = _rlx_messaging_local_path()
 
     # Build the step plan up front so every event knows its index/total.
     plan: List[Dict[str, object]] = [{"id": "create_venv", "label": "Create virtual environment"}]
@@ -243,6 +244,8 @@ def install_pip(
         plan.append({"id": "install_rlx_input", "label": "Install input capability"})
     if rlx_servo_cal_path is not None:
         plan.append({"id": "install_rlx_servo_cal", "label": "Install servo calibration"})
+    if rlx_messaging_path is not None:
+        plan.append({"id": "install_rlx_messaging", "label": "Install messaging capability"})
     plan.append({"id": "install_deps", "label": "Install dependencies"})
     total = len(plan)
 
@@ -333,6 +336,20 @@ def install_pip(
             idx,
             {"id": "install_rlx_servo_cal", "label": "Install servo calibration"},
             _pip_install_argv(bin_dir, ["-e", str(rlx_servo_cal_path)]),
+            _RLX_BUS_TIMEOUT_SECONDS,
+        )
+
+    # 2d. rlx_messaging — the shared messaging capability
+    #     (MessagingServiceBase: inbox queue + listen/speak/send/
+    #     list_channels + retained state — see docs/TODO_MESSAGING.md).
+    #     Installed AFTER rlx_bus (depends on it). Pure-Python; harmless
+    #     in venvs that never import it.
+    if rlx_messaging_path is not None:
+        idx += 1
+        run_step(
+            idx,
+            {"id": "install_rlx_messaging", "label": "Install messaging capability"},
+            _pip_install_argv(bin_dir, ["-e", str(rlx_messaging_path)]),
             _RLX_BUS_TIMEOUT_SECONDS,
         )
 
@@ -503,6 +520,22 @@ def _rlx_input_local_path() -> Optional[Path]:
         return candidate if (candidate / "pyproject.toml").is_file() else None
     here = Path(__file__).resolve()
     candidate = here.parents[5] / "packages" / "rlx_input"
+    if (candidate / "pyproject.toml").is_file():
+        return candidate
+    return None
+
+
+def _rlx_messaging_local_path() -> Optional[Path]:
+    """Resolve the on-disk location of the rlx_messaging package source —
+    the shared messaging capability (MessagingServiceBase). Same two
+    layouts as rlx_bus (dev monorepo vs frozen bundle). Returns None
+    when absent."""
+    if getattr(sys, "frozen", False):
+        install_dir = Path(sys.executable).resolve().parent
+        candidate = install_dir / "_internal" / "packages" / "rlx_messaging"
+        return candidate if (candidate / "pyproject.toml").is_file() else None
+    here = Path(__file__).resolve()
+    candidate = here.parents[5] / "packages" / "rlx_messaging"
     if (candidate / "pyproject.toml").is_file():
         return candidate
     return None

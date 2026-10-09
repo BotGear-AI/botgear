@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="24" height="24">
+  <title>lcus_relay</title>
+  <rect x="3" y="6" width="18" height="12" rx="1"/>
+  <path d="M7 6 V4"/>
+  <path d="M12 6 V4"/>
+  <path d="M17 6 V4"/>
+  <circle cx="7" cy="12" r="1.4"/>
+  <circle cx="12" cy="12" r="1.4"/>
+  <circle cx="17" cy="12" r="1.4"/>
+  <path d="M7 15.5 h0.01"/>
+  <path d="M12 15.5 h0.01"/>
+  <path d="M17 15.5 h0.01"/>
+</svg>

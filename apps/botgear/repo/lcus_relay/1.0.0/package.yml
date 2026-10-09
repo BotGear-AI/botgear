@@ -1,0 +1,74 @@
+name: lcus_relay
+title: LCUS USB Relay Module
+description: |
+  LCUS-family USB relay modules — LCUS-1, LCUS-2, LCUS-4, and LCUS-8
+  (e.g. the NOYITO "8-Channel Micro USB Relay Module"). A CH340
+  USB-serial bridge to an on-board MCU that switches 1/2/4/8 relay
+  channels via a trivial 4-byte serial protocol.
+
+  Wire format, one command per relay::
+
+      [0xA0, channel, command, checksum]
+
+    * channel  — 1-based relay index (1..channel_count)
+    * command  — 0x00 off, 0x01 on
+    * checksum — (0xA0 + channel + command) & 0xFF
+
+  A single 0xFF byte queries live relay state; the board replies with
+  one 0x00/0x01 byte per channel (best-effort — not every clone board
+  implements this reliably).
+
+  ``channel_count`` (1/2/4/8) selects which LCUS variant is attached —
+  it only changes how many channels the UI/API expose; the wire format
+  is identical across all four.
+
+  Subprocess service — pyserial does blocking I/O in its own process,
+  isolated from the backend.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [hardware, relay, serial, switch]
+icon: icon.svg
+
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section).
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+# Source ships bundled, but the pyserial dependency is installed on
+# demand when the user creates an lcus_relay@1.0.0 instance.
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/lcus_relay/1.0.0"
+
+entry:
+  argv: [python, -m, lcus_relay_service]
+
+wizard_config:
+  - id: connection
+    title: LCUS relay connection
+    fields:
+      - id: channel_count
+        type: integer
+        title: Relay channels
+        description: "Which LCUS module is attached: LCUS-1 (1), LCUS-2 (2), LCUS-4 (4), or LCUS-8 / NOYITO 8-channel (8). Can be changed later from the panel."
+        default: 8
+      - id: last_baud
+        type: integer
+        title: Baud rate
+        description: LCUS boards default to 9600.
+        default: 9600
+      - id: command_spacing_ms
+        type: integer
+        title: Command spacing (ms)
+        description: >-
+          Minimum gap enforced between commands in an All on/All off burst.
+          pyserial's write() returns once the OS has queued the bytes, not
+          once they've actually gone out over the wire, so firing every
+          channel back-to-back can outrun cheap LCUS-clone firmware. Raise
+          this if All on/All off is unreliable.
+        default: 30

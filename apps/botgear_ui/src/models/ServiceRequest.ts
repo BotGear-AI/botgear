@@ -5,6 +5,10 @@ export interface ServiceRequest {
   action: string;
   service_meta_id?: string;
   proxy_name?: string;
+  new_name?: string;
+  dry_run?: boolean;
+  rewrite_references?: boolean;
+  placeholder?: boolean;
   workspace_id?: string;
   service_proxy_id?: string;
   config?: any;
@@ -20,6 +24,10 @@ export function createEmptyServiceRequest(): ServiceRequest {
     action: "",
     service_meta_id: undefined,
     proxy_name: undefined,
+    new_name: undefined,
+    dry_run: undefined,
+    rewrite_references: undefined,
+    placeholder: undefined,
     workspace_id: undefined,
     service_proxy_id: undefined,
     config: undefined,
@@ -53,7 +61,7 @@ export const ServiceRequestSchema = {
     },
     "action": {
       "type": "string",
-      "description": "Lifecycle action - install, start, stop, restart, uninstall, activate_workspace, deactivate_workspace",
+      "description": "Lifecycle action - install, start, stop, restart, uninstall, rename, activate_workspace, deactivate_workspace",
       "example": "start"
     },
     "service_meta_id": {
@@ -65,6 +73,24 @@ export const ServiceRequestSchema = {
       "type": "string",
       "description": "Desired proxy name - required for install to name the new proxy",
       "example": "pycv"
+    },
+    "new_name": {
+      "type": "string",
+      "description": "New proxy name - required for rename (lowercase letters, digits, '-' and '_')",
+      "example": "network_scanner"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "rename only: report what would change without changing anything"
+    },
+    "rewrite_references": {
+      "type": "boolean",
+      "description": "rename only: rewrite references to the old name in other services' configs (default true); false only reports them"
+    },
+    "placeholder": {
+      "type": "boolean",
+      "description": "For create_service - drop a placeholder (no dependency install) instead of installing eagerly; the type's deps install lazily on the instance's first start_service",
+      "example": true
     },
     "workspace_id": {
       "type": "string",

@@ -92,7 +92,25 @@ def accept_invite(
         user["fullname"] = fullname
 
     user = _invoke_accept_hook(hook_module, user, db)
-    db.update_item("user", user["id"], user)
+
+    # Not a true compare-and-swap: two requests racing on the same token can
+    # both pass the query at the top of this function before either write
+    # commits, so both would still succeed without this. Re-checking
+    # immediately before the write narrows that window to a single
+    # query-then-update pair instead of the whole function body (same
+    # approach as /v1/reset-password in server.py). Closing it fully needs a
+    # conditional/atomic update primitive in the shared DatabaseAdapter
+    # (packages/database), which every backend would need to implement --
+    # out of scope here.
+    still_pending = db.query_items("user", {"invite_token": token}) or []
+    if not still_pending or still_pending[0].get("id") != user["id"]:
+        raise ValueError("This invitation has already been accepted")
+
+    # include_nulls=True: update_item() silently drops None-valued fields by
+    # default, which without this flag means invite_token/invite_token_expiry
+    # above never actually reach the database -- the single-use invite token
+    # stays valid and the link can be replayed until its own TTL expires.
+    db.update_item("user", user["id"], user, include_nulls=True)
     logger.info("accept_invite: user %s activated (roles=%s)", user.get("id"), user.get("roles"))
     return {
         "status": "accepted",

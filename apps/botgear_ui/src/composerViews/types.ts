@@ -19,7 +19,10 @@ import type { ServiceProxy } from '../models/ServiceProxy'
  *  don't depend on the page they render under. */
 // 'configure_service' is a UI-only pseudo-action (not a backend service
 // request): the page handles it by opening the per-instance config wizard.
-export type ProxyAction = 'start_service' | 'stop_service' | 'release_service' | 'configure_service'
+// 'rename_service' is likewise handled by the page (it opens the Rename dialog,
+// which does the dry-run preview + the real request itself).
+export type ProxyAction =
+  | 'start_service' | 'stop_service' | 'release_service' | 'configure_service' | 'rename_service'
 
 
 /** Props every view shape's component receives. The page wires these
@@ -45,6 +48,18 @@ export interface ComposerViewProps {
   /** True when this proxy's type declares per-instance config fields,
    *  so views can offer a Configure affordance. */
   configurable?: boolean
+  /** True when this proxy is the one currently maximized to fill the
+   *  canvas. Only ``view_full`` acts on this; other shapes ignore it.
+   *  Lifted to the page level (rather than kept as view-local state) so
+   *  the page can swap which proxy holds the full-screen slot — e.g.
+   *  picking a different service in the registry while one is already
+   *  maximized. */
+  isMaximized?: boolean
+  /** Claim or release the full-screen slot for this proxy. Setting
+   *  ``maximized: true`` for one proxy implicitly un-maximizes whatever
+   *  else was holding the slot — the page enforces "at most one
+   *  maximized node at a time". */
+  onSetMaximized?: (proxyId: string, maximized: boolean) => void
 }
 
 

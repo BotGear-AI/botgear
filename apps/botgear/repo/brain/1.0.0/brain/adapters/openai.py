@@ -22,7 +22,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from brain.adapters.base import ModelAdapter
+from brain.adapters.base import ModelAdapter, resolve_tool_names
 from brain.schemas import (
     ChatMessage,
     ModelResponse,
@@ -147,16 +147,21 @@ def _encode_tools(
     tools: List[ToolDescriptor],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, ToolDescriptor]]:
     """OpenAI tool descriptors: ``{type: function, function: {...}}``
-    with ``parameters`` as JSON Schema."""
+    with ``parameters`` as JSON Schema. Names come from
+    ``adapters.base.resolve_tool_names`` (see
+    docs/TODO_BRAIN_GAP_FIXES.md Gap 1) — previously every tool here
+    was unconditionally ``tool_NNN``, even when the bare action name
+    was unique and would have worked fine, unlike the other two
+    adapters."""
+    names = resolve_tool_names(tools)
     encoded: List[Dict[str, Any]] = []
     decode: Dict[str, ToolDescriptor] = {}
-    for i, t in enumerate(tools):
-        flat = f"tool_{i:03d}"
-        decode[flat] = t
+    for name, t in zip(names, tools):
+        decode[name] = t
         encoded.append({
             "type": "function",
             "function": {
-                "name": flat,
+                "name": name,
                 "description": (t.description or "").strip()[:1024]
                                 + f"\n[topic: {t.topic}, action: {t.action}]",
                 "parameters": t.parameters or {"type": "object", "properties": {}},
@@ -200,41 +205,51 @@ def _parse_response(
             usage=usage,
         )
 
-    call = tool_calls[0]
-    fn = call.get("function") or {}
-    flat_name = fn.get("name") or ""
-    args_raw = fn.get("arguments")
-    args: Dict[str, Any]
-    if isinstance(args_raw, str):
-        try:
-            args = json.loads(args_raw) if args_raw else {}
-        except json.JSONDecodeError:
+    # Every tool call in this one response — see
+    # docs/TODO_BRAIN_GAP_FIXES.md Gap 5. A model that both acts and
+    # confirms in the same turn (e.g. power_set + speak) used to have
+    # the confirmation silently dropped; the engine now executes each
+    # of these in order.
+    rationale = (msg.get("content") or "").strip()
+    actions: List[ProposedAction] = []
+    unknown_names: List[str] = []
+    for call in tool_calls:
+        fn = call.get("function") or {}
+        flat_name = fn.get("name") or ""
+        args_raw = fn.get("arguments")
+        args: Dict[str, Any]
+        if isinstance(args_raw, str):
+            try:
+                args = json.loads(args_raw) if args_raw else {}
+            except json.JSONDecodeError:
+                args = {}
+        elif isinstance(args_raw, dict):
+            args = args_raw
+        else:
             args = {}
-    elif isinstance(args_raw, dict):
-        args = args_raw
-    else:
-        args = {}
 
-    descriptor = decode.get(flat_name)
-    if descriptor is None:
+        descriptor = decode.get(flat_name)
+        if descriptor is None:
+            # Drop just this one call — other calls may be valid.
+            unknown_names.append(flat_name)
+            continue
+        actions.append(ProposedAction(
+            kind="tool",
+            topic=descriptor.topic,
+            action=descriptor.action,
+            args=args,
+            rationale=rationale,
+            tool_call_id=call.get("id"),
+        ))
+
+    if not actions:
         return ModelResponse(
             action=ProposedAction(
                 kind="done",
-                rationale=f"model called unknown tool {flat_name!r}",
+                rationale=f"model called unknown tool(s) {unknown_names!r}",
             ),
             raw=body,
             usage=usage,
         )
 
-    return ModelResponse(
-        action=ProposedAction(
-            kind="tool",
-            topic=descriptor.topic,
-            action=descriptor.action,
-            args=args,
-            rationale=(msg.get("content") or "").strip(),
-            tool_call_id=call.get("id"),
-        ),
-        raw=body,
-        usage=usage,
-    )
+    return ModelResponse(action=actions[0], actions=actions, raw=body, usage=usage)

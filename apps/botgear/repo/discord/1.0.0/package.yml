@@ -1,0 +1,70 @@
+name: discord
+title: Discord
+description: |
+  Discord bot implementing the ``messaging`` capability (see
+  docs/TODO_MESSAGING.md) — the same ``listen``/``speak``/``send``/
+  ``list_channels`` contract ``chat`` exposes, so a brain conversation
+  workflow can use a Discord channel exactly like it uses chat's text
+  box today.
+
+  Full bidirectional: connects to Discord's Gateway (an OUTBOUND
+  websocket the bot opens to Discord), so it needs no public HTTPS
+  endpoint or port-forwarding — works from a robot laptop behind a home
+  NAT the same as chat does.
+
+  Requires a bot application registered at discord.com/developers, with
+  the "Message Content Intent" privileged intent enabled — without it,
+  ``on_message`` events arrive with an EMPTY ``content`` field (a silent
+  failure, not an error). ``bot_token`` is stored as a Pydantic
+  ``SecretStr`` (encrypted at rest, masked on any bus/API egress).
+
+  Set ``default_channel`` (a Discord channel id) so ``speak()`` has
+  somewhere to send when the caller doesn't pass one explicitly.
+  ``guild_id`` (optional) narrows ``list_channels()`` to one server.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [messaging, discord, chat, brain]
+icon: icon.svg
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+implements: [messaging]
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/discord/1.0.0"
+
+entry:
+  argv: [python, -m, discord_service]
+
+wizard_config:
+  - id: auth
+    title: Bot credentials
+    fields:
+      - id: bot_token
+        type: password
+        title: Bot token
+        description: "From the Bot tab of your Discord application (discord.com/developers/applications). Enable the 'Message Content Intent' there too, or inbound messages arrive empty."
+        default: ""
+      - id: guild_id
+        type: string
+        title: Guild (server) id (optional)
+        description: Narrows list_channels() to one server. Leave blank to list channels across every server the bot has joined.
+        default: ""
+      - id: default_channel
+        type: string
+        title: Default channel id
+        description: Channel speak() targets when the caller doesn't pass one explicitly.
+        default: ""
+      - id: allowed_sender_ids
+        type: string
+        title: Allowed sender IDs (comma-separated, optional)
+        description: "Discord user IDs permitted to reach /inbox (DM or channel). Any other sender's message is dropped before it hits the bus. Leave blank to allow everyone."
+        default: ""

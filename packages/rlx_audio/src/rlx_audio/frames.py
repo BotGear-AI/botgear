@@ -1,17 +1,9 @@
 """Canonical audio-frame schema — shared by every ``microphone`` service.
 
 Both microphone service types (host capture, browser capture) publish the
-SAME frame shape on ``/microphone/{id}/audio`` so a consumer (speech-to-
-text, recorder, level meter) reads one format regardless of source:
-
-    {
-      "seq":         int,        # monotonic per-stream counter
-      "ts":          float,      # epoch seconds at capture
-      "sample_rate": int,        # Hz (e.g. 16000)
-      "channels":    int,        # 1 = mono
-      "format":      "pcm_s16le", # signed 16-bit little-endian interleaved
-      "data":        str,        # base64 of the raw PCM bytes
-    }
+SAME frame shape on ``/microphone/{id}/audio`` — ``AudioFrame`` below —
+so a consumer (speech-to-text, recorder, level meter) reads one format
+regardless of source.
 
 Keeping the encode/decode + level math in ONE module is what guarantees
 the two service types can't drift apart. PCM is ``s16le`` because it's the
@@ -26,19 +18,31 @@ import math
 import wave
 from typing import Any, Dict, Tuple
 
+from pydantic import BaseModel, Field
+
 FORMAT = "pcm_s16le"
+
+
+class AudioFrame(BaseModel):
+    """One audio frame — the wire shape of every ``.../audio`` topic."""
+    seq: int = Field(description="Monotonic per-stream counter")
+    ts: float = Field(description="Epoch seconds at capture")
+    sample_rate: int = Field(description="Hz, e.g. 16000")
+    channels: int = Field(description="1 = mono")
+    format: str = Field(description="'pcm_s16le' — signed 16-bit little-endian interleaved")
+    data: str = Field(description="base64 of the raw PCM bytes")
 
 
 def encode_frame(seq: int, ts: float, sample_rate: int, channels: int, pcm: bytes) -> Dict[str, Any]:
     """Build a wire frame from raw ``s16le`` PCM bytes."""
-    return {
-        "seq": int(seq),
-        "ts": float(ts),
-        "sample_rate": int(sample_rate),
-        "channels": int(channels),
-        "format": FORMAT,
-        "data": base64.b64encode(pcm).decode("ascii"),
-    }
+    return AudioFrame(
+        seq=int(seq),
+        ts=float(ts),
+        sample_rate=int(sample_rate),
+        channels=int(channels),
+        format=FORMAT,
+        data=base64.b64encode(pcm).decode("ascii"),
+    ).model_dump()
 
 
 def decode_frame(frame: Dict[str, Any]) -> bytes:

@@ -41,7 +41,7 @@ class ServiceMeta(BaseModel):
     config_steps: Optional[list] = Field(None, description="Per-instance configuration wizard steps shown on first Start", json_schema_extra={"type":"array","items":{"type":"object","additionalProperties":True,"properties":{"id":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"fields":{"type":"array","items":{"type":"object","additionalProperties":True}}}}})
     config_schema: Optional[dict] = Field(None, description="JSON Schema Draft-7 for per-instance config values — validated by ajv in doStart()", json_schema_extra={"type":"object","additionalProperties":True})
     ui_schema: Optional[dict] = Field(None, description="RJSF ui:schema for per-instance config form rendering hints (e.g. password widgets, field order)", json_schema_extra={"type":"object","additionalProperties":True})
-    ui: Optional[dict] = Field(None, description="Modular service-UI bundle descriptor (Option B — see docs/TODO_SERVICE_UI_BUNDLES.md). When present, the service ships a pre-built frontend ESM the host dynamically imports instead of a built-in serviceViews component. Shape — entry='ui/dist/ui.js', css?='ui/dist/ui.css', sdk='^1.0'. None = no bundled UI.", json_schema_extra={"type":"object","additionalProperties":True})
+    ui: Optional[dict] = Field(None, description="Modular service-UI bundle descriptor (Option B — see repo/README.md's \"Adding a UI\" section). When present, the service ships a pre-built frontend ESM the host dynamically imports instead of a built-in serviceViews component. Shape — entry='ui/dist/ui.js', css?='ui/dist/ui.css', sdk='^1.0'. None = no bundled UI.", json_schema_extra={"type":"object","additionalProperties":True})
 
 # managed
     @classmethod

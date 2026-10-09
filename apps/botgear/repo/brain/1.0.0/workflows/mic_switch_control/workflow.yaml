@@ -1,0 +1,74 @@
+description: |
+  Listen on the microphone for a spoken instruction to turn the
+  "switch-1" power switch (a Tasmota-flashed Sonoff device) on or off,
+  act on it, confirm out loud via text-to-speech, then keep listening.
+  Ends when the operator says "goodbye", detected directly off the STT
+  service's transcript stream (engine-enforced, bypasses the model —
+  see exit_on_phrase below). No motion, no other devices, no other
+  switches: this workflow is scoped to switch-1 only.
+
+  Setup: mic_local (microphone) -> stt_local (ear, continuous
+  transcription) -> this workflow -> tasmota (switch-1) for the action,
+  plus speech_local (speech-1) + speaker_local (speaker-1) for the
+  spoken confirmation. All five proxies must be running; then
+  start_workflow mic_switch_control.
+
+preferred_backend: ollama
+preferred_model: qwen3:8b
+# Same choice conversation_session made, for the same reason: a smaller
+# model (llama3.2:3b) was observed emitting a plain-text reply instead
+# of a tool call on later turns — a "done" in disguise that ends the
+# run. qwen3:8b calls tools reliably across turns, and is available
+# locally (confirmed via `ollama list` before writing this workflow).
+
+# Backstops only — the exit phrase terminates the session, not these.
+max_steps: 500
+timeout_seconds: 86400
+requires_human_approval: false
+# Same reasoning as conversation_session: gating a switch flip behind a
+# human click defeats the point of voice control. Safety instead comes
+# from allowed_tools.yaml's single-device allow-list (switch-1 only,
+# power_set/power_toggle/list_relays — not pulse/connect/disconnect).
+
+exit_on_phrase:
+  matches:
+    - goodbye
+    - good by     # STT often splits it: "GOOD BY", "good bye" (substring match)
+  case_insensitive: true
+  whole_message: false
+  # stt_local publishes every transcript (partial AND final) to
+  # /stt/{id}/text as {text, final, seq, ts} — the engine's watcher
+  # only reads the `text` field, so this works exactly like
+  # chat/discord's /inbox watching does; no stt-specific support
+  # needed. Caveat: a PARTIAL transcript containing "goodbye"
+  # mid-recognition can trigger this slightly before the utterance
+  # finalizes — acceptable for an exit phrase (worst case the session
+  # ends a moment early), unlike the switch instruction itself, which
+  # the model only ever sees as a finalized listen() result anyway.
+  listen_topic:
+    - /stt/+/text
+
+# Keep the session alive across silence — see prompt.md, step 1.
+loop_on_timeout:
+  tool: listen
+  field: timeout
+  value: true
+
+inputs:
+  listen_window_seconds:
+    type: integer
+    required: false
+    default: 8
+    description: |
+      How long stt_local listens for each turn before returning a
+      timeout (handled by loop_on_timeout — silently re-listens, no LLM
+      round trip, no step consumed).
+
+steps:
+  - id: default
+    prompt: prompt.md
+    on_success: success.md
+    on_failure: failure.md
+
+context:
+  - memory/switch_log.md

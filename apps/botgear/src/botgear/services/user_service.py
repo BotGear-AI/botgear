@@ -41,7 +41,7 @@ def create_user(item: User, user: dict, request: Request):
 
 # read - get all items
 def get_all_user(user: dict, request: Request):
-    logger.info("===============get_all_user called==============")
+    logger.debug("===============get_all_user called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("user")
@@ -49,18 +49,20 @@ def get_all_user(user: dict, request: Request):
 
 # read - get an item
 def get_user(id: str, user: dict, request: Request):
-    logger.info("===============get_user called==============")
-    logger.info(f"Received request to retrieve user with id: {id}")
+    logger.debug("===============get_user called==============")
+    logger.debug(f"Received request to retrieve user with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("user", id)
     return item
 
 # read - get_path an item
 def get_path_user(path: str, user: dict, request: Request):
-    logger.info("===============get_user called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_user called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("user", path)
     return item
@@ -90,6 +92,7 @@ def delete_user(id: str, user: dict, request: Request):
     logger.info("===============delete_user called==============")
     logger.info(f"Received request to delete user with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("user", id)
         if not item:

@@ -112,7 +112,7 @@ def register_script_routes(app: FastAPI, get_db_provider: Callable) -> None:
         ``<repo>/<name>/<version>/ui/dist/ui.js``. 404 when the service
         ships no bundled UI — the host then falls back to its static
         serviceViews registry / a placeholder. See
-        docs/TODO_SERVICE_UI_BUNDLES.md."""
+        repo/README.md's "Adding a UI" section."""
         path = _find_repo_file(name, version, "ui", "dist", "ui.js")
         if path is None:
             raise HTTPException(status_code=404, detail="no ui bundle")

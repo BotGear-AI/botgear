@@ -18,7 +18,7 @@ bundled: true
 # example in the build+publish smoke set.
 publish: true
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md). The
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section). The
 # host dynamically imports ui/dist/ui.js instead of a built-in
 # serviceViews component. (Spike: ui.js is hand-written; a Vite lib build
 # replaces it later.)

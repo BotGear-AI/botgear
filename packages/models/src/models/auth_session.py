@@ -4,14 +4,13 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class AuthSession(BaseModel):
     id: Optional[str] = Field(None, json_schema_extra={"example":"sess_123e4567e89b12d3"})
     user_id: Optional[str] = Field(None, json_schema_extra={"example":"123e4567-e89b-12d3-a456-426614174000"})
     tenant_id: Optional[str] = Field(None, json_schema_extra={"example":"tenant_001"})
     refresh_token_hash: Optional[str] = Field(None, description="Hash of refresh token (never store raw refresh token)", json_schema_extra={"example":"sha256:abcd..."})
-    status: Literal["active","revoked","expired"] = Field("active", json_schema_extra={"example":"active"})
+    status: Literal["active","revoked","expired","mfa_pending"] = Field("active", json_schema_extra={"example":"active"})
     created: Optional[int] = Field(None, json_schema_extra={"example":1683123456789})
     expires_at: Optional[int] = Field(None, json_schema_extra={"example":1685725456789})
     revoked_at: Optional[int] = Field(None, json_schema_extra={"example":1684000000000})

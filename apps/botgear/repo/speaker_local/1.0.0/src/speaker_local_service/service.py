@@ -8,7 +8,8 @@ SOURCE reader:
   * topic input  → frames arrive on the bus; base routes them to _play_pcm.
   * file / url   → a reader task decodes the source to PCM at the configured
                    rate, paces it into the output buffer in real time, and
-                   republishes frames on /speaker/{id}/audio so the UI meters.
+                   publishes a small decimated waveform on /speaker/{id}/viz
+                   (an ``AudioFrame``) so the UI can draw the playhead.
 
 Decoding: WAV is handled by the stdlib ``wave`` module (zero-dependency);
 other formats (mp3/ogg/flac) use ``miniaudio`` when present. ``sounddevice``
@@ -29,7 +30,7 @@ import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from rlx_audio import SpeakerServiceBase, encode_frame
+from rlx_audio import AudioFrame, SpeakerServiceBase, encode_frame
 from rlx_bus import service_method
 
 _VIZ_SAMPLES = 64       # decimated samples per viz frame
@@ -49,6 +50,10 @@ def _sd():
 
 class SpeakerLocalService(SpeakerServiceBase):
     source = "local"
+    publishes = [*SpeakerServiceBase.publishes, "viz"]
+    # Mono, _VIZ_SAMPLES decimated samples taken at the audible position —
+    # a UI waveform, not playable audio.
+    topic_schemas = {"viz": AudioFrame}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)

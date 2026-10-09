@@ -4,15 +4,12 @@
 A first-class Service implementation. See runtime/framework/ for the
 uniform service shape every service implements.
 
-Bus topics
-----------
-  /clock/{proxy_id}/tick     -> {"seq": int, "interval_ms": int, "now": float}
-                                published every interval_ms ms while not paused.
-  /clock/{proxy_id}/state    -> {"paused": bool, "interval_ms": int}  (retained)
-                                Late UI subscribers see the current truth here.
-  /clock/{proxy_id}/control  <- {"action": "start_clock"}
-                              | {"action": "stop_clock"}
-                              | {"action": "set_interval", "interval_ms": int}
+Wire shape is declared in code below (``TickPayload``, ``ClockState``,
+``topic_schemas``/``state_schema``) — introspected into this type's
+descriptor at ``/runtime/runtime/types/clock`` (see
+``runtime/types_index.py``), not hand-documented here. Control actions
+(start_clock/stop_clock/set_interval) are discoverable the same way,
+straight off their @service_method signatures.
 
 The inner pause + interval are independent of service lifecycle —
 ``stop_clock`` pauses publishing, ``set_interval`` changes the rate, but
@@ -26,7 +23,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -53,8 +50,25 @@ class ClockConfig(ServiceConfig):
     is_clock_running: bool = Field(True, description="Resume the tick loop on start")
 
 
+# ── wire schemas: these ARE the docs now, not a docstring block ──────────
+
+class TickPayload(BaseModel):
+    """Published on ``/clock/{id}/tick`` every interval_ms while not paused."""
+    seq: int = Field(description="Monotonic tick counter, resets to 0 on service start")
+    interval_ms: int = Field(description="Interval in effect for this tick")
+    now: float = Field(description="time.time() at publish")
+
+
+class ClockState(BaseModel):
+    """Retained on ``/clock/{id}/state`` — late subscribers see current truth."""
+    paused: bool
+    interval_ms: int
+
+
 class ClockService(Service):
     config_class = ClockConfig
+    state_schema = ClockState
+    topic_schemas = {"tick": TickPayload}
     # Always-on topics — surfaced in the Composer's Topics tab + the
     # Topology page so users see what clock instances broadcast.
     publishes = ["tick", "state"]
@@ -140,11 +154,8 @@ class ClockService(Service):
     def _publish_state(self) -> None:
         """One retained state message captures both knobs the UI cares
         about — pause + interval. Keeps the wire grammar small."""
-        self.publish(
-            "state",
-            {"paused": self._paused, "interval_ms": self.interval_ms},
-            retained=True,
-        )
+        state = ClockState(paused=self._paused, interval_ms=self.interval_ms)
+        self.publish("state", state.model_dump(), retained=True)
 
     async def _tick_loop(self) -> None:
         seq = 0
@@ -155,10 +166,8 @@ class ClockService(Service):
             # next tick without restarting the loop.
             interval_s = max(MIN_INTERVAL_MS / 1000.0, self.interval_ms / 1000.0)
             if not self._paused:
-                self.publish(
-                    "tick",
-                    {"seq": seq, "interval_ms": self.interval_ms, "now": time.time()},
-                )
+                tick = TickPayload(seq=seq, interval_ms=self.interval_ms, now=time.time())
+                self.publish("tick", tick.model_dump())
                 seq += 1
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval_s)

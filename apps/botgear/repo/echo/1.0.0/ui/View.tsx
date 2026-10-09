@@ -1,5 +1,5 @@
 // Modular service UI for echo — the real, COMPILED source (Option B,
-// docs/TODO_SERVICE_UI_BUNDLES.md). Built to ui/dist/ui.js by the
+// see repo/README.md's "Adding a UI" section). Built to ui/dist/ui.js by the
 // framework-owned vite lib config (externalizing react + @rlx/ui, JSX via
 // the automatic runtime → exercises the /rlx/jsx-runtime.js shim). A
 // service author writes only this file.

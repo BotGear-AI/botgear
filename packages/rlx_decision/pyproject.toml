@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=83.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlx_decision"
+version = "0.1.0"
+description = "Fast System One decision primitive client (Jev / TypeSafe AI) for robotics, event routing, and sub-200ms reflexes."
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0,<3.0",
+    "requests>=2.28",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

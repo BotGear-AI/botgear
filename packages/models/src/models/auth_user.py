@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class AuthUser(BaseModel):
     id: Optional[str] = Field(None, json_schema_extra={"example":"123e4567-e89b-12d3-a456-426614174000"}, description="Primary user id (UUID)")
@@ -21,10 +20,10 @@ class AuthUser(BaseModel):
     permissions: Optional[list[str]] = Field(None, description="Optional fine-grained permissions", json_schema_extra={"example":["reports.read","reports.write"]})
     status: Literal["active","invited","disabled","locked"] = Field("active", description="Account lifecycle status", json_schema_extra={"example":"active"})
     auth_provider: Optional[Literal["local","oauth","unknown"]] = Field("local", description="Where the user authenticates", json_schema_extra={"example":"okta"})
-    password_hash: Optional[str] = Field(None, json_schema_extra={"example":"$2b$12$abcdefghijklmnopqrstuv"})
+    password_hash: Optional[str] = Field(None, exclude=True, repr=False, json_schema_extra={"example":"$2b$12$abcdefghijklmnopqrstuv"})
     password_updated_at: Optional[int] = Field(None, description="Epoch ms when password was last changed", json_schema_extra={"example":1683123456789})
     is_mfa_enabled: Optional[bool] = Field(False, description="Enable multi-factor auth", json_schema_extra={"example":True})
-    totp_secret: Optional[str] = Field(None, description="TOTP secret (should be encrypted at rest)", json_schema_extra={"example":"BASE32SECRET"})
+    totp_secret: Optional[str] = Field(None, exclude=True, repr=False, description="TOTP secret (should be encrypted at rest)", json_schema_extra={"example":"BASE32SECRET"})
     login_count: Optional[int] = Field(0, json_schema_extra={"example":5})
     last_login: Optional[int] = Field(None, json_schema_extra={"example":1683123456789})
     last_unsuccessful_login: Optional[int] = Field(None, json_schema_extra={"example":1683123456789})

@@ -383,7 +383,7 @@ def stop(proxy_id: str, *, timeout: float = _GRACEFUL_STOP_SECONDS) -> Dict[str,
     # Windows: snapshot the child subtree BEFORE stopping the root, so we
     # can sweep any workers the service didn't reap itself (Windows has no
     # atomic process-group kill and doesn't auto-reap orphans; Job Objects
-    # are the Phase-3 fix — docs/TODO_WINDOWS_SUPPORT.md). POSIX kills the
+    # are the Phase-3 fix — see AGENTS.md's "Windows support" section). POSIX kills the
     # whole group atomically via killpg, so no snapshot is needed → [].
     pre_children = (
         proc_compat.snapshot_child_pids(process.pid)
@@ -419,12 +419,49 @@ def stop(proxy_id: str, *, timeout: float = _GRACEFUL_STOP_SECONDS) -> Dict[str,
     return {"stopped": True, "rc": rc}
 
 
-def stop_all() -> None:
-    """Best-effort shutdown of every supervised process. Used on app exit."""
+def stop_all(*, timeout: float = _GRACEFUL_STOP_SECONDS) -> int:
+    """Stop every supervised process at once. Used on app exit.
+
+    Same SIGTERM → wait → SIGKILL as ``stop``, but every process is asked
+    first and they share ONE deadline — stopping them one by one costs up
+    to ``timeout`` per service that ignores SIGTERM. Returns how many were
+    stopped."""
     with _REGISTRY_LOCK:
-        proxy_ids = list(_REGISTRY.keys())
-    for pid in proxy_ids:
+        targets = list(_REGISTRY.items())
+    live = []
+    pre_children: List[int] = []      # Windows-only sweep, same as stop()
+    for proxy_id, running in targets:
+        running.expected_stop.set()
+        if running.process.poll() is not None:
+            continue
+        if proc_compat.IS_WINDOWS:
+            pre_children += proc_compat.snapshot_child_pids(running.process.pid)
         try:
-            stop(pid, timeout=_GRACEFUL_STOP_SECONDS)
-        except Exception:
-            logger.exception("process_manager.stop_all failed for %s", pid)
+            _request_graceful_stop(proxy_id, running.process.pid)
+            live.append((proxy_id, running))
+        except Exception:  # noqa: BLE001
+            logger.exception("process_manager.stop_all: graceful stop failed for %s", proxy_id)
+            live.append((proxy_id, running))
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and any(r.process.poll() is None for _, r in live):
+        time.sleep(0.1)
+
+    for proxy_id, running in live:
+        if running.process.poll() is None:
+            logger.warning("process_manager.sigkill proxy=%s (graceful exit timed out)", proxy_id)
+            try:
+                proc_compat.force_kill_tree(running.process.pid)
+                running.process.wait(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                logger.exception("process_manager.stop_all: kill failed for %s", proxy_id)
+    for cpid in pre_children:
+        if proc_compat.pid_alive(cpid):
+            proc_compat.force_kill_tree(cpid)
+    for proxy_id, running in targets:
+        for t in running.pumps:
+            t.join(timeout=0.5)
+        with _REGISTRY_LOCK:
+            _REGISTRY.pop(proxy_id, None)
+    logger.info("process_manager.stop_all: stopped %d process(es)", len(targets))
+    return len(targets)

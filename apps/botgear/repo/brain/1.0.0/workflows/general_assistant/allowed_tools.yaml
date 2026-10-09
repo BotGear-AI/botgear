@@ -1,0 +1,54 @@
+# default_policy: allow — the inversion. Anything live on the bus is
+# reachable UNLESS blocked below. See
+# src/botgear/agent_surface/excludes.py for the
+# shared hardware-danger excludes this automatically inherits
+# (movement / arm / system / video / sabertooth / motor_control) — that
+# list is NOT repeated here on purpose; context_loader.py's
+# _load_allowed_tools merges it in unconditionally for any workflow
+# that sets default_policy: allow, so it can't be forgotten or skipped
+# per-workflow.
+default_policy: allow
+
+allowed: []
+# Nothing needs to go here — default_policy: allow already covers
+# everything not blocked. An `allowed` entry only matters for
+# something ALSO in `blocked`, and `blocked` always wins regardless
+# (see safety_gate.py) — so there is no way to use `allowed` to carve
+# an exception back into a block, here or anywhere else.
+
+blocked:
+  # Brain's OWN self-control surface. NOT in the shared hardware
+  # excludes on purpose — this is a privilege-escalation / system-
+  # integrity risk, not a physical-danger one, so it's specific to
+  # this workflow rather than shared across every inverted workflow.
+  # A default-allow assistant that could ALSO call these would be
+  # able to:
+  #   - start_workflow: launch a DIFFERENT, possibly more permissive
+  #     workflow, bypassing this one's own restrictions entirely
+  #   - cancel / approve: interfere with OTHER runs, including
+  #     anything mid-flight elsewhere on this instance
+  #   - clear_backend / set_backend / set_active_backend: tamper with
+  #     backend credentials/URLs
+  #   - save_workflow_preferences / save_run_configuration /
+  #     delete_run_configuration / set_default_configuration: mutate
+  #     OTHER workflows' stored config, not just this one's own memory
+  #   - clear_runs: destroy the run audit trail
+  #   - test_backend: probe whether backend credentials work
+  # Left reachable (NOT blocked, intentionally): list_workflows,
+  # list_tools, get_run, list_run_configurations, get_backends,
+  # list_backend_models — read-only introspection, the actual point of
+  # this workflow — plus read_memory/write_memory for its own memory.
+  - topic: /brain/*/control
+    actions:
+      - start_workflow
+      - cancel
+      - approve
+      - clear_backend
+      - set_backend
+      - set_active_backend
+      - save_workflow_preferences
+      - save_run_configuration
+      - delete_run_configuration
+      - set_default_configuration
+      - clear_runs
+      - test_backend

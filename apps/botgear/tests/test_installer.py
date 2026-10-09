@@ -22,11 +22,13 @@ def _bin(cwd) -> Path:
 def no_rlx_bus(monkeypatch):
     # Two-step plan (create_venv → install_deps) keeps assertions simple.
     # Neutralize ALL pre-installed local packages (rlx_bus + rlx_audio +
-    # rlx_input + rlx_servo_cal) so the plan is just create_venv → install_deps.
+    # rlx_input + rlx_servo_cal + rlx_messaging) so the plan is just
+    # create_venv → install_deps.
     monkeypatch.setattr(installer, "_rlx_bus_local_path", lambda: None)
     monkeypatch.setattr(installer, "_rlx_audio_local_path", lambda: None)
     monkeypatch.setattr(installer, "_rlx_input_local_path", lambda: None)
     monkeypatch.setattr(installer, "_rlx_servo_cal_local_path", lambda: None)
+    monkeypatch.setattr(installer, "_rlx_messaging_local_path", lambda: None)
 
 
 def _fake_stream_ok(argv, cwd, on_progress, timeout):

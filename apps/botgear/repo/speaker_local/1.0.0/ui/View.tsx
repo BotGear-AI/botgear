@@ -5,7 +5,7 @@
 // device). The meter is computed from the frames the speaker plays
 // (/speaker/{id}/audio — the backend republishes file/url frames there).
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useWsClient, useServiceRequest, type InboundFrame, type ServiceProxy } from '@rlx/ui'
+import { useWsClient, useServiceRequest, MicrophoneSourcePicker, type InboundFrame, type ServiceProxy } from '@rlx/ui'
 
 interface Dev { id: string; label: string; default?: boolean }
 interface Track { kind: string; ref: string; name?: string }
@@ -184,9 +184,16 @@ export default function SpeakerLocalView({ proxy }: { proxy: ServiceProxy }) {
             <option value="file">File</option>
             <option value="url">URL</option>
           </select>
-          {kind !== '' && (
+          {kind === 'topic' && (
+            <MicrophoneSourcePicker
+              value={ref}
+              onChange={(topic) => { setRef(topic); inputDirty.current = true }}
+              className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-200"
+            />
+          )}
+          {(kind === 'file' || kind === 'url') && (
             <input type="text" value={ref} onChange={(e) => { setRef(e.target.value); inputDirty.current = true }}
-              placeholder={kind === 'topic' ? '/microphone/mic-1/audio' : kind === 'file' ? '/path/on/server.wav' : 'https://…/audio.mp3'}
+              placeholder={kind === 'file' ? '/path/on/server.wav' : 'https://…/audio.mp3'}
               className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px]" />
           )}
           {kind === 'file' && (

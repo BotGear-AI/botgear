@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="24" height="24">
+  <title>google_chat</title>
+  <!-- Generic chat bubble with an outbound arrow — this integration is
+       send-only in v1. Deliberately NOT the Google Chat trademarked
+       logo. Lucide-style, matches every other service icon's stroke
+       convention. -->
+  <path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-8l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" />
+  <path d="M8 10h5" />
+  <path d="M11 7l3 3-3 3" />
+</svg>

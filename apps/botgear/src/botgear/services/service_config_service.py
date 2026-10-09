@@ -41,7 +41,7 @@ def create_service_config(item: ServiceConfig, user: dict, request: Request):
 
 # read - get all items
 def get_all_service_config(user: dict, request: Request):
-    logger.info("===============get_all_service_config called==============")
+    logger.debug("===============get_all_service_config called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("service_config")
@@ -49,18 +49,20 @@ def get_all_service_config(user: dict, request: Request):
 
 # read - get an item
 def get_service_config(id: str, user: dict, request: Request):
-    logger.info("===============get_service_config called==============")
-    logger.info(f"Received request to retrieve service_config with id: {id}")
+    logger.debug("===============get_service_config called==============")
+    logger.debug(f"Received request to retrieve service_config with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_config", id)
     return item
 
 # read - get_path an item
 def get_path_service_config(path: str, user: dict, request: Request):
-    logger.info("===============get_service_config called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_service_config called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_config", path)
     return item
@@ -90,6 +92,7 @@ def delete_service_config(id: str, user: dict, request: Request):
     logger.info("===============delete_service_config called==============")
     logger.info(f"Received request to delete service_config with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_config", id)
         if not item:

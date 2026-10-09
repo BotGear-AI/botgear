@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lcus_relay_service"
+version = "1.0.0"
+description = "botgear lcus_relay service — LCUS-1/2/4/8 USB relay modules over the trivial A0/channel/command/checksum serial protocol."
+requires-python = ">=3.10"
+dependencies = [
+    # pyserial owns the actual port I/O. Pinned loose — pyserial is an
+    # old, stable lib and we only use its long-stable surface.
+    "pyserial>=3.5,<4.0",
+    # rlx_bus is pre-installed into every venv by runtime/installer.py
+    # so it doesn't appear here. It brings websockets along.
+]
+
+[project.scripts]
+lcus_relay_service = "lcus_relay_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

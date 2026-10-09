@@ -1,3 +1,4 @@
+from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple, Union
 
@@ -58,6 +59,45 @@ class DatabaseAdapter(ABC):
         :param include_nulls: When False (default), None values in updates are ignored.
         """
         pass
+
+    def bulk_update_items(
+        self, table: str, updates_by_id: Dict[str, dict], include_nulls: bool = False
+    ) -> List[dict]:
+        """Apply a per-row update to many rows of ``table`` at once.
+
+        ``updates_by_id`` maps row id -> the same-shaped ``updates`` dict
+        ``update_item`` takes. Returns the updated rows (order not
+        guaranteed to match input order).
+
+        Non-abstract on purpose, same rationale as ``query_page``: this
+        default just calls ``update_item`` once per row, so every adapter
+        (including document/key-value backends with no native multi-row
+        UPDATE) gets correct behavior for free. It exists so a caller
+        writing hundreds/thousands of rows in one logical operation (e.g.
+        re-evaluating a batch of records against a rule set) has a single
+        entry point to call — adapters that can push a real multi-row
+        UPDATE down into the engine (Postgres, SQL backends) override this
+        to collapse what would otherwise be one network round-trip per row
+        into a small, constant number of round-trips for the whole batch.
+        Confirmed in practice: 976 sequential update_item() calls against
+        Postgres took ~53s (each paying its own connection-pool checkout +
+        validation ping + single-row UPDATE); the point of overriding this
+        is to turn that into a handful of multi-row statements instead.
+        """
+        results = []
+        for row_id, updates in updates_by_id.items():
+            result = self.update_item(table, row_id, updates, include_nulls=include_nulls)
+            if result:
+                results.append(result)
+        return results
+
+    def compare_and_update_item(self, table: str, key: str, expected: dict, updates: dict) -> bool:
+        """Atomically update scalar fields only if the stored row matches expected.
+
+        Return False on a missing row or mismatch. Unsupported adapters must
+        raise rather than approximate this operation with separate reads/writes.
+        """
+        raise NotImplementedError("Atomic conditional updates are not supported")
 
     @abstractmethod
     def delete_item(self, table: str, key: str) -> None:
@@ -122,6 +162,40 @@ class DatabaseAdapter(ABC):
             rows = rows[:limit]
         return rows, total
 
+    def prune_older_than(
+        self,
+        table: str,
+        field: str,
+        cutoff: datetime,
+        *,
+        batch_size: int = 5000,
+        max_rows: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> int:
+        """Delete rows whose ``field`` is a point in time before ``cutoff``
+        (an aware UTC datetime); returns how many were deleted (or would be,
+        with ``dry_run``). The primitive behind ``__retention__`` — see
+        ``database.retention`` for policies, scheduling and the safety rails.
+
+        A row is deleted only when its value is provably older: NULL or
+        unparseable values are kept. Values may be ISO-8601 strings,
+        datetimes or epoch numbers (ms above 1e11, else seconds).
+
+        Non-abstract on purpose, like ``query_page``: this default scans the
+        table in Python and deletes row by row, so it works on **every**
+        adapter; Postgres and TinyDB override it. O(table) — fine for small
+        tables only.
+        """
+        from database.retention import is_older
+        doomed = [row.get("id") for row in self.get_all_items(table)
+                  if row.get("id") is not None and is_older(row.get(field), cutoff)]
+        if max_rows is not None:
+            doomed = doomed[:max_rows]
+        if not dry_run:
+            for key in doomed:
+                self.delete_item(table, key)
+        return len(doomed)
+
     @abstractmethod
     def search_by_key_part(
         self, table: str, key_part: str, regex: bool = False
@@ -150,6 +224,27 @@ class DatabaseAdapter(ABC):
         For SQL backends, this is a SQL query with optional parameters. For others, NotImplementedError is raised.
         """
         pass
+
+    def query_readonly(
+        self, querystr: str, params: tuple = None,
+        timeout_ms: int = 10000, row_limit: int = 500,
+    ) -> Tuple[List[dict], bool]:
+        """
+        Execute querystr with writes rejected at the database level and a
+        statement timeout, for ad-hoc admin/debug query tools. Returns
+        (rows, truncated) — truncated is True when more than row_limit rows
+        were available.
+
+        Non-abstract on purpose, matching list_tables(): existing adapters
+        continue to work unchanged; only backends that opt in (e.g. for an
+        admin SQL-debug page) need to implement it. Raising NotImplementedError
+        by default means a backend that hasn't implemented a real read-only
+        guard can never silently allow writes through this path.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement query_readonly(). "
+            "Ad-hoc read-only query tools are unavailable for this backend."
+        )
 
 
     @abstractmethod

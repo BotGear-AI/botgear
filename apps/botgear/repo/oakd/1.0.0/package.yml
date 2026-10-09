@@ -1,0 +1,68 @@
+name: oakd
+title: OAK-D
+description: |
+  Luxonis OAK-D depth camera family (OAK-D, OAK-D Lite, OAK-D Pro, ...).
+  An OAK-D is not a plain webcam — it's a small edge-AI compute pipeline
+  (Movidius Myriad X VPU) that computes a stereo depth map ON THE DEVICE
+  from its two mono cameras, alongside its RGB camera. This service
+  streams both: RGB and a colorized depth preview, over the same MJPEG
+  transport the ``video`` service uses.
+
+  Subprocess service — runs in its own venv (the ``depthai`` SDK is a
+  large, version-coupled-to-hardware dependency; isolating it here keeps
+  every other service's venv untouched) and its own child process (so
+  the device's USB handle + DepthAI's background threads stay isolated
+  from the backend, same reasoning as ``video``).
+
+  v1 scope: RGB + depth streaming only. On-device neural-network
+  inference (spatial object detection — real-world x/y/z per detection,
+  OAK-D's flagship feature) is a documented future phase, not implemented
+  yet — see this type's README.md.
+
+  Optional (off by default): ``publish_depth_samples`` publishes a
+  low-rate, decimated, metric-millimeter depth grid on
+  ``/oakd/{id}/depth_sample`` — feeds the ``slam`` service's 2D
+  occupancy mapping (docs/TODO_SLAM.md). Zero cost when left off.
+
+  REQUIRES a one-time host udev rule before the device will open — see
+  "OAK-D USB permissions" in AGENTS.md. Symptom without it: the service
+  starts but /state.error reports a permission-denied/device-not-found
+  failure even though the OS sees the device.
+
+  USB3 is required for reliable operation (USB2 causes bandwidth
+  starvation / crashes on OAK-D Lite specifically) — /state.usb_speed
+  reports what was actually negotiated so a slow/choppy stream is
+  diagnosable without a terminal.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [video, camera, depth, oak-d, luxonis, streaming]
+icon: icon.svg
+
+bundled: true
+publish: true
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/oakd/1.0.0"
+
+# Shown by the install wizard before the one-time dependency install —
+# same disclosure pattern as the video service's license block.
+license: |
+  oakd — third-party dependency notice.
+
+  Installing this service downloads the `depthai` Python SDK
+  (Apache-2.0, https://github.com/luxonis/depthai-python), which bundles
+  Luxonis' device-side firmware/bootloader blob for the OAK-D family,
+  plus opencv-contrib-python-headless (Apache-2.0, same dependency
+  ``video`` already uses) for depth colorization + JPEG encoding. By
+  proceeding you confirm you have reviewed and accept these third-party
+  licenses for your deployment.
+
+entry:
+  argv: [python, -m, oakd_service]

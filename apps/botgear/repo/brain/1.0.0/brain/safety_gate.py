@@ -13,82 +13,38 @@ Pattern grammar:
   literal     exact match
 
 Evaluation:
-  1. Any blocked match  → DENY (blocked wins ties)
+  1. Any blocked match  → DENY (blocked ALWAYS wins — unconditional,
+                          regardless of default_policy below; there is
+                          no way for an allowed-rule to carve an
+                          exception back into a block)
   2. Any allowed match  → ALLOW
-  3. Otherwise          → DENY (default-deny)
+  3. Otherwise          → workflow.allowed_tools.default_policy decides:
+                          "deny" (default — unchanged for every workflow
+                          that doesn't opt in) or "allow" (inverted
+                          default for that one workflow — see
+                          ToolPolicy.default_policy and
+                          botgear/agent_surface/excludes.py for the
+                          mandatory hard-exclude list that comes with it)
 """
 from __future__ import annotations
 
-import fnmatch
 import logging
-from typing import Iterable, Optional
+from typing import Optional
 
-from brain.schemas import AllowedTools, ProposedAction, SafetyVerdict, ToolDescriptor, ToolPattern, Workflow
+# The matching grammar + policy evaluation are botgear's shared agent
+# surface (docs/AGENT_ROADMAP.md, Phase 0) — one policy for every mind.
+# Re-exported under brain's historical names.
+from botgear.agent_surface.policy import (  # noqa: F401
+    action_matches as _action_matches,
+    capability_prefix,
+    check_call,
+    matches_any as _matches_any,
+    topic_matches as _topic_matches,
+)
+from brain.schemas import ProposedAction, SafetyVerdict, ToolDescriptor, Workflow
 
 
 logger = logging.getLogger(__name__)
-
-
-def _strip_federation(s: str) -> tuple[str, bool]:
-    """Strip an inline ``@<peer>`` suffix from any segment of a topic.
-
-    Returns ``(unfederated, was_federated)``. The federation suffix
-    lives WITHIN a path segment (``/video/video-1@funny-droid/control``)
-    so we walk the segments to find it — a top-level ``partition('@')``
-    would chop off everything after the first ``@``, including the
-    rest of the topic path.
-    """
-    parts = s.split("/")
-    federated = False
-    for i, part in enumerate(parts):
-        if "@" in part:
-            seg_base, _, _peer = part.partition("@")
-            parts[i] = seg_base
-            federated = True
-    return "/".join(parts), federated
-
-
-def _topic_matches(pattern: str, topic: str) -> bool:
-    """Glob a topic against a pattern.
-
-    ``*`` matches exactly one path segment (no slash crossing — fnmatch's
-    default greedy ``*`` is the wrong shape for bus topics).
-
-    ``@**`` is the federation opt-in: a pattern containing ``@**``
-    in any segment matches both unfederated and federated topics.
-    Without it, federated topics never match.
-    """
-    pattern_base, _ = _strip_federation(pattern.replace("@**", ""))
-    federation_opt_in = "@**" in pattern
-    topic_base, topic_federated = _strip_federation(topic)
-
-    if topic_federated and not federation_opt_in:
-        return False
-
-    p_parts = pattern_base.split("/")
-    t_parts = topic_base.split("/")
-    if len(p_parts) != len(t_parts):
-        return False
-    for pp, tp in zip(p_parts, t_parts):
-        if not fnmatch.fnmatchcase(tp, pp):
-            return False
-    return True
-
-
-def _action_matches(actions: list[str], proposed: str) -> bool:
-    """Membership check with ``"*"`` as a wildcard meaning "any action
-    on this topic". An empty list matches nothing — workflow authors
-    have to write something explicit to allow anything."""
-    if "*" in actions:
-        return True
-    return proposed in actions
-
-
-def _matches_any(patterns: Iterable[ToolPattern], topic: str, action: str) -> Optional[ToolPattern]:
-    for p in patterns:
-        if _topic_matches(p.topic, topic) and _action_matches(p.actions, action):
-            return p
-    return None
 
 
 def check_tool_call(
@@ -101,39 +57,9 @@ def check_tool_call(
     + the live tool catalog. Returns a SafetyVerdict — never raises."""
     if action.kind != "tool":
         return SafetyVerdict(allowed=True, reason="terminal action")
-
-    topic = action.topic or ""
-    name = action.action or ""
-
-    blocked = _matches_any(workflow.allowed_tools.blocked, topic, name)
-    if blocked is not None:
-        return SafetyVerdict(
-            allowed=False,
-            guard="block_list",
-            reason=f"matched blocked pattern: topic={blocked.topic!r} action={name!r}",
-        )
-
-    allowed = _matches_any(workflow.allowed_tools.allowed, topic, name)
-    if allowed is None:
-        return SafetyVerdict(
-            allowed=False,
-            guard="allow_list",
-            reason=(
-                f"no allow rule matches topic={topic!r} action={name!r} "
-                f"(default-deny — workflow.allowed_tools.allowed needs an entry)"
-            ),
-        )
-
-    if tool_catalog is not None:
-        descriptor = tool_catalog.get(f"{topic}::{name}")
-        if descriptor is None:
-            return SafetyVerdict(
-                allowed=False,
-                guard="unknown_target",
-                reason=f"{topic} has no live service exposing action {name!r}",
-            )
-
-    return SafetyVerdict(allowed=True, reason=f"matched allow rule {allowed.topic!r}")
+    return check_call(
+        workflow.allowed_tools, action.topic or "", action.action or "", catalog=tool_catalog,
+    )
 
 
 def check_max_steps(workflow: Workflow, steps_used: int) -> SafetyVerdict:

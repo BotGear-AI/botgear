@@ -3,8 +3,10 @@
 
 The id is generated once and persisted to ``<data_dir>/runtime_id``
 (plain text, single line). On every boot the file is read; if missing,
-a fresh ``adjective-robotnoun`` pair is picked and written. The id is
-also mirrored into the ``runtime`` service_proxy row's
+the machine hostname is sanitized into an id and written (falling
+back to a random ``adjective-robotnoun`` pair if the hostname can't
+be made into a valid id — e.g. empty, or no leading letter). The id
+is also mirrored into the ``runtime`` service_proxy row's
 ``service_config.runtime_id`` so the API + UI can read it without
 touching the bus.
 
@@ -31,6 +33,7 @@ import logging
 import os
 import random
 import re
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -67,9 +70,42 @@ _FILE_NAME = "runtime_id"
 _DEFAULT_DATA_DIR = "data"
 
 
-def generate_id() -> str:
-    """Pick a fresh adjective-noun pair."""
+def _sanitize_hostname(hostname: str) -> Optional[str]:
+    """Turn a raw hostname into a valid runtime id, or None if it can't
+    be (empty after stripping, or nothing left to lead with a letter).
+
+    FQDNs are trimmed to their leading label (``host.example.com`` ->
+    ``host``); anything outside ``[a-z0-9-]`` becomes a hyphen; runs of
+    hyphens collapse to one; a non-letter lead gets a ``host-`` prefix
+    so it satisfies the ``@<id>`` topic-suffix grammar.
+    """
+    name = hostname.strip().lower().split(".", 1)[0]
+    name = re.sub(r"[^a-z0-9-]+", "-", name)
+    name = re.sub(r"-{2,}", "-", name).strip("-")
+    if not name:
+        return None
+    if not name[0].isalpha():
+        name = f"host-{name}"
+    name = name[:63].rstrip("-")
+    return name if is_valid_id(name) else None
+
+
+def _generate_random_id() -> str:
+    """Fallback id: a fresh adjective-noun pair, used when the machine
+    hostname can't be turned into a valid id."""
     return f"{random.choice(_ADJECTIVES)}-{random.choice(_ROBOT_NOUNS)}"
+
+
+def generate_id() -> str:
+    """Pick a default id: the machine hostname, sanitized to fit the
+    id format. Falls back to a random adjective-noun pair if the
+    hostname is unavailable or can't be made into a valid id."""
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        hostname = ""
+    sanitized = _sanitize_hostname(hostname) if hostname else None
+    return sanitized if sanitized is not None else _generate_random_id()
 
 
 def is_valid_id(value: str) -> bool:
@@ -136,7 +172,8 @@ def resolve_runtime_id(
          Config model — typically set via ``BOTGEAR_RUNTIME_ID`` in
          ``.env``; same source as every other ``BOTGEAR_*`` knob)
       4. The persisted text file at ``data/runtime_id``
-      5. Freshly generated + written to the file
+      5. Freshly generated (hostname, or a random pair if that fails)
+         + written to the file
 
     Overrides 1-3 are READ-ONLY — they never mutate the persisted file.
     That keeps ``--env-file .env.funny-droid python -m botgear.main``

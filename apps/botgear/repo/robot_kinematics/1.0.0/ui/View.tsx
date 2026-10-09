@@ -178,7 +178,7 @@ function Grasp({ handRef, cupRef }: {
   handRef: React.MutableRefObject<RapierRigidBody | null>
   cupRef: React.MutableRefObject<RapierRigidBody | null>
 }) {
-  useFixedJoint(handRef, cupRef, [[0, 0, 0.04], [0, 0, 0, 1], [0, 0, 0], [0, 0, 0, 1]])
+  useFixedJoint(handRef as React.RefObject<RapierRigidBody>, cupRef as React.RefObject<RapierRigidBody>, [[0, 0, 0.04], [0, 0, 0, 1], [0, 0, 0], [0, 0, 0, 1]])
   return null
 }
 

@@ -53,7 +53,10 @@ def build_proto_user_from_registration(registration: dict) -> dict:
     earlier hook (e.g. on_new_registration) has stamped one onto it.
     """
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    user_id = registration.get("user_id") or registration.get("email")
+    # The account is always the registration's email: never trust a stored
+    # user_id (one written before /v1/register enforced user_id == email could
+    # name someone else's account).
+    user_id = (registration.get("email") or "").lower() or registration.get("user_id")
     return {
         "id": user_id,
         "tenant_id": registration.get("tenant_id"),
@@ -94,7 +97,10 @@ def verify_and_register(db, token: str, *, hook_module: Any = None) -> dict:
     registration["state"] = "verified"
     db.update_item("registration", registration.get("id"), registration)
 
-    user_id = registration.get("user_id") or registration.get("email")
+    # The account is always the registration's email: never trust a stored
+    # user_id (one written before /v1/register enforced user_id == email could
+    # name someone else's account).
+    user_id = (registration.get("email") or "").lower() or registration.get("user_id")
     existing_user = db.get_item("user", user_id)
     if existing_user:
         # Don't run the hook on this path — the user record predates this

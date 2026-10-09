@@ -7,9 +7,9 @@ its source — that layout is the same one a running rlx reads from at
 know about" set; what actually ships in a bundle vs is available
 remotely is decided per-service (see Vocabulary below).
 
-For the design rationale + roadmap, see `../docs/TODO_REPO.md`. This
-README is the working dev's reference — how to make a new service,
-how to build + publish the registry.
+This README is the working dev's reference — how to make a new
+service, how to build + publish the registry, and the lifecycle/state
+model a running rlx uses for each service type.
 
 
 ## Vocabulary
@@ -28,7 +28,7 @@ Used consistently across the codebase, the build tools, and the UI:
 | **publish** | Take a registry root and either leave it in place (`--kind file`, the default) or upload it (`--kind gh_release` / `--kind http`). Regenerates `catalog.yml`. |
 | **bundled** | `bundled: true|false` in each `package.yml`. Whether the service's source ships inside the rlx binary download. **Independent of** `publish`. |
 | **publish** (field) | `publish: true|false` in each `package.yml`. Whether the service is built + shipped to a remote registry. The single source of truth — there is no `registry.yml`. |
-| **loaded** / **installed** | Two distinct states for a service on a running rlx. See `../docs/TODO_REPO.md` "Loaded vs Installed". |
+| **loaded** / **installed** | Two distinct states for a service on a running rlx. See "Lifecycle states" below. |
 
 **Quick mental model:**
 - *repo* = source. *registry root* = built artifacts. *registry* = built artifacts hosted remotely.
@@ -39,8 +39,34 @@ Used consistently across the codebase, the build tools, and the UI:
   writable + read-only `repo_paths`) vs *archived* registries
   (`catalog.yml` + tgz + sha). The runtime only ever runs the exploded
   form; a registry archive is downloaded + sha-verified + extracted into
-  the writable root on load. See `../docs/TODO_REPO.md` "Two kinds of
-  repo source (format vs access)".
+  the writable root on load.
+
+
+## Lifecycle states — loaded vs installed
+
+Three states per `type@version` on a running rlx:
+
+- **ABSENT** — no `repo/<type>/<version>/` dir. Only a reachable registry knows it exists.
+- **LOADED** — dir exists, `package.yml` parses, type is registered — visible in the
+  Catalog and `/v1/service-meta-list`, but not ready to Start. A fresh `tar -xzf` of a
+  registry archive produces this. A dev checkout has everything LOADED at boot.
+- **INSTALLED** — the install hook has run: pip services get a built `.venv`; hardware/
+  config-needing services would also gate here. Ready to Start.
+
+`install_phase` (`service_meta`) is the authoritative field: `loaded | installing |
+installed | failed`. `installed: bool` is kept only as a derived mirror
+(`install_phase == "installed"`) for back-compat — new code reads `install_phase`.
+
+**Uninstall vs Remove are different actions.** Uninstall drops INSTALLED → LOADED (tears
+down the `.venv` / captured config, keeps source + catalog entry — cheap to reinstall,
+preserves any wizard input). Remove drops LOADED → ABSENT (deletes source). Remove is
+disabled in the UI for `bundled: true` services, since the next bundle extraction would
+just bring them back.
+
+A registry-served tarball can also be **sideloaded** — dropped directly into
+`<writable-root-parent>/repo-staging/` — and `registry.sideload_dir()` picks it up on
+the next reconcile pass without a registry URL at all (`runtime/registry.py`,
+`event_handlers.py`). Useful for air-gapped installs.
 
 
 ## TL;DR — make a new service in 4 commands
@@ -160,7 +186,7 @@ publish time, not here.
 ## Adding a UI (Option B — modular service UIs)
 
 A service can ship its own frontend, dynamically loaded by the host with
-no host rebuild. Full design: `docs/TODO_SERVICE_UI_BUNDLES.md`.
+no host rebuild.
 
 `cp -r master_template/1.0.0 …` already brought a `ui/` template along:
 
@@ -464,5 +490,3 @@ inside the bundle.
 - **`tools/build_services.py` / `tools/publish_services.py`** — build +
   publish the registry. Driven by each `package.yml`'s `publish` flag;
   transport via `--kind` / `--repo` / `--base-url` (run with `--help`).
-- **`../docs/TODO_REPO.md`** — design doc (loaded vs installed,
-  phasing, open questions).

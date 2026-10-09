@@ -199,7 +199,7 @@ function TreeNode({ entry, depth, openPath, selectedKey, onOpen, onSelect, onCon
         <span className="flex-1 truncate">{entry.name}</span>
         {isBundled && (
           <span className="shrink-0 rounded bg-slate-800 px-1 text-[9px] uppercase tracking-wider text-slate-500"
-            title="A shipped, read-only example — duplicate it to edit/run">
+            title="A shipped, read-only example — runnable as-is; duplicate it to edit">
             example
           </span>
         )}

@@ -1,0 +1,45 @@
+name: tasmota
+title: Tasmota
+description: |
+  Relay/switch control for any device running Tasmota firmware over
+  HTTP — Sonoff, Shelly boards reflashed with Tasmota, Athom,
+  BlitzWolf, generic ESP8266/ESP32 relay boards, etc. all speak the
+  identical command API (``http://<host>/cm?cmnd=...``), so this one
+  service needs no per-product code: relay count and any sensor
+  telemetry (energy monitoring, temperature, ...) are auto-detected
+  from a single ``Status 0`` call rather than configured per device.
+
+  Subprocess service — HTTP polling runs in a child process so a
+  slow/unreachable device can never block the backend event loop.
+
+  Includes a best-effort LAN subnet scan to find unauthenticated
+  Tasmota devices (Tasmota's own mDNS discovery was deprecated years
+  ago and is unreliable on modern firmware, so an active HTTP sweep is
+  the practical alternative). Password-protected devices aren't found
+  by the scan and must be added via Connect with credentials directly.
+language: python
+status: development
+author: CloudSeeder
+tags: [tasmota, sonoff, relay, switch, iot, shelly]
+
+# Capability interface — see AGENTS.md's "Promoted interfaces today"
+# table. Any future relay-style hardware (Tasmota or not) can implement
+# the same contract and be interchangeable with this service in the UI
+# / brain workflows.
+implements: [power_switch]
+icon: icon.svg
+
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section).
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+bundled: true
+publish: true   # available in the remote registry (see master_template for docs)
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/tasmota/1.0.0"
+
+entry:
+  argv: [python, -m, tasmota_service]

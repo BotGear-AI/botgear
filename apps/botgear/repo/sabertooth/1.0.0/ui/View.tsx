@@ -14,9 +14,9 @@
 // Sabertooth directly. The space/enter = STOP convention lives in the
 // motor_control view; here a plain Stop-all button is enough.
 import {
-  useCallback, useEffect, useState, type FormEvent,
+  useCallback, useEffect, useRef, useState, type FormEvent,
 } from 'react'
-import { Loader2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 
 import type { ServiceProxy } from '@rlx/ui'
 import type { InboundFrame } from '@rlx/ui'
@@ -52,6 +52,8 @@ interface SabertoothState {
   ports?: PortInfo[]
   last_port?: string | null
   last_baud?: number
+  autoreconnect?: boolean
+  retrying?: boolean
   errors?: number
   last_error?: string | null
   connected_at?: string | null
@@ -115,7 +117,28 @@ export default function SabertoothFullView({ proxy }: { proxy: ServiceProxy }) {
 
   const onRefreshPorts = useCallback(() => sendAction({ action: 'list_ports' }), [sendAction])
 
+  const onToggleAutoConnect = useCallback(
+    (enabled: boolean) => sendAction({ action: 'set_auto_connect', enabled }),
+    [sendAction],
+  )
+
+  // A displayed error can be purely client-side (e.g. connectRequest's
+  // "no reply within 10.0s" timeout) and nothing else resets it once the
+  // link comes up some other way (a late reply, an autoreconnect). Clear
+  // both requests' errors the moment /state reports a fresh connection so
+  // a stale message doesn't outlive the failure that caused it.
+  const wasConnectedRef = useRef(false)
+  useEffect(() => {
+    if (state.connected && !wasConnectedRef.current) {
+      connectRequest.clearError()
+      disconnectRequest.clearError()
+    }
+    wasConnectedRef.current = !!state.connected
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.connected])
+
   const connected = !!state.connected
+  const retrying = !!state.retrying
   const channels = state.channels ?? [1, 2]
   const error = connectRequest.error ?? disconnectRequest.error ?? state.last_error
 
@@ -184,11 +207,34 @@ export default function SabertoothFullView({ proxy }: { proxy: ServiceProxy }) {
             </select>
           </label>
           <div className="ml-auto flex items-center gap-2">
+            {/* Auto-connect toggle — keeps retrying last_port in the
+                background whenever offline, including after the USB
+                adapter is unplugged and plugged back in. */}
+            <label
+              className="flex items-center gap-1.5 font-mono text-[10px] text-slate-400"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <input
+                type="checkbox"
+                checked={!!state.autoreconnect}
+                onChange={(e) => onToggleAutoConnect(e.target.checked)}
+                className="nodrag nopan accent-emerald-500"
+              />
+              auto-connect
+            </label>
             {/* Connectivity light */}
             <span className="flex items-center gap-1.5 font-mono text-[10px]">
-              <span className={`inline-block h-2.5 w-2.5 rounded-full ${connected ? 'bg-emerald-400 shadow-[0_0_6px_1px] shadow-emerald-500/60' : 'bg-slate-600'}`} />
-              <span className={connected ? 'text-emerald-300' : 'text-slate-500'}>
-                {connected ? 'connected' : 'offline'}
+              <span
+                className={`inline-block h-2.5 w-2.5 rounded-full ${
+                  connected
+                    ? 'bg-emerald-400 shadow-[0_0_6px_1px] shadow-emerald-500/60'
+                    : retrying
+                      ? 'animate-pulse bg-amber-400'
+                      : 'bg-slate-600'
+                }`}
+              />
+              <span className={connected ? 'text-emerald-300' : retrying ? 'text-amber-300' : 'text-slate-500'}>
+                {connected ? 'connected' : retrying ? 'reconnecting…' : 'offline'}
               </span>
             </span>
             {!connected ? (
@@ -278,6 +324,13 @@ function MotorSlider({
   const [dragging, setDragging] = useState(false)
   useEffect(() => { if (!dragging) setDraft(value) }, [value, dragging])
   const pct = Math.round(draft * 100)
+  // Step from the displayed percent, not draft*100 + delta/100, so
+  // repeated clicks can't drift off-integer from float accumulation.
+  const step = (delta: number) => {
+    const v = Math.max(-1, Math.min(1, (pct + delta) / 100))
+    setDraft(v)
+    onSet(v)
+  }
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-baseline justify-between font-mono text-[10px] text-slate-400">
@@ -287,6 +340,13 @@ function MotorSlider({
         </span>
       </div>
       <div className="flex items-center gap-2">
+        <button
+          type="button" onClick={() => step(-1)}
+          onPointerDown={(e) => e.stopPropagation()}
+          disabled={pct <= -100}
+          aria-label={`motor ${channel} decrease 1%`}
+          className="nodrag nopan rounded border border-slate-700 p-0.5 text-slate-400 hover:border-emerald-500 hover:text-emerald-300 disabled:opacity-30 disabled:hover:border-slate-700 disabled:hover:text-slate-400"
+        ><ChevronLeft size={12} /></button>
         <input
           type="range" min={-1} max={1} step={0.01} value={draft}
           className="nodrag nopan flex-1 accent-emerald-500"
@@ -294,6 +354,13 @@ function MotorSlider({
           onPointerUp={() => setDragging(false)}
           onChange={(e) => { const v = Number(e.target.value); setDraft(v); onSet(v) }}
         />
+        <button
+          type="button" onClick={() => step(1)}
+          onPointerDown={(e) => e.stopPropagation()}
+          disabled={pct >= 100}
+          aria-label={`motor ${channel} increase 1%`}
+          className="nodrag nopan rounded border border-slate-700 p-0.5 text-slate-400 hover:border-emerald-500 hover:text-emerald-300 disabled:opacity-30 disabled:hover:border-slate-700 disabled:hover:text-slate-400"
+        ><ChevronRight size={12} /></button>
         <button
           type="button" onClick={() => { setDraft(0); onStop() }}
           onPointerDown={(e) => e.stopPropagation()}

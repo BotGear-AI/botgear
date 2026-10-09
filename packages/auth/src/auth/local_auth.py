@@ -30,6 +30,20 @@ from typing import Dict, Callable
 from threading import Lock
 from database.interface import DatabaseAdapter
 from database.factory import get_database_client
+from .user_status import is_inactive_user
+def _storable(user: AuthUser) -> dict:
+    """The record to WRITE for a user. AuthUser marks its secrets (password_hash,
+    totp_secret) exclude=True so they never leave the server through a
+    model_dump()/response; a write path must add them back, or the stored user
+    has no password hash and can never log in."""
+    record = user.model_dump(exclude_none=True)
+    for name, spec in type(user).model_fields.items():
+        value = getattr(user, name)
+        if spec.exclude and value is not None:
+            record[name] = value
+    return record
+
+
 class LocalAuthProvider(AuthProvider):
     """Local authentication provider (uses DatabaseAdapter for persistence, JWT for tokens)."""
 
@@ -62,7 +76,7 @@ class LocalAuthProvider(AuthProvider):
         # Optional data_dir for admin_password.txt co-location. Pulled
         # from the config dict (which is typically ``settings.model_dump()``)
         # so apps that already declare ``data_dir`` in their pydantic
-        # settings (continuous_mfa, botgear, …) get instance-local
+        # settings (continuous_mfa, botcore, …) get instance-local
         # password isolation without touching this constructor.
         self._data_dir = config.get("data_dir") if isinstance(config, dict) else None
 
@@ -134,7 +148,7 @@ class LocalAuthProvider(AuthProvider):
             self.database.insert_item(
                 USERS_TABLE,
                 "admin@cloudseeder.ai",
-                admin_user.model_dump(exclude_none=True)
+                _storable(admin_user)
             )
 
     def _generate_jwt(self, user_id: str, *, ttl_minutes: Optional[int] = None) -> str:
@@ -185,7 +199,7 @@ class LocalAuthProvider(AuthProvider):
     # FIXME - change username to id
     # Deprecated - since the whole registration object should be passed, and the details handled in a "per app" way
     def register_user(self, username: str, password: str = None, password_hash: str = None) -> dict:
-        if password_hash is None and password is not None:
+        if password_hash is None and password is None:
             raise ValueError("register_user Password hash or password is required when registering a user")
         if password_hash is not None and password is not None:
             raise ValueError("register_user Password hash and password cannot be provided at the same time")
@@ -211,7 +225,7 @@ class LocalAuthProvider(AuthProvider):
         self.database.insert_item(
             USERS_TABLE,
             username,
-            new_user.model_dump(exclude_none=True)
+            _storable(new_user)
         )
         return {"username": username, "message": "User registered"}
 
@@ -260,7 +274,7 @@ class LocalAuthProvider(AuthProvider):
             # logger.info(f"[AUTH DEBUG] User record: {user}")
             # logger.info(f"[AUTH DEBUG] Token in DB: {user.get('token') if user else None}")
             # logger.info(f"[AUTH DEBUG] Token in request: {token}")
-            if user:
+            if user and not is_inactive_user(user):
                 user.pop("password_hash", None)
                 user.pop("password", None)
                 user.pop("token", None)
@@ -276,7 +290,7 @@ class LocalAuthProvider(AuthProvider):
                 raise ValueError("refresh_token sub username cannot be empty")
             username = username.lower()
             user = self.database.get_item(USERS_TABLE, username)
-            if user:
+            if user and not is_inactive_user(user):
                 new_token = self._generate_jwt(username)
                 user.pop("token", None)
                 # Update only the modified timestamp

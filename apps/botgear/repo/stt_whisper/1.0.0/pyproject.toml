@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stt_whisper_service"
+version = "1.0.0"
+description = "botgear Whisper-family speech-to-text service (faster-whisper/CTranslate2). Implements the transcription capability."
+requires-python = ">=3.10"
+dependencies = [
+    # faster-whisper: CTranslate2-backed Whisper inference. No torch (unlike
+    # the original openai-whisper), no system ffmpeg (the `av` dependency's
+    # wheel bundles it). Wheels ship for Linux x86_64/aarch64 (64-bit
+    # Raspberry Pi OS), macOS x86_64/arm64, Windows x64 — see
+    # this type's README.md.
+    "faster-whisper>=1.2,<2.0",
+    # _feed() converts PCM to float32 via numpy directly. Declared
+    # explicitly rather than assumed transitive — stt_local made the exact
+    # same "comes in transitively" assumption for sherpa-onnx and it was
+    # flat wrong in a real venv (numpy absent, every feed silently
+    # ModuleNotFoundError'd, swallowed by _recognizer_loop's broad except —
+    # see that fix's commit for the full failure mode).
+    "numpy",
+]
+
+[project.scripts]
+stt_whisper_service = "stt_whisper_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

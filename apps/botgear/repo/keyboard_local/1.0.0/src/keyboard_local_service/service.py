@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import Field
 from rlx_bus import service_method
-from rlx_input import KeyboardConfig, KeyboardServiceBase
+from rlx_input import KeyboardConfig, KeyboardServiceBase, KeyboardState
 
 from .keyboard_capture import EvdevBackend, PynputBackend, select_backend
 
@@ -40,7 +40,18 @@ class KeyboardLocalConfig(KeyboardConfig):
         False, description="evdev exclusive grab — captured keys do NOT reach other apps (teleop). evdev only.")
 
 
+class KeyboardLocalState(KeyboardState):
+    """Retained on ``/keyboard/{id}/state`` — the shared keyboard state
+    plus host-capture backend/device details."""
+    backend: str = Field(description="Active backend, else the configured one ('auto' | 'evdev' | 'pynput')")
+    device_id: Optional[str]
+    grab: bool
+    devices: List[Dict[str, Any]]
+    available_backends: List[str]
+
+
 class KeyboardLocalService(KeyboardServiceBase):
+    state_schema = KeyboardLocalState
     config_class = KeyboardLocalConfig
     source = "local"
 
@@ -132,13 +143,13 @@ class KeyboardLocalService(KeyboardServiceBase):
 
     # ─── state ────────────────────────────────────────────────────────
     def _snapshot(self) -> Dict[str, Any]:
-        snap = super()._snapshot()
         available = [n for n, cls in (("evdev", EvdevBackend), ("pynput", PynputBackend)) if cls.available()]
-        snap.update({
-            "backend": self._backend.name if self._backend is not None else self.config.backend,
-            "device_id": self.config.device_id,
-            "grab": self.config.grab,
-            "devices": self._devices,
-            "available_backends": available,
-        })
-        return snap
+        state = KeyboardLocalState(
+            **super()._snapshot(),
+            backend=self._backend.name if self._backend is not None else self.config.backend,
+            device_id=self.config.device_id,
+            grab=self.config.grab,
+            devices=self._devices,
+            available_backends=available,
+        )
+        return state.model_dump()

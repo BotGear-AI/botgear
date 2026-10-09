@@ -70,14 +70,44 @@ export function RuntimeSwitcher() {
   // Refresh peer suggestions every time the dialog opens — peers come
   // and go on the network in real time, so a stale list from mount
   // would mislead. Soft-fails: unauthed/disconnected runtime → empty.
+  //
+  // GET /v1/peers (peer_api.py, list_at_root=True) returns the peer
+  // list bare — NOT wrapped in {peers: [...]}. This previously read
+  // `r.peers`, which is always undefined against a bare array, so this
+  // suggestion list was silently empty regardless of what peer_manager
+  // actually knew about.
+  const refreshPeers = useCallback(() => {
+    if (!activeConn) { setPeerSuggestions([]); return }
+    activeConn.apiFetch<DiscoveredPeer[]>('/v1/peers')
+      .then((r) => setPeerSuggestions(r ?? []))
+      .catch(() => setPeerSuggestions([]))
+  }, [activeConn])
+
   useEffect(() => {
-    if (!dialogOpen || !activeConn) return
-    let cancelled = false
-    activeConn.apiFetch<{ peers: DiscoveredPeer[] }>('/v1/peers')
-      .then((r) => { if (!cancelled) setPeerSuggestions(r.peers ?? []) })
-      .catch(() => { if (!cancelled) setPeerSuggestions([]) })
-    return () => { cancelled = true }
-  }, [dialogOpen, activeConn])
+    if (!dialogOpen) return
+    refreshPeers()
+  }, [dialogOpen, refreshPeers])
+
+  // "Rescan network" — rebuilds the runtime's mDNS engine (see
+  // mdns.rescan's docstring: a laptop's Wi-Fi routinely isn't up yet
+  // when the backend boots, so it never joins multicast on the real
+  // interface until something re-triggers it). Auto-connect then picks
+  // up any peer the rebuilt browser (re)discovers, so we give it a
+  // moment before re-reading /v1/peers rather than expecting the POST
+  // itself to return the new peer.
+  const rescanPeers = useCallback(async () => {
+    if (!activeConn) return
+    try {
+      await activeConn.apiFetch('/v1/peers-request', {
+        method: 'POST',
+        body: JSON.stringify({ action: 'rescan' }),
+      })
+    } catch {
+      // best-effort — refreshPeers below still shows whatever's there
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    refreshPeers()
+  }, [activeConn, refreshPeers])
 
   const switchTo = useCallback((id: string) => {
     // Preserve the sub-path: ``/r/witty-gizmo/topology`` → ``/r/funny-droid/topology``.
@@ -92,6 +122,28 @@ export function RuntimeSwitcher() {
     setDialogOpen(false)
     switchTo(newId)
   }, [switchTo])
+
+  // Disconnecting the runtime the URL currently points at must navigate
+  // AWAY first, before the connection disappears from the map — the
+  // active-runtime route (/r/:runtimeId/*) requires a matching
+  // connection to exist and everything under it (useApiFetch,
+  // useWsClient, etc.) throws when it doesn't. ActiveRuntimeProvider now
+  // has a safety-net redirect for this too, but doing it here means the
+  // user goes straight to the next connection's canvas instead of
+  // bouncing through it.
+  const removeConnection = useCallback((id: string) => {
+    if (id === activeId) {
+      const remaining = connections.filter((c) => c.id !== id)
+      if (remaining.length === 0) {
+        navigate('/no-runtimes')
+      } else {
+        const m = location.pathname.match(/^\/r\/[^/]+(\/.*)?$/)
+        const suffix = m?.[1] ?? '/workspaces/runtime'
+        navigate(`/r/${encodeURIComponent(remaining[0].id)}${suffix}${location.search}${location.hash}`)
+      }
+    }
+    remove(id)
+  }, [activeId, connections, remove, navigate, location])
 
   return (
     <>
@@ -108,7 +160,7 @@ export function RuntimeSwitcher() {
               connection={c}
               isActive={c.id === activeId}
               onClick={() => switchTo(c.id)}
-              onRemove={() => remove(c.id)}
+              onRemove={() => removeConnection(c.id)}
             />
           ))}
         </div>
@@ -126,6 +178,7 @@ export function RuntimeSwitcher() {
       {dialogOpen && (
         <ConnectDialog
           discoveredPeers={peerSuggestions}
+          onRescan={activeConn ? rescanPeers : undefined}
           onClose={() => setDialogOpen(false)}
           onConnected={onAdd}
         />

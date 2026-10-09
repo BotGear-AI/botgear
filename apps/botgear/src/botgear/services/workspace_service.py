@@ -69,7 +69,7 @@ def _hydrate_runtime_membership(db: DatabaseAdapter, row: Dict[str, Any]) -> Dic
 
 # read - get all items
 def get_all_workspace(user: dict, request: Request):
-    logger.info("===============get_all_workspace called==============")
+    logger.debug("===============get_all_workspace called==============")
     db = get_database_client()
     if not db:
         return []
@@ -78,8 +78,8 @@ def get_all_workspace(user: dict, request: Request):
 
 # read - get an item
 def get_workspace(id: str, user: dict, request: Request):
-    logger.info("===============get_workspace called==============")
-    logger.info(f"Received request to retrieve workspace with id: {id}")
+    logger.debug("===============get_workspace called==============")
+    logger.debug(f"Received request to retrieve workspace with id: {id}")
     db = get_database_client()
     if db:
         item = db.get_item("workspace", id)
@@ -88,8 +88,8 @@ def get_workspace(id: str, user: dict, request: Request):
 
 # read - get_path an item
 def get_path_workspace(path: str, user: dict, request: Request):
-    logger.info("===============get_workspace called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_workspace called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
     if db:
         item = db.get_item("workspace", path)
@@ -129,6 +129,7 @@ def delete_workspace(id: str, user: dict, request: Request):
     logger.info("===============delete_workspace called==============")
     logger.info(f"Received request to delete workspace with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("workspace", id)
         if not item:

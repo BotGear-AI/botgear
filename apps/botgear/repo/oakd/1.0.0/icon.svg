@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <title>oakd</title>
+  <!-- Stereo depth camera glyph — two lens circles + a scan/depth arc
+       below, to distinguish from the plain video service's single-lens
+       icon. Generic, not a Luxonis trademarked logo. -->
+  <rect x="2" y="5" width="20" height="11" rx="2"/>
+  <circle cx="8" cy="10.5" r="2.25"/>
+  <circle cx="16" cy="10.5" r="2.25"/>
+  <path d="M4 19c2-1.5 4-1.5 8-1.5s6 0 8 1.5"/>
+</svg>

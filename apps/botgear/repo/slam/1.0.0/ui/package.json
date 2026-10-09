@@ -1,0 +1,17 @@
+{
+  "name": "slam-service-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Modular UI bundle for the slam service (Option B).",
+  "dependencies": {
+    "three": "^0.160.0"
+  },
+  "rlx": {
+    "entry": "View.tsx",
+    "sdk": "^1.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.160.0"
+  }
+}

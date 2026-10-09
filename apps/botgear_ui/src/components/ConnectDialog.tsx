@@ -34,6 +34,10 @@ interface ConnectDialogProps {
    * switcher) so the dialog itself doesn't need to know which
    * runtime's peers to fetch. */
   discoveredPeers?: DiscoveredPeer[]
+  /** Rebuilds the active runtime's mDNS engine + refreshes
+   * ``discoveredPeers`` a moment later. Omitted (button hidden) when
+   * there's no active runtime to issue the request from. */
+  onRescan?: () => Promise<void> | void
   onClose: () => void
   onConnected: (newConnectionId: string) => void
 }
@@ -68,6 +72,7 @@ function peerHttpOrigin(wsUrl: string): string {
 export function ConnectDialog({
   initialUrl = '',
   discoveredPeers = [],
+  onRescan,
   onClose,
   onConnected,
 }: ConnectDialogProps) {
@@ -79,6 +84,7 @@ export function ConnectDialog({
   // Tracks which discovered peer is mid-connect so we can disable its
   // button + surface the spinner. Keyed by peer.key.
   const [busyPeer, setBusyPeer] = useState<string | null>(null)
+  const [rescanning, setRescanning] = useState(false)
   const { connections, add } = useRuntimeConnections()
   // ``useActiveRuntimeOptional`` so this dialog also works when
   // rendered from <NoRuntimesState> — there's no /r/:runtimeId/* route
@@ -158,6 +164,19 @@ export function ConnectDialog({
     }
   }, [activeConn, add, onConnected])
 
+  const handleRescan = useCallback(async () => {
+    if (!onRescan) return
+    setRescanning(true)
+    setError(null)
+    try {
+      await onRescan()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRescanning(false)
+    }
+  }, [onRescan])
+
   /** Manual URL + creds path — for runtimes mDNS can't see. */
   const submitManual = useCallback(async (e?: FormEvent) => {
     e?.preventDefault()
@@ -224,9 +243,22 @@ export function ConnectDialog({
 
         {/* ── Discovered peers (primary path) ───────────────────────── */}
         <section>
-          <h3 className="mb-1 text-[10px] uppercase tracking-wider text-slate-400">
-            Discovered{activeConn ? ` via ${activeConn.meta.runtime_id ?? activeConn.id}` : ''}
-            {peerOptions.length > 0 && ` (${peerOptions.length})`}
+          <h3 className="mb-1 flex items-center justify-between text-[10px] uppercase tracking-wider text-slate-400">
+            <span>
+              Discovered{activeConn ? ` via ${activeConn.meta.runtime_id ?? activeConn.id}` : ''}
+              {peerOptions.length > 0 && ` (${peerOptions.length})`}
+            </span>
+            {onRescan && (
+              <button
+                type="button"
+                onClick={() => void handleRescan()}
+                disabled={rescanning}
+                title="Rebuild mDNS discovery on this runtime — fixes it missing peers whose network came up after this runtime booted"
+                className="normal-case tracking-normal text-slate-500 hover:text-sky-300 disabled:opacity-40"
+              >
+                {rescanning ? 'Rescanning…' : 'Rescan ↻'}
+              </button>
+            )}
           </h3>
           {peerOptions.length === 0 ? (
             <div className="rounded border border-slate-800 bg-slate-950/60 px-2 py-1.5 text-[11px] text-slate-500">

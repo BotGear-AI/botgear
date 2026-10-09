@@ -13,6 +13,9 @@ MicrophoneServiceBase), but the hardware lives in the operator's BROWSER:
     to that topic ONLY to feed save-to-file recording — the published shape
     is identical to mic_local's.
 
+The ``cmd``/``report`` shapes are declared below (``MicCmd``,
+``MicReport``) and introspected with the rest of the type.
+
 A browser microphone only exists while an authorized tab is open; a stale
 heartbeat marks ``last_error:"no browser client"`` and clears ``connected``.
 """
@@ -21,9 +24,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from rlx_audio import MicrophoneServiceBase
+from pydantic import BaseModel, ConfigDict, Field
+from rlx_audio import AudioFrame, MicrophoneServiceBase
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,32 @@ _STALE_AFTER_S = 5.0
 _CHECK_EVERY_S = 2.0
 
 
+class MicCmd(BaseModel):
+    """Published on ``/microphone/{id}/cmd`` — a command to the browser half."""
+    action: Literal["enumerate", "connect", "disconnect", "set_muted"]
+    device_id: Optional[str] = Field(None, description="connect")
+    sample_rate: Optional[int] = Field(None, description="connect")
+    channels: Optional[int] = Field(None, description="connect")
+    frame_ms: Optional[int] = Field(None, description="connect")
+    muted: Optional[bool] = Field(None, description="set_muted")
+
+
+class MicReport(BaseModel):
+    """Consumed from ``/microphone/{id}/report`` — browser status +
+    heartbeat; a stale one (>5s) marks the mic disconnected."""
+    model_config = ConfigDict(extra="allow")
+    devices: Optional[List[Dict[str, Any]]] = None
+    connected: Optional[bool] = None
+    muted: Optional[bool] = None
+    level_rms: Optional[float] = None
+    error: Optional[str] = None
+    ts: Optional[float] = None
+
+
 class MicBrowserService(MicrophoneServiceBase):
+    publishes = [*MicrophoneServiceBase.publishes, "cmd"]
+    topic_schemas: Dict[str, Any] = {**MicrophoneServiceBase.topic_schemas, "cmd": MicCmd}
+    subscribes_schemas = {"report": MicReport, "audio": AudioFrame}
     source = "browser"
 
     def __init__(self, proxy_id, bus) -> None:
@@ -54,23 +83,29 @@ class MicBrowserService(MicrophoneServiceBase):
 
     # ─── transport hooks — relay to the browser ───────────────────────
     async def _enumerate_devices(self):
-        await self.publish("cmd", {"action": "enumerate"})
+        await self._cmd(MicCmd(action="enumerate"))
         return list(self._devices)
 
     async def _open(self) -> None:
-        await self.publish("cmd", {
-            "action": "connect",
-            "device_id": self.config.device_id,
-            "sample_rate": self.config.sample_rate,
-            "channels": self.config.channels,
-            "frame_ms": self.config.frame_ms,
-        })
+        await self._cmd(MicCmd(
+            action="connect",
+            device_id=self.config.device_id,
+            sample_rate=self.config.sample_rate,
+            channels=self.config.channels,
+            frame_ms=self.config.frame_ms,
+        ))
 
     async def _close(self) -> None:
-        await self.publish("cmd", {"action": "disconnect"})
+        await self._cmd(MicCmd(action="disconnect"))
 
     async def _on_mute_changed(self, muted: bool) -> None:
-        await self.publish("cmd", {"action": "set_muted", "muted": muted})
+        await self._cmd(MicCmd(action="set_muted", muted=muted))
+
+    async def _cmd(self, cmd: MicCmd) -> None:
+        # exclude_unset (not exclude_none) so connect's explicit
+        # device_id=None (= the browser's default device) still reaches
+        # the browser, as before.
+        await self.publish("cmd", cmd.model_dump(exclude_unset=True))
 
     # ─── browser → backend status ─────────────────────────────────────
     async def _on_report(self, payload: Any) -> None:

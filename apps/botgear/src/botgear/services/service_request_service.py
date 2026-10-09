@@ -50,7 +50,7 @@ def create_service_request(item: ServiceRequest, user: dict, request: Request):
 
 # read - get all items
 def get_all_service_request(user: dict, request: Request):
-    logger.info("===============get_all_service_request called==============")
+    logger.debug("===============get_all_service_request called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("service_request")
@@ -58,18 +58,20 @@ def get_all_service_request(user: dict, request: Request):
 
 # read - get an item
 def get_service_request(id: str, user: dict, request: Request):
-    logger.info("===============get_service_request called==============")
-    logger.info(f"Received request to retrieve service_request with id: {id}")
+    logger.debug("===============get_service_request called==============")
+    logger.debug(f"Received request to retrieve service_request with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_request", id)
     return item
 
 # read - get_path an item
 def get_path_service_request(path: str, user: dict, request: Request):
-    logger.info("===============get_service_request called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_service_request called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_request", path)
     return item
@@ -99,6 +101,7 @@ def delete_service_request(id: str, user: dict, request: Request):
     logger.info("===============delete_service_request called==============")
     logger.info(f"Received request to delete service_request with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_request", id)
         if not item:

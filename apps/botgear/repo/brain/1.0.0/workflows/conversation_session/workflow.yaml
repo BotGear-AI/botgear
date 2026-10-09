@@ -44,6 +44,9 @@ preferred_model: qwen3:8b
 max_steps: 500
 timeout_seconds: 86400
 requires_human_approval: false
+# Direct light/switch commands ("turn the light off") run without the
+# model — see brain/reflex_engine.py and packages/rlx_decision/README.md.
+fast_reflex: true
 
 # THE terminator. The watcher subscribes to the chat inbox (where the
 # operator's utterances are published) and matches every incoming
@@ -55,9 +58,18 @@ requires_human_approval: false
 exit_on_phrase:
   matches:
     - goodbye
+    - good by     # STT often splits it: "GOOD BY", "good bye" (substring match)
   case_insensitive: true
   whole_message: false
-  listen_topic: /chat/+/inbox
+  # A list — audio (stt_local publishes every transcript, partial+final,
+  # to /stt/{id}/text) or any of the `messaging`-capability providers
+  # (see docs/TODO_MESSAGING.md) may be the one actually running.
+  listen_topic:
+    - /stt/+/text
+    - /chat/+/inbox
+    - /discord/+/inbox
+    - /slack/+/inbox
+    - /google_chat/+/inbox
 
 # Keep the session alive across silence. When ``listen`` returns
 # ``{timeout: true}`` (its wait window elapsed with no operator

@@ -209,6 +209,53 @@ async def test_connect_identifies_remote_id(fake_server):
         await pc.stop()
 
 
+def test_default_auth_param_is_token():
+    pc = PeerConnection(url="ws://x", token_provider=lambda: "t")
+    assert pc.auth_param == "token"
+
+
+def test_auth_param_is_settable_for_option_b():
+    pc = PeerConnection(url="ws://x", token_provider=lambda: "s", auth_param="api_key")
+    assert pc.auth_param == "api_key"
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_configured_auth_param_in_url(fake_server, monkeypatch):
+    """The credential goes under whichever query param auth_param names
+    — "token" by default (Option A), "api_key" when the caller is using
+    a per-peer api_client secret (Option B). Captured by wrapping the
+    real websockets.connect rather than asserting on the live server
+    (FakePeerServer deliberately doesn't check auth at all)."""
+    import botgear.runtime.peer_connection as pc_mod
+
+    captured_urls: list = []
+    real_connect = pc_mod.websockets.connect
+
+    def _spy_connect(url, *a, **kw):
+        captured_urls.append(url)
+        return real_connect(url, *a, **kw)
+
+    monkeypatch.setattr(pc_mod.websockets, "connect", _spy_connect)
+
+    pc = PeerConnection(
+        url=f"ws://127.0.0.1:{fake_server.port}",
+        token_provider=lambda: "my-api-client-secret",
+        auth_param="api_key",
+    )
+    pc.start()
+    try:
+        for _ in range(40):
+            if pc.is_connected:
+                break
+            await asyncio.sleep(0.05)
+        assert pc.is_connected
+        assert captured_urls, "websockets.connect was never called"
+        assert "api_key=my-api-client-secret" in captured_urls[0]
+        assert "token=" not in captured_urls[0]
+    finally:
+        await pc.stop()
+
+
 @pytest.mark.asyncio
 async def test_state_transitions(fake_server):
     """State progresses INIT → CONNECTING → IDENTIFYING → CONNECTED.

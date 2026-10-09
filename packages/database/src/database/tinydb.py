@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 from tinydb import TinyDB, Query
 from tinydb.storages import JSONStorage
@@ -98,6 +98,19 @@ class TinyDBDatabase(DatabaseAdapter):
             db.remove(doc_ids=[key])  # Use string-based doc_id
         except KeyError:
             pass  # Ignore if key does not exist
+
+    def prune_older_than(self, table: str, field: str, cutoff, *, batch_size: int = 5000,
+                         max_rows: Optional[int] = None, dry_run: bool = False) -> int:
+        """In-place removal of rows whose ``field`` is before ``cutoff`` (see
+        DatabaseAdapter.prune_older_than) — one read + one write of the file."""
+        from database.retention import is_older
+        db = self._get_db(table)
+        doomed = [doc.doc_id for doc in db.all() if is_older(doc.get(field), cutoff)]
+        if max_rows is not None:
+            doomed = doomed[:max_rows]
+        if doomed and not dry_run:
+            db.remove(doc_ids=doomed)
+        return len(doomed)
 
     def search_by_key_part(self, table: str, key_part: str, regex: bool = False) -> List[Dict[str, Any]]:
         """

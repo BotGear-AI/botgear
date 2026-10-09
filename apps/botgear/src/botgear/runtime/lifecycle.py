@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import shutil
 import threading
 import time
@@ -43,6 +44,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from pathlib import Path
+
+import yaml
 
 from config import get_settings
 from database.interface import DatabaseAdapter
@@ -59,6 +62,31 @@ from botgear import framework
 # row exist?" check before either commits, producing duplicate rows.
 # Install is rare; a single coarse lock is fine.
 _INSTALL_LOCK = threading.Lock()
+
+# A proxy name is used verbatim as the ``<name>.yml`` filename, a bus topic
+# segment (``/<type>/<name>/control``) and a URL path segment
+# (``/v1/service-proxy/<name>``). So it must avoid path separators, the topic
+# wildcards ``+`` / ``#``, the federation ``@`` suffix, spaces and case
+# ambiguity. Enforced for NEW installs only — yml files already on disk
+# (e.g. ``workE``) still load, since boot never goes through install.
+PROXY_NAME_MAX_LEN = 63
+_PROXY_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+
+
+def validate_proxy_name(name: str) -> None:
+    """Raise ``ValueError`` (with an actionable message) if ``name`` is not a
+    legal service-proxy name: lowercase letters, digits, ``-`` and ``_``,
+    starting with a letter, at most 63 characters."""
+    if len(name) > PROXY_NAME_MAX_LEN:
+        raise ValueError(
+            f"invalid service name {name!r}: {len(name)} characters "
+            f"(max {PROXY_NAME_MAX_LEN})"
+        )
+    if not _PROXY_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid service name {name!r}: use lowercase letters, digits, "
+            "'-' and '_', starting with a letter (e.g. 'sabertooth-1')"
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -299,6 +327,17 @@ def _mark_type_installed(meta: Dict[str, Any], db: Optional[DatabaseAdapter]) ->
     db.update_item("service_meta", meta_id, meta, include_nulls=True)
     _publish_service_meta(meta)
 
+    # Best-effort: a freshly-built venv is the first point a subprocess
+    # type's config_class becomes importable (see schema_introspect.
+    # subprocess_config_schema) — republish the types index now so its
+    # config_schema shows up (persisted onto this row too) without
+    # waiting for a backend restart. Mirrors registry.py's install path.
+    try:
+        from botgear.runtime import types_index
+        types_index.rebuild()
+    except Exception:  # noqa: BLE001
+        logger.debug("lifecycle: types_index.rebuild skipped (no publisher running)")
+
 
 def _handle_install(req: Dict[str, Any], db: DatabaseAdapter) -> Dict[str, Any]:
     """Create a new service_proxy row from a service_meta_id.
@@ -315,6 +354,7 @@ def _handle_install(req: Dict[str, Any], db: DatabaseAdapter) -> Dict[str, Any]:
         raise ValueError("install requires service_meta_id")
     if not proxy_name:
         raise ValueError("install requires proxy_name")
+    validate_proxy_name(proxy_name)
 
     meta = db.get_item("service_meta", service_meta_id)
     if not meta:
@@ -628,11 +668,18 @@ def _handle_uninstall(req: Dict[str, Any], db: DatabaseAdapter) -> Dict[str, Any
     final_state["pid"] = None
     db.delete_item("service_proxy", proxy_id)
 
-    # Durable uninstall: drop the name from the registry AND delete the yml.
-    # Both are required — leaving the yml would resurrect the service as a
-    # candidate; leaving the registry name would re-create it (or surface a
-    # missing-yml error) on the next boot. (Registry-only removal, by
-    # contrast, PARKS the service: keeps the yml so it can be re-added.)
+    # Release drops the name from the registry — that's what actually stops
+    # the service (boot's prune step deletes the row for any name not in
+    # the registry). The yml is DELIBERATELY left on disk: it becomes a
+    # parked candidate, re-addable by re-adding the name to the registry
+    # (or by renaming/copying ANY other candidate yml onto this proxy_id —
+    # config is looked up purely by proxy_id, so a differently-typed
+    # candidate binds just as cleanly; that's the intentional swap-by-name
+    # mechanism, not a bug). This used to also delete the yml ("durable
+    # uninstall"), which destroyed real operator config (secrets, tuned
+    # values) any time a service was removed from the canvas even just to
+    # troubleshoot — there's no separate "purge config" action today, so
+    # don't add one implicitly here either.
     try:
         from botgear.runtime.config_sets import (
             load_runtime_yml, write_runtime_registry, active_set_dir,
@@ -640,10 +687,8 @@ def _handle_uninstall(req: Dict[str, Any], db: DatabaseAdapter) -> Dict[str, Any
         set_dir = active_set_dir(_resolve_data_dir())
         write_runtime_registry(
             set_dir, [x for x in load_runtime_yml(set_dir).registry if x != proxy_id])
-        (set_dir / f"{proxy_id}.yml").unlink(missing_ok=True)
-        (set_dir / f"{proxy_id}.yml.tmp").unlink(missing_ok=True)
     except Exception:  # noqa: BLE001
-        logger.exception("uninstall: failed to prune registry/yml for %s", proxy_id)
+        logger.exception("uninstall: failed to prune registry for %s", proxy_id)
 
     # Tidy workspace references. Without this, the layout map keeps the
     # released id and the UI either shows a ghost node forever or — on
@@ -714,6 +759,280 @@ def _tidy_workspace_refs(db: DatabaseAdapter, proxy_id: str) -> None:
                 {"workspace_id": ws_id, "reason": "tidy", "proxy_id": proxy_id},
             )
             logger.info("tidy_workspace_refs: stripped %s from %s", proxy_id, ws_id)
+
+
+# ─── rename ─────────────────────────────────────────────────────────────
+
+# Statuses during which a proxy owns live resources (a process, bus
+# subscriptions, an in-flight install) under its current name. Rename
+# refuses these — renaming a live service would orphan them.
+_RENAME_BLOCKING_STATUSES = {"running", "starting", "stopping", "installing"}
+
+# Config keys that hold a service's OWN identity, never a reference to
+# another service — mirrors ``link_service._SELF_ID_KEYS`` so rename
+# rewrites exactly the values the link projection treats as references.
+_SELF_ID_KEYS = {"id", "proxy_id", "name"}
+
+
+def _rename_refs(node: Any, old_id: str, new_id: str, key: Optional[str] = None) -> tuple[Any, int]:
+    """Return ``(node', n)`` with every reference to ``old_id`` rewritten to
+    ``new_id``. A reference is what ``link_service`` recognizes as one: a
+    string value equal to the id (outside the self-identity keys), or a
+    service topic ``/<type>/<old_id>/...`` whose owner segment is the id."""
+    if isinstance(node, dict):
+        total = 0
+        out: Dict[Any, Any] = {}
+        for k, v in node.items():
+            out[k], n = _rename_refs(v, old_id, new_id, k)
+            total += n
+        return out, total
+    if isinstance(node, list):
+        total = 0
+        items = []
+        for v in node:
+            v2, n = _rename_refs(v, old_id, new_id, key)
+            items.append(v2)
+            total += n
+        return items, total
+    if isinstance(node, str):
+        if node == old_id and key not in _SELF_ID_KEYS:
+            return new_id, 1
+        if node.startswith("/"):
+            parts = node.split("/")
+            # ['', '<type>', '<proxy_id>', '<suffix>', ...]
+            if len(parts) >= 4 and parts[2] == old_id:
+                parts[2] = new_id
+                return "/".join(parts), 1
+    return node, 0
+
+
+def _rewrite_yml_refs(path: Path, old_id: str, new_id: str) -> int:
+    """Rewrite references inside one proxy yml in place (raw YAML — the
+    encrypted secret values are opaque strings and pass through untouched).
+    ``type`` / ``desired_state`` are never references. Returns the count."""
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError):
+        logger.warning("rename: skipping unreadable yml %s", path)
+        return 0
+    if not isinstance(raw, dict):
+        return 0
+    head = {k: raw[k] for k in ("type", "desired_state") if k in raw}
+    body = {k: v for k, v in raw.items() if k not in head}
+    body, n = _rename_refs(body, old_id, new_id)
+    if n:
+        tmp = path.with_suffix(".yml.tmp")
+        tmp.write_text(yaml.safe_dump({**head, **body}, sort_keys=False, default_flow_style=False))
+        tmp.rename(path)
+    return n
+
+
+def _rename_workspace_refs(db: DatabaseAdapter, old_id: str, new_id: str) -> list[str]:
+    """Re-key ``old_id`` → ``new_id`` in every workspace's stored references
+    (the same fields ``_tidy_workspace_refs`` strips on release). Returns
+    the ids of the workspaces that changed."""
+    changed_ids: list[str] = []
+    for ws in db.get_all_items("workspace") or []:
+        ws_id = ws.get("id")
+        if not ws_id:
+            continue
+        changed = False
+
+        members = ws.get("service_proxy_ids")
+        if isinstance(members, list) and old_id in members:
+            ws["service_proxy_ids"] = [new_id if p == old_id else p for p in members]
+            changed = True
+
+        for field in ("node_positions", "node_view_types"):
+            mapping = ws.get(field)
+            if isinstance(mapping, dict) and old_id in mapping:
+                ws[field] = {(new_id if k == old_id else k): v for k, v in mapping.items()}
+                changed = True
+
+        edges = ws.get("edges")
+        if isinstance(edges, list):
+            new_edges = []
+            for e in edges:
+                if isinstance(e, dict) and old_id in (e.get("source"), e.get("target")):
+                    e = dict(e)
+                    if e.get("source") == old_id:
+                        e["source"] = new_id
+                    if e.get("target") == old_id:
+                        e["target"] = new_id
+                    changed = True
+                new_edges.append(e)
+            ws["edges"] = new_edges
+
+        if changed:
+            db.update_item("workspace", ws_id, ws, include_nulls=True)
+            get_bus().publish_sync(
+                f"/workspace/{ws_id}/changed",
+                {"workspace_id": ws_id, "reason": "rename", "proxy_id": new_id, "old_proxy_id": old_id},
+            )
+            changed_ids.append(ws_id)
+    return changed_ids
+
+
+def rename_service(old_id: str, new_id: str) -> Dict[str, Any]:
+    """Rename a service instance ``old_id`` → ``new_id``.
+
+    A proxy's name IS its identity — the DB primary key, the
+    ``<name>.yml`` filename, its slot in ``runtime.registry``, the owner
+    segment of its bus topics and the key other services' configs bind it
+    by — so a rename re-keys every one of those:
+
+      * the active set's ``<old>.yml`` → ``<new>.yml`` and its registry slot
+        (order preserved);
+      * the ``service_proxy`` row (re-inserted under the new id);
+      * every workspace's members / positions / view types / edges;
+      * references in EVERY proxy yml of the active set (other services'
+        bindings like ``controller_id: <old>`` or ``/<type>/<old>/audio``
+        input topics, plus the renamed service's own self-topics). A
+        RUNNING referencing service is flushed to yml first and reloaded
+        after, so its live config adopts the new name without a restart;
+      * the brain workspace dir ``<data>/brain/<old>/`` if present.
+
+    Only the ACTIVE config set is touched — other sets keep the old name.
+    Refused while the service is live (stop it first) and for singletons.
+    Raises ``ValueError`` with an operator-facing message on refusal.
+    """
+    validate_proxy_name(new_id)
+    if new_id == old_id:
+        raise ValueError(f"'{old_id}' already has that name")
+    db = get_database_client()
+    if db is None:
+        raise ValueError("database client not initialised")
+
+    from botgear.runtime.config_sets import (
+        active_set_dir, load_runtime_yml, write_runtime_registry,
+    )
+
+    data_dir = _resolve_data_dir()
+    set_dir = active_set_dir(data_dir)
+
+    # Same lock as create: the existence check + re-insert must not race a
+    # concurrent create (or another rename) claiming ``new_id``.
+    with _INSTALL_LOCK:
+        proxy = db.get_item("service_proxy", old_id)
+        if not proxy:
+            raise ValueError(f"service_proxy '{old_id}' not found")
+        if _is_singleton_proxy(db, proxy):
+            raise ValueError(f"refusing to rename '{old_id}' — it is a singleton instance")
+        status = proxy.get("status")
+        if status in _RENAME_BLOCKING_STATUSES or framework.REGISTRY.get(old_id) is not None:
+            raise ValueError(
+                f"refusing to rename '{old_id}' while status={status!r} — stop it first"
+            )
+        if db.get_item("service_proxy", new_id):
+            raise ValueError(f"a service named '{new_id}' already exists")
+        new_yml = set_dir / f"{new_id}.yml"
+        if new_yml.exists():
+            raise ValueError(
+                f"a parked config '{new_id}.yml' already exists in the active config set — "
+                "pick another name or remove that file first"
+            )
+
+        # 1. Flush live configs that are about to be rewritten, so the
+        #    yml rewrite below starts from the current truth, not a stale
+        #    snapshot that a later save_all would then clobber.
+        running_refs: list[str] = []
+        for row in db.get_all_items("service_proxy") or []:
+            pid = row.get("id")
+            if not pid or pid == old_id or row.get("status") not in {"running", "starting"}:
+                continue
+            path = set_dir / f"{pid}.yml"
+            if not path.is_file():
+                continue
+            try:
+                _, n = _rename_refs(yaml.safe_load(path.read_text()) or {}, old_id, new_id)
+            except Exception:  # noqa: BLE001
+                n = 0
+            if n:
+                save_one_service_config(pid)
+                running_refs.append(pid)
+
+        # 2. The yml + registry slot.
+        old_yml = set_dir / f"{old_id}.yml"
+        yml_renamed = False
+        if old_yml.is_file():
+            old_yml.rename(new_yml)
+            yml_renamed = True
+        registry_updated = False
+        try:
+            reg = load_runtime_yml(set_dir).registry
+            if old_id in reg:
+                write_runtime_registry(set_dir, [new_id if x == old_id else x for x in reg])
+                registry_updated = True
+        except Exception:  # noqa: BLE001
+            logger.exception("rename: failed to update registry for %s → %s", old_id, new_id)
+
+        # 3. The DB row — re-keyed, with its (stale) config mirror rewritten
+        #    the same way as the yml.
+        new_row = dict(proxy)
+        new_row["id"] = new_id
+        new_row["name"] = new_id
+        if isinstance(new_row.get("service_config"), dict):
+            new_row["service_config"], _ = _rename_refs(new_row["service_config"], old_id, new_id)
+        db.insert_item("service_proxy", new_id, new_row)
+        db.delete_item("service_proxy", old_id)
+
+    # 4. References in every proxy yml (including the renamed one's own
+    #    self-topics) + the other rows' config mirrors.
+    references: Dict[str, int] = {}
+    if set_dir.is_dir():
+        for path in sorted(set_dir.glob("*.yml")):
+            if path.name == "runtime.yml":
+                continue
+            n = _rewrite_yml_refs(path, old_id, new_id)
+            if n:
+                references[path.stem] = n
+    for row in db.get_all_items("service_proxy") or []:
+        rid = row.get("id")
+        if rid and rid != new_id and isinstance(row.get("service_config"), dict):
+            cfg, n = _rename_refs(row["service_config"], old_id, new_id)
+            if n:
+                row["service_config"] = cfg
+                db.update_item("service_proxy", rid, row, include_nulls=True)
+    reloaded = [pid for pid in running_refs if reload_one_service_config(pid).get("ok")]
+
+    # 5. Workspaces.
+    workspaces = _rename_workspace_refs(db, old_id, new_id)
+
+    # 6. Per-instance data dirs keyed by proxy id.
+    moved_dirs: list[str] = []
+    brain_old = data_dir / "brain" / old_id
+    brain_new = data_dir / "brain" / new_id
+    if brain_old.is_dir():
+        if brain_new.exists():
+            logger.warning("rename: %s exists — leaving %s in place", brain_new, brain_old)
+        else:
+            brain_old.rename(brain_new)
+            moved_dirs.append(str(brain_new))
+
+    # 7. Tell UIs: the old id is gone (same terminal event release sends,
+    #    so every list drops it), the new one exists.
+    bus = get_bus()
+    gone = dict(proxy)
+    gone["status"] = "uninstalled"
+    bus.publish_sync(_proxy_lifecycle_topic(old_id), gone)
+    bus.clear_retained(_proxy_lifecycle_topic(old_id))
+    _publish_lifecycle(new_row)
+
+    logger.info(
+        "rename: %s → %s yml=%s registry=%s refs=%s reloaded=%s workspaces=%s dirs=%s",
+        old_id, new_id, yml_renamed, registry_updated, references, reloaded, workspaces, moved_dirs,
+    )
+    return {
+        "old_id": old_id,
+        "new_id": new_id,
+        "proxy": new_row,
+        "yml_renamed": yml_renamed,
+        "registry_updated": registry_updated,
+        "references": references,
+        "reloaded": reloaded,
+        "workspaces": workspaces,
+        "moved_dirs": moved_dirs,
+    }
 
 
 def _publish_workspace(workspace: Dict[str, Any], event: str, detail: Optional[str] = None) -> None:
@@ -1111,8 +1430,11 @@ def reload_one_service_config(proxy_id: str) -> Dict[str, Any]:
         get_bus().publish_sync(f"/{type_name}/{proxy_id}/control", {"action": "reload_config"})
         applied = "control:reload_config"
     else:
+        from botgear.runtime.discovery import _mask_secret_fields
         get_bus().publish_sync(
-            f"/service_proxy/{proxy_id}/config_state", new_config, retained=True,
+            f"/service_proxy/{proxy_id}/config_state",
+            _mask_secret_fields(type_id, new_config),
+            retained=True,
         )
         applied = "config_state"
 
@@ -1265,6 +1587,8 @@ def handle(req_record: Dict[str, Any]) -> Dict[str, Any]:
     elapsed_ms = int((time.time() - started) * 1000)
     req_record["status"] = "completed"
     req_record["result"] = f"{action} ok ({elapsed_ms}ms) — proxy status={proxy_state.get('status')}"
+    if proxy_state.get("summary"):
+        req_record["result"] += f" — {proxy_state['summary']}"
     req_record["completed_at"] = _now_iso()
     db.update_item("service_request", req_record["id"], req_record, include_nulls=True)
     return req_record

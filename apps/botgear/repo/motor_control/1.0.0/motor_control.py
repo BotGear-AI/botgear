@@ -43,13 +43,20 @@ motor safety. ``clear_input`` returns the channel to manual control.
 
 Safety model
 ------------
-Three layers, host + hardware:
+Four layers, host + hardware:
 
   * Per-channel output clamp ``[min_output, max_output]`` — every value
     is clamped here before it leaves this service.
   * Per-channel slew-rate limiting — ``slew_rate`` (units/sec) caps how
     fast an output can change, so a step command ramps instead of
     snapping. 0 disables (instant).
+  * Input-source watchdog — a channel driven by ``set_input`` holds its
+    target at whatever the last message set it to; nothing else would
+    ever zero it if that source just stops publishing (a wireless
+    controller's link dropping mid-command is the motivating case — see
+    ``InputSource.timeout_s``). If no message arrives within
+    ``timeout_s``, the target is forced to 0 (still through the normal
+    clamp/slew path, not a bypass) until the source resumes.
   * A latching emergency stop — ``stop_all`` (the UI's big STOP button
     and the space/enter key) forces every output to 0 AND latches
     ``estopped`` so no further motion happens until ``clear_estop``.
@@ -57,10 +64,11 @@ Three layers, host + hardware:
 The driver (e.g. Sabertooth) adds its own clamp + hardware serial
 timeout on top.
 
-Bus topics published
---------------------
-  /motor_control/{id}/state    retained — channels + outputs + estop
-  /motor_control/{id}/control  incoming actions
+Wire shape for what this service PUBLISHES (``state``) is declared
+below via ``MotorControlState``/``state_schema`` — introspected into
+this type's descriptor at ``/runtime/runtime/types/motor_control``, not
+documented here. ``control`` actions (add_channel/set/stop/... above)
+are discoverable the same way, off their @service_method signatures.
 
 NOTE: deliberately NO ``from __future__ import annotations`` — the
 config models use ``Optional[...]`` and Pydantic v2 resolves hints
@@ -118,6 +126,19 @@ class InputSource(BaseModel):
     scale: float = Field(1.0, description="Linear scale applied to the raw value: out = raw*scale + offset.")
     offset: float = Field(0.0, description="Linear offset added after scaling.")
     deadzone: float = Field(0.0, ge=0.0, description="Raw values with abs < deadzone are treated as 0 (suppresses creep).")
+    timeout_s: float = Field(
+        0.5, gt=0.0,
+        description=(
+            "Watchdog: if no message arrives on `topic` for this long, the channel's "
+            "target is forced to 0 (still subject to slew/clamp) instead of coasting "
+            "on the last value forever — guards against a source that goes silent "
+            "mid-command (wireless link drop, crashed publisher, dropped peer "
+            "connection) with no chance to publish a final 'centered' frame on the "
+            "way out. Default 0.5s comfortably exceeds a healthy source's normal "
+            "update gap without being so tight that an ordinary hiccup trips it; "
+            "raise it for a source that updates more slowly by design."
+        ),
+    )
 
 
 class MotorChannel(BaseModel):
@@ -155,12 +176,42 @@ class MotorControlConfig(ServiceConfig):
     estopped: bool = Field(False, description="Latched emergency stop. When True every output is forced to 0 and set() is refused until clear_estop.")
 
 
+# ── wire schema for what this service PUBLISHES ────────────────────────
+
+class MotorChannelState(BaseModel):
+    """One channel's live state, as it appears in `/state`'s `channels`
+    list. Distinct from `MotorChannel` (the persisted config): adds the
+    computed `output` (live, post-slew) and `bound` fields."""
+
+    id: str
+    controller_type: Optional[str]
+    controller_id: Optional[str]
+    motor: int
+    value: float = Field(description="Commanded target throttle (-1..+1).")
+    output: float = Field(description="Live output actually being sent, post-slew.")
+    min_output: float
+    max_output: float
+    slew_rate: float
+    invert: bool
+    enabled: bool
+    bound: bool = Field(description="True once both controller_type and controller_id are set.")
+    input_source: Optional[InputSource] = None
+
+
+class MotorControlState(BaseModel):
+    """Retained on `/motor_control/{id}/state` — channels + outputs + estop."""
+
+    estopped: bool
+    channels: List[MotorChannelState]
+
+
 class MotorControlService(Service):
     """In-process multi-motor commander. See module docstring for both
     the consumed motor_controller contract and the promoted
     motor_control contract."""
 
     config_class = MotorControlConfig
+    state_schema = MotorControlState
     publishes = ["state"]
 
     _tick_task: Optional[asyncio.Task] = None
@@ -178,6 +229,18 @@ class MotorControlService(Service):
     # to so _resync can detect a re-pointed source. Rebuilt on start.
     _input_tasks: Dict[str, asyncio.Task] = {}
     _input_topics: Dict[str, str] = {}
+    # Watchdog bookkeeping (both keyed by channel id, rebuilt on start).
+    # _input_last_seen: monotonic time of the last message received on
+    # the channel's bound topic — ANY message, even one _extract_input
+    # can't parse, since receiving garbage still proves the source is
+    # alive. Seeded to "now" when a subscription starts (not left unset)
+    # so a fresh binding gets a full timeout_s grace period before the
+    # tick loop could consider it stale, instead of being stale from the
+    # first tick just because no message has arrived YET.
+    # _input_stale: last-known stale/fresh state per channel, so the tick
+    # loop logs the transition once instead of every tick while stuck.
+    _input_last_seen: Dict[str, float] = {}
+    _input_stale: Dict[str, bool] = {}
 
     # ─── lifecycle ───────────────────────────────────────────────────
     async def on_start(self) -> None:
@@ -188,6 +251,8 @@ class MotorControlService(Service):
         self._last_sent = {}
         self._input_tasks = {}
         self._input_topics = {}
+        self._input_last_seen = {}
+        self._input_stale = {}
         for ch in self.config.channels:
             self._outputs[ch.id] = 0.0 if self.config.estopped else float(ch.value)
         await self._publish_state()
@@ -511,7 +576,9 @@ class MotorControlService(Service):
                 await asyncio.sleep(dt)
                 frame += 1
                 changed = False
+                now = time.monotonic()
                 for ch in self.config.channels:
+                    self._check_input_watchdog(ch, now)
                     target = 0.0 if (self.config.estopped or not ch.enabled) else ch.value
                     cur = self._outputs.get(ch.id, 0.0)
                     nxt = self._advance(cur, target, ch.slew_rate, dt)
@@ -559,10 +626,17 @@ class MotorControlService(Service):
                 task.cancel()
                 self._input_tasks.pop(cid, None)
                 self._input_topics.pop(cid, None)
+                self._input_last_seen.pop(cid, None)
+                self._input_stale.pop(cid, None)
         for cid, topic in desired.items():
             if cid not in self._input_tasks:
                 self._input_tasks[cid] = asyncio.create_task(self._input_loop(cid, topic))
                 self._input_topics[cid] = topic
+                # Grace period: seed to "now" rather than leaving unset, so
+                # the watchdog doesn't consider a just-started subscription
+                # stale before its first message has had a chance to arrive.
+                self._input_last_seen[cid] = time.monotonic()
+                self._input_stale[cid] = False
 
     async def _input_loop(self, channel_id: str, topic: str) -> None:
         """Subscribe to one input source and drive its channel's target.
@@ -573,12 +647,53 @@ class MotorControlService(Service):
             async for msg in self.subscribe_iter(topic, subscriber_id=f"motor_control-{self.proxy_id}-input-{channel_id}"):
                 if getattr(msg, "topic", None) == "__terminate__" or self.is_stopping():
                     break
+                # Record BEFORE the binding/extract checks below — even a
+                # message this channel ends up ignoring proves the topic
+                # itself is still alive, which is all the watchdog cares
+                # about (a live-but-noisy source is not what it guards
+                # against).
+                self._input_last_seen[channel_id] = time.monotonic()
                 ch = self._find(channel_id)
                 if ch is None or ch.input_source is None or ch.input_source.topic != topic:
                     break  # binding removed or re-pointed — this task is stale
                 self._apply_input(ch, getattr(msg, "payload", None))
         except asyncio.CancelledError:
             pass
+
+    def _check_input_watchdog(self, ch: MotorChannel, now: float) -> bool:
+        """Zero ``ch.value`` if its bound input source has gone silent for
+        longer than its ``timeout_s``. A no-op for a channel with no
+        input_source. Returns the channel's current stale/fresh state
+        (mainly for tests — the tick loop doesn't need the return value,
+        it reads the mutated ``ch.value`` instead).
+
+        Forcing ``ch.value`` itself (not just a local variable the tick
+        loop would otherwise compute) means the /state snapshot honestly
+        shows "target is 0" instead of still reporting a phantom non-zero
+        commanded value that just happens not to be reaching the motor —
+        the same reasoning clear_input's zeroing already uses. Logging is
+        edge-triggered (on the stale/fresh transition only) so a source
+        that's been down for an hour doesn't spam a warning every tick."""
+        src = ch.input_source
+        if src is None:
+            return False
+        last_seen = self._input_last_seen.get(ch.id)
+        stale = last_seen is None or (now - last_seen) > src.timeout_s
+        was_stale = self._input_stale.get(ch.id, False)
+        if stale and not was_stale:
+            logger.warning(
+                "motor_control %s: channel %r input source %r silent for >%.2fs — zeroing target",
+                self.proxy_id, ch.id, src.topic, src.timeout_s,
+            )
+        elif was_stale and not stale:
+            logger.info(
+                "motor_control %s: channel %r input source %r resumed",
+                self.proxy_id, ch.id, src.topic,
+            )
+        self._input_stale[ch.id] = stale
+        if stale:
+            ch.value = 0.0
+        return stale
 
     def _apply_input(self, ch: MotorChannel, payload: Any) -> Optional[float]:
         """Compute and set ``ch``'s target from one input payload.
@@ -614,27 +729,33 @@ class MotorControlService(Service):
         return raw * src.scale + src.offset
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "estopped": bool(self.config.estopped),
-            "channels": [
-                {
-                    "id": c.id,
-                    "controller_type": c.controller_type,
-                    "controller_id": c.controller_id,
-                    "motor": c.motor,
-                    "value": c.value,                       # commanded target
-                    "output": round(self._outputs.get(c.id, 0.0), 4),  # live, post-slew
-                    "min_output": c.min_output,
-                    "max_output": c.max_output,
-                    "slew_rate": c.slew_rate,
-                    "invert": c.invert,
-                    "enabled": c.enabled,
-                    "bound": bool(c.controller_type and c.controller_id),
-                    "input_source": c.input_source.model_dump() if c.input_source else None,
-                }
+        # Built via MotorControlState (the declared state_schema) then
+        # dumped, so this stays the single source of truth the schema
+        # is checked against — but the return type stays a plain dict,
+        # since @service_method handlers below also return this value
+        # directly as their RPC result, not just _publish_state.
+        state = MotorControlState(
+            estopped=bool(self.config.estopped),
+            channels=[
+                MotorChannelState(
+                    id=c.id,
+                    controller_type=c.controller_type,
+                    controller_id=c.controller_id,
+                    motor=c.motor,
+                    value=c.value,                       # commanded target
+                    output=round(self._outputs.get(c.id, 0.0), 4),  # live, post-slew
+                    min_output=c.min_output,
+                    max_output=c.max_output,
+                    slew_rate=c.slew_rate,
+                    invert=c.invert,
+                    enabled=c.enabled,
+                    bound=bool(c.controller_type and c.controller_id),
+                    input_source=c.input_source,
+                )
                 for c in self.config.channels
             ],
-        }
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         # Service.publish is synchronous on the in-process base.

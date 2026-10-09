@@ -26,7 +26,7 @@ icon: icon.svg
 bundled: true
 publish: true   # available in the remote registry (see master_template for docs)
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md). The
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section). The
 # host dynamically imports ui/dist/ui.js (compiled from ui/View.tsx by
 # botgear_ui/scripts/build-service-ui.mjs) instead of a built-in
 # serviceViews component.

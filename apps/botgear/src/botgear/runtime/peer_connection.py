@@ -4,9 +4,14 @@
 Step 2b — federation primitive. ``PeerConnection`` owns a single
 long-lived WS to a remote runtime's ``/v1/ws`` endpoint:
 
-  1. Open the socket with a subprocess JWT (Option A authentication —
-     both runtimes must share ``JWT_SECRET_KEY``; documented as a
-     LAN-dev constraint).
+  1. Open the socket with a credential — either a subprocess JWT
+     (Option A: both runtimes share ``JWT_SECRET_KEY``, the original
+     zero-config LAN-dev default) or a per-peer ``api_client`` secret
+     (Option B: ``auth_param="api_key"``, individually revocable,
+     no shared fleet-wide secret). Which one is used is decided by the
+     caller (peer_manager.connect's ``secret`` argument) per peer, not
+     globally — an unpaired, auto-discovered peer still falls back to
+     Option A so zero-config mDNS discovery keeps working.
   2. Subscribe to remote ``/runtime/info`` and parse out the remote
      runtime id. Until that arrives we hold ``remote_id = None``.
   3. Expose ``publish_upstream`` / ``subscribe_upstream`` so the peer
@@ -24,6 +29,7 @@ import asyncio
 import json
 import logging
 import random
+import ssl
 import uuid
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, Optional, Set
@@ -33,6 +39,20 @@ from websockets.exceptions import WebSocketException
 
 
 logger = logging.getLogger(__name__)
+
+
+# Trusted-LAN assumption (see mdns.py's module docstring — same threat
+# model as ROS1's master/DDS: fine for a workshop, not a hostile
+# network). Peers self-sign their own TLS cert per-install (see
+# server.py's ssl_enabled path) with no shared CA, so the default
+# strict SSL context would reject every single federation peer
+# unconditionally — federation auth is the subprocess JWT
+# (JWT_SECRET_KEY), not the TLS certificate chain, so verification is
+# deliberately skipped rather than trying to distribute/pin certs
+# across every runtime in the LAN.
+_INSECURE_WSS_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_INSECURE_WSS_CONTEXT.check_hostname = False
+_INSECURE_WSS_CONTEXT.verify_mode = ssl.CERT_NONE
 
 
 # Expected, transient peer-connection failures — peer down (OSError /
@@ -88,6 +108,7 @@ class PeerConnection:
         url: str,
         *,
         token_provider: Callable[[], str],
+        auth_param: str = "token",
         on_state_change: Optional[Callable[["PeerConnection"], None]] = None,
         on_message: Optional[Callable[[str, Any, Dict[str, Any]], None]] = None,
         local_id_provider: Optional[Callable[[], str]] = None,
@@ -97,6 +118,13 @@ class PeerConnection:
         # opened either way.
         self.url = _normalise_peer_url(url)
         self._token_provider = token_provider
+        # Which query param the credential goes under on the remote's
+        # /v1/ws — "token" for the shared JWT_SECRET_KEY subprocess
+        # token (Option A, the long-standing default), "api_key" for a
+        # per-peer api_client secret (Option B — see peer_manager.connect's
+        # ``secret`` param). The remote's ws_endpoint tries whichever one
+        # arrives; this just has to match what the caller put here.
+        self.auth_param = auth_param
         self._on_state_change = on_state_change
         self._on_message = on_message
         # Lazy lookup of OUR runtime id so the collision check has a
@@ -264,11 +292,14 @@ class PeerConnection:
         """Single connect → identify → serve cycle. Returns on
         disconnect; the outer loop handles retry."""
         token = self._token_provider()
-        url_with_token = f"{self.url}?token={token}"
+        url_with_token = f"{self.url}?{self.auth_param}={token}"
         self._set_state(PeerState.CONNECTING)
 
         try:
-            async with websockets.connect(url_with_token, ping_interval=20, ping_timeout=20) as ws:
+            ssl_ctx = _INSECURE_WSS_CONTEXT if self.url.startswith("wss://") else None
+            async with websockets.connect(
+                url_with_token, ping_interval=20, ping_timeout=20, ssl=ssl_ctx,
+            ) as ws:
                 self._ws = ws
                 self._set_state(PeerState.IDENTIFYING)
 

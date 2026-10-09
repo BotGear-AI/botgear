@@ -9,6 +9,8 @@ consumer can answer the questions ``services_index`` can't:
   * What does a ``video`` service's config look like before I create one?
   * What does its ``state`` payload look like before I subscribe?
   * What arguments does its ``add_filter`` action accept?
+  * What shape does a ``chat`` instance expect on the topic I'd publish
+    to feed it (``subscribes_schemas``)?
 
 Topics published (all retained):
 
@@ -26,12 +28,18 @@ Sources for the descriptor:
     framework's existing loader and introspected for:
       - ``config_class`` → JSON Schema via Pydantic v2
       - ``@service_method``-decorated callables → arg JSON Schemas
-      - optional ``state_schema`` + ``topic_schemas`` class attrs
-  * For **subprocess** types, the class lives in a per-type venv that
-    the runtime can't import. Their descriptors include only manifest-
-    derived fields, with ``schemas_complete: false``. A later phase
-    can have subprocess services publish their own enriched descriptor
-    to the same topic on first start.
+      - optional ``state_schema`` + ``topic_schemas`` (published) +
+        ``subscribes_schemas`` (consumed/inbound) class attrs
+  * For **subprocess** types, the class lives in a per-type venv the
+    runtime can't import directly — instead a one-shot script runs
+    through THAT venv's own python (see
+    ``schema_introspect.subprocess_introspect``), importing the class
+    and returning the same ``config_schema``/``state_schema``/
+    ``topic_schemas``/``subscribes_schemas``/``methods`` bundle as the
+    in-process path. ``schemas_complete`` reflects whether that
+    introspection actually succeeded (false only when the venv is
+    missing/uninstalled or the class raised on import — see the
+    descriptor's ``notes`` field).
 
 Build-once-at-startup: `service_meta` is reconciled at boot and not
 hot-reloaded (per ``runtime/catalog.py``). If that ever changes, call
@@ -47,11 +55,14 @@ from typing import Any, Dict, List, Optional
 from botgear.framework.adapters.in_process import _load_service_class
 from botgear.runtime.bus import get_bus
 from botgear.runtime.identity import get_runtime_id
+from rlx_bus.introspect import publishes as class_publishes
 from botgear.runtime.schema_introspect import (
     class_state_schema,
     class_topic_schemas,
+    class_subscribes_schemas,
     config_class_schema,
     introspect_methods,
+    subprocess_introspect,
 )
 
 
@@ -135,24 +146,22 @@ def _build_descriptor(meta: Dict[str, Any], repo_dir: Optional[Path]) -> Dict[st
         "schemas_complete": False,
         "config_schema": None,
         "state_schema": None,
+        "publishes": [],
         "topic_schemas": {},
+        "subscribes_schemas": {},
         "methods": [],
         "sub_resources": [],
     }
 
     if transport != "in_process":
-        # Manifest-only descriptor for subprocess types. A consumer
-        # discovers the running instance's full schema via its
-        # /<type>/<id>/meta + /<type>/<id>/<sub>/catalog topics.
-        descriptor["notes"] = (
-            "Subprocess type — config/state/method schemas are not "
-            "available via the runtime venv. Subscribe to a running "
-            "instance's /meta + filter_catalog (if applicable) for "
-            "live schemas."
-        )
+        # Subprocess types get the SAME schema bundle as in-process ones —
+        # asking the type's own venv to import its Service class and hand
+        # back rlx_bus.introspect.describe_class(cls) as JSON. No running
+        # instance required.
+        #
         # Hint the canonical instance-side catalog topics so a consumer
-        # knows where to look at runtime. We can't list per-resource
-        # schemas without a running instance, but the hint is enough.
+        # knows where to look at runtime for things this descriptor still
+        # can't cover (e.g. video's per-instance filter catalog).
         if type_name == "video":
             descriptor["sub_resources"] = [{
                 "name": "filters",
@@ -161,6 +170,28 @@ def _build_descriptor(meta: Dict[str, Any], repo_dir: Optional[Path]) -> Dict[st
                 "catalog_topic_suffix": "filter_catalog",
                 "key_field": "type",
             }]
+        type_root = Path(meta["repo_root"]) if meta.get("repo_root") else repo_dir
+        introspected = None
+        if type_root is not None:
+            from botgear.runtime import proc_compat
+            venv_python = proc_compat.venv_python(type_root / type_name / type_version / ".venv")
+            argv = list(meta.get("entry_argv") or [])
+            introspected = subprocess_introspect(venv_python, type_name, argv)
+        if introspected is not None:
+            descriptor["config_schema"] = introspected.get("config_schema")
+            descriptor["state_schema"] = introspected.get("state_schema")
+            descriptor["topic_schemas"] = introspected.get("topic_schemas") or {}
+            descriptor["subscribes_schemas"] = introspected.get("subscribes_schemas") or {}
+            descriptor["publishes"] = introspected.get("publishes") or []
+            descriptor["methods"] = introspected.get("methods") or []
+            descriptor["schemas_complete"] = True
+        else:
+            descriptor["notes"] = (
+                "Subprocess type — introspection script failed (venv "
+                "missing/not yet installed, or the class raised on "
+                "import). Subscribe to a running instance's /meta topic "
+                "as a fallback."
+            )
         return descriptor
 
     # ── in-process path: load the class + introspect ──
@@ -181,9 +212,11 @@ def _build_descriptor(meta: Dict[str, Any], repo_dir: Optional[Path]) -> Dict[st
         descriptor["notes"] = f"Service class load failed: {exc!r}"
         return descriptor
 
-    descriptor["config_schema"] = config_class_schema(getattr(cls, "config_class", None))
+    descriptor["config_schema"] = config_class_schema(cls)
     descriptor["state_schema"] = class_state_schema(cls)
     descriptor["topic_schemas"] = class_topic_schemas(cls)
+    descriptor["subscribes_schemas"] = class_subscribes_schemas(cls)
+    descriptor["publishes"] = class_publishes(cls)
     descriptor["methods"] = introspect_methods(cls)
     descriptor["schemas_complete"] = True
     return descriptor
@@ -229,6 +262,38 @@ def _publish_descriptors(descriptors: Dict[str, Dict[str, Any]]) -> None:
 _built: Dict[str, Dict[str, Any]] = {}
 
 
+def _persist_config_schema(meta_row: Dict[str, Any], schema: Dict[str, Any]) -> None:
+    """Write an introspected ``config_schema`` back onto its
+    ``service_meta`` DB row so the plain REST list (``/v1/service-meta-
+    list``, what the UI's catalog + ConfigWizard actually read — they
+    don't subscribe to the bus descriptor) serves it too, not just the
+    bus descriptor. Skipped when unchanged. Best-effort: a DB hiccup
+    here must not break the bus publish it's piggybacking on.
+
+    ``reconcile_catalog``'s per-boot manifest upsert won't clobber this —
+    ``update_item`` merges onto the existing row rather than replacing
+    it (see AGENTS.md's DB-backend notes), and we round-trip the full
+    row anyway.
+    """
+    if meta_row.get("config_schema") == schema:
+        return
+    meta_id = meta_row.get("id")
+    if not meta_id:
+        return
+    try:
+        from database.factory import get_database_client
+        db = get_database_client()
+        if db is None:
+            return
+        row = db.get_item("service_meta", meta_id)
+        if not row:
+            return
+        row["config_schema"] = schema
+        db.update_item("service_meta", meta_id, row, include_nulls=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("types_index: failed to persist config_schema for %s", meta_id)
+
+
 def rebuild() -> Dict[str, Dict[str, Any]]:
     """Rescan service_meta + republish every descriptor. Returns the
     new descriptors map (keyed by type-name).
@@ -244,7 +309,14 @@ def rebuild() -> Dict[str, Dict[str, Any]]:
         type_name = meta.get("name")
         if not type_name or type_name in new:
             continue
-        new[type_name] = _build_descriptor(meta, repo_dir)
+        descriptor = _build_descriptor(meta, repo_dir)
+        new[type_name] = descriptor
+        # Both transports: the UI's Configure button and ConfigWizard read
+        # config_schema off the REST service_meta list, not the bus. Built-in
+        # types (agent, brain, clock, ...) were left out, so they never got a
+        # Configure button at all.
+        if descriptor.get("config_schema") is not None:
+            _persist_config_schema(meta, descriptor["config_schema"])
     # Clear stale entries: anything in _built but not in new gets its
     # retained topic nulled.
     bus = get_bus()

@@ -5,13 +5,9 @@ solves all end-effectors together via Pinocchio + Pink so shared joints
 (the waist) coordinate and limits hold. Each end-effector has a *pendant* —
 a world-frame target point it chases (arms reach it; head looks at it).
 
-Bus topics:
-  /robot_kinematics/{id}/state      retained — rig + joint angles + EE poses + link positions
-  /robot_kinematics/{id}/control    incoming actions
-  /robot_kinematics/{id}/heartbeat  1Hz (base class)
-
-Actions: list_rigs, load_rig, set_target, solve, step, set_calibration,
-send_to_servos, reset.
+Wire shape (``RobotKinematicsState`` via ``state_schema``) and the
+``control`` actions are introspected into
+``/runtime/runtime/types/robot_kinematics`` off the code below.
 """
 from __future__ import annotations
 
@@ -19,6 +15,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig, SubprocessService, service_method
 from rlx_servo_cal import auto_calibrate, math_to_servo, servo_to_math
 
@@ -64,11 +61,54 @@ class RobotKinematicsConfig(ServiceConfig):
     hand_curl: Dict[str, float] = {}    # side ('r'/'l') -> 0 open .. 1 closed
 
 
+# ── wire schema for what this service PUBLISHES ───────────────────────
+
+class EndEffectorStatus(BaseModel):
+    name: str
+    link: str
+    mode: str
+    enabled: bool
+    pos_mm: Optional[List[float]] = Field(description="World-frame [x, y, z] mm; None when no rig is loaded")
+    error_mm: Optional[float] = Field(description="Distance to its target; None when no rig is loaded")
+
+
+class RobotKinematicsState(BaseModel):
+    """Retained on ``/robot_kinematics/{id}/state`` — rig + joint angles +
+    EE poses + link positions. Solver-derived fields are empty/None
+    until a rig is loaded."""
+    rig_id: Optional[str]
+    rig_title: Optional[str]
+    visual: Optional[str] = Field(description="Bundle-relative GLB for the skinned viewer")
+    base_link: str
+    loaded: bool
+    error: Optional[str]
+    end_effectors: List[EndEffectorStatus]
+    targets: Dict[str, Target] = Field(description="ee_name -> pendant")
+    props: List[Prop]
+    joint_angles: Dict[str, float] = Field(description="Degrees")
+    joint_limits: Dict[str, List[float]] = Field(description="joint -> [lower_deg, upper_deg]")
+    link_positions: Dict[str, List[float]] = Field(description="link -> world [x, y, z] mm")
+    link_poses: Dict[str, Dict[str, List[float]]] = Field(description="link -> {pos, quat}")
+    link_parents: Dict[str, str]
+    limit_violations: List[str]
+    colliding_links: List[str]
+    obstacle_clearance_mm: Optional[float]
+    avoid_obstacles: bool
+    locked_joints: List[str]
+    joint_clamps_deg: Dict[str, List[float]]
+    follow_servos: bool
+    actuate_hardware: bool
+    hand_curl: Dict[str, float]
+    calibration: List[JointCalibration]
+    ts: float
+
+
 class RobotKinematicsService(SubprocessService):
     type_name = "robot_kinematics"
     heartbeat_interval_s = 1.0
     config_class = RobotKinematicsConfig
     publishes = ["state"]
+    state_schema = RobotKinematicsState
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -642,40 +682,42 @@ class RobotKinematicsService(SubprocessService):
     # ─── state ────────────────────────────────────────────────────────
     def _snapshot(self) -> Dict[str, Any]:
         s = self._solver
-        ee_status: List[Dict[str, Any]] = []
-        for ee in self.config.end_effectors:
-            ee_status.append({
-                "name": ee.name, "link": ee.link, "mode": ee.mode, "enabled": ee.enabled,
-                "pos_mm": s.ee_world_pos(ee.name) if s else None,
-                "error_mm": s.reach_error_mm(ee.name) if s else None,
-            })
-        return {
-            "rig_id": self.config.rig_id,
-            "rig_title": self.config.rig_title,
-            "visual": self.config.visual or None,
-            "base_link": self.config.base_link,
-            "loaded": s is not None,
-            "error": self._error,
-            "end_effectors": ee_status,
-            "targets": {k: v.model_dump() for k, v in (self.config.targets or {}).items()},
-            "props": [p.model_dump() for p in (self.config.props or [])],
-            "joint_angles": s.joint_angles_deg() if s else {},
-            "joint_limits": s.joint_limits_deg() if s else {},
-            "link_positions": s.link_world_positions() if s else {},
-            "link_poses": s.link_world_poses() if s else {},
-            "link_parents": self._link_parents,
-            "limit_violations": s.limit_violations() if s else [],
-            "colliding_links": s.colliding_links() if s else [],
-            "obstacle_clearance_mm": s.obstacle_clearance_mm() if s else None,
-            "avoid_obstacles": self.config.avoid_obstacles,
-            "locked_joints": list(self.config.locked_joints),
-            "joint_clamps_deg": dict(self.config.joint_clamps_deg),
-            "follow_servos": self.config.follow_servos,
-            "actuate_hardware": self.config.actuate_hardware,
-            "hand_curl": s.finger_curl() if s else {},
-            "calibration": [c.model_dump() for c in self.config.calibration],
-            "ts": time.time(),
-        }
+        ee_status = [
+            EndEffectorStatus(
+                name=ee.name, link=ee.link, mode=ee.mode, enabled=ee.enabled,
+                pos_mm=s.ee_world_pos(ee.name) if s else None,
+                error_mm=s.reach_error_mm(ee.name) if s else None,
+            )
+            for ee in self.config.end_effectors
+        ]
+        state = RobotKinematicsState(
+            rig_id=self.config.rig_id,
+            rig_title=self.config.rig_title,
+            visual=self.config.visual or None,
+            base_link=self.config.base_link,
+            loaded=s is not None,
+            error=self._error,
+            end_effectors=ee_status,
+            targets=dict(self.config.targets or {}),
+            props=list(self.config.props or []),
+            joint_angles=s.joint_angles_deg() if s else {},
+            joint_limits=s.joint_limits_deg() if s else {},
+            link_positions=s.link_world_positions() if s else {},
+            link_poses=s.link_world_poses() if s else {},
+            link_parents=self._link_parents,
+            limit_violations=s.limit_violations() if s else [],
+            colliding_links=s.colliding_links() if s else [],
+            obstacle_clearance_mm=s.obstacle_clearance_mm() if s else None,
+            avoid_obstacles=self.config.avoid_obstacles,
+            locked_joints=list(self.config.locked_joints),
+            joint_clamps_deg=dict(self.config.joint_clamps_deg),
+            follow_servos=self.config.follow_servos,
+            actuate_hardware=self.config.actuate_hardware,
+            hand_curl=s.finger_curl() if s else {},
+            calibration=list(self.config.calibration),
+            ts=time.time(),
+        )
+        return state.model_dump()
 
     async def _publish_state(self, force: bool = True) -> None:
         """Publish the full state snapshot (retained). ``force`` (default) always

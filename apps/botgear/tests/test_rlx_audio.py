@@ -643,6 +643,43 @@ async def test_stt_start_latches_active_unlike_listen(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stt_start_stop_persist_continuous_flag(tmp_path, monkeypatch):
+    """start()/stop() must persist continuous (mirrors AudioDeviceServiceBase's
+    connect()/disconnect() persisting `connected`) — otherwise a subprocess
+    restart has no record that the operator wanted listening on, and
+    on_start()'s ``if self.config.continuous`` check silently never fires."""
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    assert stt.config.continuous is False
+    await stt.m_start()
+    assert stt.config.continuous is True
+    assert stt.bus.last("/stt/stt-1/state")["continuous"] is True
+    await stt.m_stop()
+    assert stt.config.continuous is False
+    assert stt.bus.last("/stt/stt-1/state")["continuous"] is False
+
+
+@pytest.mark.asyncio
+async def test_stt_resumes_listening_on_restart_when_continuous(tmp_path, monkeypatch):
+    """The other half of the fix: on_start() already checked
+    config.continuous before this change — a fresh process booting with
+    that flag pre-set (as start() now persists) must come up listening on
+    its own, the same recovery a mic gets from config.connected."""
+    stt = _stt(tmp_path, monkeypatch)
+    stt.config = stt.config.merge_dict({
+        "continuous": True, "input_kind": "topic", "input_ref": "/microphone/mic-1/audio",
+    })
+    assert stt._active is False           # not yet started
+    await stt.on_start()
+    try:
+        assert stt._active is True
+        assert stt._recognizer is not None
+        assert stt.bus.last("/stt/stt-1/state")["listening"] is True
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
 async def test_stt_listen_fast_fails_without_microphone(tmp_path, monkeypatch):
     stt = _stt(tmp_path, monkeypatch)
     # No select_input → no source. listen must NOT block the full window or
@@ -706,6 +743,36 @@ async def test_stt_recognizer_loop_end_to_end(tmp_path, monkeypatch):
         assert out == {"text": "go forward", "bearing": None, "timeout": False}
         finals = [p for t, p, _ in stt.bus.published if t.endswith("/text") and p.get("final")]
         assert finals and finals[-1]["text"] == "go forward"
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_stt_recognizer_loop_surfaces_feed_error(tmp_path, monkeypatch):
+    """A _feed() that raises on every call (e.g. a missing runtime dep —
+    exactly what a stt_local venv without numpy did) must not fail silently
+    forever: frames keep arriving, ready/listening stay true, but nothing is
+    ever transcribed with zero visible signal. The loop should surface it via
+    last_error instead of only logging."""
+    class BoomFeedStt(FakeStt):
+        def _feed(self, handle, pcm):
+            raise ModuleNotFoundError("No module named 'numpy'")
+    stt = _stt(tmp_path, monkeypatch, cls=BoomFeedStt)
+    await stt.on_start()
+    try:
+        await stt.m_select_input("topic", "/microphone/mic-1/audio")
+        await stt.m_start()
+        frame = encode_frame(1, 0.0, 16000, 1, struct.pack("<2h", 9, 9))
+        await stt._on_topic_frame(frame, "/microphone/mic-1/audio")
+        # Give the loop a moment to pick the frame up and feed it.
+        for _ in range(50):
+            if stt._last_error:
+                break
+            await asyncio.sleep(0.02)
+        assert stt._last_error is not None
+        assert "numpy" in stt._last_error
+        states = [p for t, p, _ in stt.bus.published if t.endswith("/state")]
+        assert states and states[-1]["last_error"] == stt._last_error
     finally:
         await stt.on_stop()
 
@@ -821,3 +888,467 @@ async def test_stt_meta_topics_and_default_model(tmp_path, monkeypatch):
     assert stt._resolve_model() == "fake-en"                    # falls back to DEFAULT_MODEL
     await stt.m_set_model("other")
     assert stt._resolve_model() == "other"
+
+
+# ─── transcript-to-file (save-to-disk) ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_transcript_recording_writes_finals_only(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.on_start()
+    try:
+        out = await stt.m_start_recording("session.txt")
+        state = stt.bus.last("/stt/stt-1/state")
+        assert state["recording_transcript"] is True
+        assert state["transcript_path"].endswith("session.txt")
+        # Partials must NOT be written — only non-empty finals.
+        await stt._handle_result({"text": "hel", "final": False})
+        await stt._handle_result({"text": "hello there", "final": True})
+        await stt._handle_result({"text": "", "final": True})   # empty final: no line
+        res = await stt.m_stop_recording()
+        assert res["lines"] == 1
+        path = tmp_path / "transcripts" / "session.txt"
+        assert path.is_file()
+        lines = path.read_text().splitlines()
+        assert len(lines) == 1
+        assert lines[0].endswith("hello there")
+        assert lines[0].startswith("[")              # timestamp prefix
+        # A fresh suggestion is pre-loaded for next time.
+        assert stt.bus.last("/stt/stt-1/state")["transcript_suggested_path"].endswith(".txt")
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_transcript_recording_appends_across_start_stop_cycles(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.on_start()
+    try:
+        await stt.m_start_recording("session.txt")
+        await stt._handle_result({"text": "first", "final": True})
+        await stt.m_stop_recording()
+        await stt.m_start_recording("session.txt")   # same file, second session
+        await stt._handle_result({"text": "second", "final": True})
+        await stt.m_stop_recording()
+        path = tmp_path / "transcripts" / "session.txt"
+        lines = path.read_text().splitlines()
+        assert len(lines) == 2
+        assert lines[0].endswith("first") and lines[1].endswith("second")
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_transcript_suggested_path_under_transcripts_dir(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.on_start()
+    try:
+        p = stt._fresh_transcript_path()
+        assert p.startswith(str(tmp_path / "transcripts"))
+        assert p.endswith(".txt")
+        assert "stt-1" in p
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_transcript_recording_without_start_is_a_noop(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    res = await stt.m_stop_recording()
+    assert res == {"path": None, "lines": 0}
+    assert stt._recording_transcript is False
+
+
+# ─── speak(wait=True) + speakable text ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_speech_speak_wait_returns_after_streaming(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)
+    await spk.on_start()
+    try:
+        res = await spk.m_speak("hello there", wait=True, wait_timeout_s=5)
+        assert res["finished"] is True and res["outcome"] == "finished"
+        # Streaming is over by the time speak returned: frames were sent and
+        # the service is idle again.
+        assert any(t.endswith("/audio") for t, _, _ in spk.bus.published)
+        assert spk._speaking is False and spk._pending == []
+    finally:
+        await spk.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_speech_speak_without_wait_returns_immediately(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)
+    res = await spk.m_speak("hello there")      # no worker running → still returns
+    assert "finished" not in res and res["queued"] == 1
+
+
+@pytest.mark.asyncio
+async def test_speech_speak_wait_times_out_without_blocking(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)         # no worker → never streams
+    res = await spk.m_speak("hello", wait=True, wait_timeout_s=0.2)
+    assert res["finished"] is False and res["outcome"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_speech_speak_wait_resolves_when_interrupted(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)         # no worker → item stays queued
+    waiter = asyncio.create_task(spk.m_speak("first", wait=True, wait_timeout_s=5))
+    await asyncio.sleep(0.05)
+    await spk.m_stop()
+    res = await asyncio.wait_for(waiter, 2)
+    assert res["finished"] is False and res["outcome"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_speech_state_carries_proxy_id(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)
+    await spk.m_speak("hi")
+    assert spk.bus.last("/speech/speech-1/state")["proxy_id"] == "speech-1"
+
+
+@pytest.mark.asyncio
+async def test_speech_speak_strips_markdown(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)
+    res = await spk.m_speak("Options:\n\n1. **Device Status**\n- *Audio* settings")
+    assert res["spoken"] == "Options: 1. Device Status. Audio settings."
+
+
+@pytest.mark.parametrize("raw, spoken", [
+    ("Hello there", "Hello there"),
+    ("Done!", "Done!"),
+    ("# Heading\nBody text", "Heading. Body text."),
+    ("Let me clarify the options:\n\n1. **Device Status** (e.g., switches)\n2. **Hardware Control**",
+     "Let me clarify the options: 1. Device Status (e.g., switches). 2. Hardware Control."),
+    ("- one\n- two\n* three", "one. two. three."),
+    ("see [the docs](http://x) and `run_it`", "see the docs and run_it"),
+    ("| a | b |\n|---|---|\n| 1 | 2 |", "a, b. 1, 2."),
+    ("keep snake_case_names and 2 * 3", "keep snake_case_names and 2 * 3"),
+    ("> quoted\n---\nafter", "quoted. after."),
+    ("", ""),
+])
+def test_speakable_text(raw, spoken):
+    from rlx_audio.base import speakable_text
+    assert speakable_text(raw) == spoken
+
+
+# ─── STT echo gate ─────────────────────────────────────────────────────
+
+
+def _speech_state(**kw) -> Dict[str, Any]:
+    state = {"proxy_id": "mouth", "speaking": False, "synthesizing": False, "queue": []}
+    state.update(kw)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_stt_echo_gate_drops_frames_while_speech_busy(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()
+    frame = encode_frame(1, 0.0, 16000, 1, struct.pack("<2h", 9, 9))
+
+    for busy in ({"synthesizing": True}, {"speaking": True}, {"queue": ["next"]}):
+        await stt._on_speech_state(_speech_state(**busy))
+        await stt._on_topic_frame(frame, "/microphone/mic-1/audio")
+        assert stt._frame_q.qsize() == 0, busy
+        assert stt.bus.last("/stt/stt-1/state")["echo_suppressed"] is True
+
+
+@pytest.mark.asyncio
+async def test_stt_echo_gate_reopens_after_holdoff(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    stt.config.echo_holdoff_ms = 100
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()
+    frame = encode_frame(1, 0.0, 16000, 1, struct.pack("<2h", 9, 9))
+
+    await stt._on_speech_state(_speech_state(speaking=True))
+    await stt._on_speech_state(_speech_state())          # speech ended
+    await stt._on_topic_frame(frame, "/microphone/mic-1/audio")
+    assert stt._frame_q.qsize() == 0                     # still inside the hold-off
+    await asyncio.sleep(0.15)
+    await stt._on_topic_frame(frame, "/microphone/mic-1/audio")
+    assert stt._frame_q.qsize() == 1                     # gate open again
+    assert stt._echo_gated() is False
+
+
+@pytest.mark.asyncio
+async def test_stt_echo_gate_tracks_each_speech_service(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    stt.config.echo_holdoff_ms = 0
+    await stt._on_speech_state(_speech_state(proxy_id="a", speaking=True))
+    await stt._on_speech_state(_speech_state(proxy_id="b", speaking=True))
+    await stt._on_speech_state(_speech_state(proxy_id="a"))
+    assert stt._echo_gated() is True                     # b is still talking
+    await stt._on_speech_state(_speech_state(proxy_id="b"))
+    assert stt._echo_gated() is False
+
+
+@pytest.mark.asyncio
+async def test_stt_echo_gate_ignores_stale_busy_report(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt._on_speech_state(_speech_state(speaking=True))
+    stt._speech_busy["mouth"] -= stt._ECHO_STALE_S + 1   # speech died mid-utterance
+    assert stt._echo_gated() is False
+
+
+@pytest.mark.asyncio
+async def test_stt_echo_gate_discards_results_and_partial_but_keeps_earlier_utterances(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()
+    await stt._handle_result({"text": "turn on the light", "final": True})   # operator, before speech
+    await stt._handle_result({"text": "I'll", "final": False})              # partial in flight
+    gen0 = stt._gen
+
+    await stt._on_speech_state(_speech_state(speaking=True))
+    assert stt._gen == gen0 + 1                          # in-flight feeds invalidated
+    assert stt.resets >= 1                               # decode state reset
+    assert stt._last_partial == ""
+    await stt._handle_result({"text": "I'll turn on the light", "final": True})   # echo
+    assert [stt._queue.get_nowait()["text"] for _ in range(stt._queue.qsize())] == ["turn on the light"]
+
+
+@pytest.mark.asyncio
+async def test_stt_echo_gate_can_be_disabled(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    stt.config.suppress_while_speaking = False
+    await stt._on_speech_state(_speech_state(speaking=True))
+    assert stt._echo_gated() is False
+
+
+@pytest.mark.asyncio
+async def test_stt_listen_times_out_while_speech_is_playing(tmp_path, monkeypatch):
+    class EchoStt(FakeStt):
+        def _feed(self, handle, pcm):
+            return {"text": "echo of my own voice", "final": True}
+    stt = _stt(tmp_path, monkeypatch, cls=EchoStt)
+    await stt.on_start()
+    try:
+        await stt.m_select_input("topic", "/microphone/mic-1/audio")
+        await stt.m_start()
+        await stt._on_speech_state(_speech_state(speaking=True))
+        frame = encode_frame(1, 0.0, 16000, 1, struct.pack("<2h", 9, 9))
+        await stt._on_topic_frame(frame, "/microphone/mic-1/audio")
+        out = await stt.m_listen(timeout_seconds=0.5)
+        assert out["timeout"] is True and out["text"] == ""
+    finally:
+        await stt.on_stop()
+
+
+# ─── runtime-wide HALT ────────────────────────────────────────────────
+
+
+HALT = {"level": "stop", "source": "test", "reason": ""}
+
+
+@pytest.mark.asyncio
+async def test_speech_on_halt_interrupts_and_clears_queue(tmp_path, monkeypatch):
+    spk = _speech(tmp_path, monkeypatch)
+    waiter = asyncio.create_task(spk.m_speak("one", wait=True, wait_timeout_s=5))
+    await spk.m_speak("two")
+    await asyncio.sleep(0.01)
+    gen0 = spk._gen
+    await spk.on_halt(HALT)
+    assert spk._gen == gen0 + 1 and spk._pending == []
+    assert (await asyncio.wait_for(waiter, 2))["outcome"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_speaker_on_halt_flushes_and_drops_in_flight_frames():
+    spk = _spk()
+    await spk.m_connect()
+    frame = encode_frame(1, 0.0, 16000, 1, struct.pack("<2h", 1, 2))
+    await spk.on_halt(HALT)
+    await spk._on_sink_frame(frame)             # in flight from before the halt → dropped
+    assert spk.played == []
+    spk._halt_drain_until = 0.0                 # drain window over
+    await spk._on_sink_frame(frame)
+    assert len(spk.played) == 1                 # speaker still works after a halt
+
+
+@pytest.mark.asyncio
+async def test_stt_on_halt_drops_queued_utterances_and_stop_word_tail(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()
+    stt._enqueue_utterance("I DIDN'T CATCH THAT")
+    await stt.on_halt(HALT)
+    assert stt._queue.qsize() == 0
+    await stt._handle_result({"text": "stop", "final": True})    # the stop word finalizing late
+    assert stt._queue.qsize() == 0
+    stt._halt_quiet_until = 0.0
+    await stt._handle_result({"text": "hello", "final": True})
+    assert stt._queue.qsize() == 1                               # back to normal
+
+
+class SpotStt(FakeStt):
+    """FakeStt with a stub spotter: any frame whose first sample is 7
+    'contains' the label in ``self.hit``."""
+
+    hit = "stop_0"
+
+    def _create_kws(self, phrases, sample_rate):
+        self.phrases = phrases
+        return {"ok": True}
+
+    def _kws_feed(self, handle, pcm):
+        return self.hit if struct.unpack("<h", pcm[:2])[0] == 7 else None
+
+
+async def _spot(tmp_path, monkeypatch, **cfg) -> SpotStt:
+    stt = _stt(tmp_path, monkeypatch, cls=SpotStt)
+    for k, v in cfg.items():
+        setattr(stt.config, k, v)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.on_start()
+    await stt._kws_build_task
+    return stt
+
+
+async def _say(stt, first_sample: int) -> None:
+    await stt._on_topic_frame(encode_frame(1, 0.0, 16000, 1, struct.pack("<2h", first_sample, 0)),
+                              "/microphone/mic-1/audio")
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if stt._kws_q.qsize() == 0:
+            break
+    await asyncio.sleep(0.02)
+
+
+def _halts(stt) -> List[Dict[str, Any]]:
+    return [p for t, p, _ in stt.bus.published if t == "/runtime/halt"]
+
+
+@pytest.mark.asyncio
+async def test_stop_word_broadcasts_halt_even_when_idle(tmp_path, monkeypatch):
+    stt = await _spot(tmp_path, monkeypatch)
+    try:
+        assert stt._active is False                       # one-shot STT between turns
+        assert stt.phrases == {"stop_0": "stop", "stop_1": "be quiet", "stop_2": "stop talking",
+                               "emergency_0": "emergency stop"}
+        await _say(stt, 7)
+        halts = _halts(stt)
+        assert len(halts) == 1
+        assert halts[0]["level"] == "stop" and halts[0]["source"] == "voice:stt-1"
+        assert stt.bus.last("/stt/stt-1/stop_word")["phrase"] == "stop"
+        assert stt.bus.last("/stt/stt-1/state")["last_stop_word"] == "stop"
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_emergency_word_halts_at_emergency_level(tmp_path, monkeypatch):
+    stt = await _spot(tmp_path, monkeypatch)
+    stt.hit = "emergency_0"
+    try:
+        await _say(stt, 7)
+        assert _halts(stt)[0]["level"] == "emergency"
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_word_heard_while_robot_talks(tmp_path, monkeypatch):
+    stt = await _spot(tmp_path, monkeypatch)
+    try:
+        await stt._on_speech_state(_speech_state(speaking=True, current_text="Here are the options for you"))
+        assert stt._echo_gated() is True                  # transcription is gated...
+        await _say(stt, 7)
+        assert len(_halts(stt)) == 1                      # ...but the spotter still hears "stop"
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_word_the_robot_itself_says_is_vetoed(tmp_path, monkeypatch):
+    stt = await _spot(tmp_path, monkeypatch)
+    try:
+        await stt._on_speech_state(_speech_state(speaking=True, current_text="I will stop the motor now."))
+        await _say(stt, 7)
+        assert _halts(stt) == []
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_word_cooldown(tmp_path, monkeypatch):
+    stt = await _spot(tmp_path, monkeypatch)
+    try:
+        await _say(stt, 7)
+        await _say(stt, 7)                                 # "stop, stop" → one HALT
+        assert len(_halts(stt)) == 1
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_words_disabled(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch, cls=SpotStt)
+    stt.config.stop_words_enabled = False
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.on_start()
+    try:
+        assert stt._kws_task is None and stt._kws is None
+        await _say(stt, 7)
+        assert _halts(stt) == []
+    finally:
+        await stt.on_stop()
+
+
+@pytest.mark.asyncio
+async def test_spotter_build_failure_leaves_transcription_working(tmp_path, monkeypatch):
+    class BrokenSpot(FakeStt):
+        def _create_kws(self, phrases, sample_rate):
+            raise RuntimeError("no network")
+    stt = _stt(tmp_path, monkeypatch, cls=BrokenSpot)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.on_start()
+    try:
+        await stt._kws_build_task
+        assert stt._kws is None and "no network" in stt._kws_error
+        assert stt.bus.last("/stt/stt-1/state")["stop_words_ready"] is False
+        stt._enqueue_utterance("still works")
+        assert (await stt.m_listen(timeout_seconds=1))["text"] == "still works"
+    finally:
+        await stt.on_stop()
+
+
+# ─── stale utterances ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_listen_skips_stale_utterances(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()                                  # continuous: queue fills with nobody listening
+    stt._enqueue_utterance("turn switch one on")
+    stt._queue._queue[-1]["ts"] -= 60                    # said a minute ago
+    stt._enqueue_utterance("what voices do you have")
+    out = await stt.m_listen(timeout_seconds=1)
+    assert out["text"] == "what voices do you have"
+
+
+@pytest.mark.asyncio
+async def test_listen_times_out_when_only_stale_utterances(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()
+    stt._enqueue_utterance("turn switch one on")
+    stt._queue._queue[-1]["ts"] -= 60
+    out = await stt.m_listen(timeout_seconds=0.5)
+    assert out["timeout"] is True and out["text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_listen_age_limit_can_be_disabled(tmp_path, monkeypatch):
+    stt = _stt(tmp_path, monkeypatch)
+    stt.config.max_utterance_age_s = 0
+    await stt.m_select_input("topic", "/microphone/mic-1/audio")
+    await stt.m_start()
+    stt._enqueue_utterance("old but wanted")
+    stt._queue._queue[-1]["ts"] -= 600
+    assert (await stt.m_listen(timeout_seconds=1))["text"] == "old but wanted"

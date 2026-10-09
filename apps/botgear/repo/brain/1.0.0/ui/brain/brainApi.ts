@@ -1,5 +1,5 @@
-// Typed wrappers around the brain workspace file API (stone A of
-// docs/TODO_BRAIN_VIEWER.md).
+// Typed wrappers around the brain workspace file API (stone A; see
+// README.md's "Workspace file browser (UI)" section).
 //
 // The backend lives in src/botgear/api/brain_files_api.py. Endpoints:
 //   GET /v1/service-proxy/{proxy_id}/files          → tree

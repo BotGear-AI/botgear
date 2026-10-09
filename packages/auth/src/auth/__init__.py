@@ -2,7 +2,7 @@
 
 from .interface import AuthProvider
 from .factory import get_auth_provider
-from .auth_util import AuthDependencies, create_auth_dependencies, no_auth_required, no_role_required
+from .auth_util import AuthDependencies, create_auth_dependencies, no_auth_required, no_role_required, has_permission
 from .local_auth import LocalAuthProvider
 from .none_auth import NoneAuthProvider
 from .oauth_auth import OAuthAuthProvider
@@ -22,6 +22,7 @@ __all__ = [
     "create_auth_dependencies",
     "no_auth_required",
     "no_role_required",
+    "has_permission",
     "LocalAuthProvider",
     "NoneAuthProvider",
     "OAuthAuthProvider",

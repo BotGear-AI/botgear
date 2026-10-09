@@ -22,7 +22,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -61,6 +61,16 @@ class UIConfig(ServiceConfig):
     )
 
 
+class UIState(BaseModel):
+    """Retained on ``/ui/{id}/state`` — the full canvas snapshot, a
+    projection of ``UIConfig`` (see there for field meanings)."""
+    workspace_id: Optional[str]
+    node_positions: Dict[str, Dict[str, float]]
+    node_view_types: Dict[str, str]
+    edges: List[Dict[str, Any]]
+    viewport: Dict[str, float]
+
+
 class UIService(Service):
     """In-process service that holds canvas layout state.
 
@@ -73,6 +83,7 @@ class UIService(Service):
 
     type_name = "ui"
     config_class = UIConfig
+    state_schema = UIState
     publishes = ["state"]
     _control_task: Optional[asyncio.Task] = None
 
@@ -103,17 +114,14 @@ class UIService(Service):
         (a freshly-loaded browser tab, a remote peer) gets it
         immediately without a request round-trip."""
         cfg = self.config
-        self.publish(
-            "state",
-            {
-                "workspace_id": cfg.workspace_id,
-                "node_positions": cfg.node_positions,
-                "node_view_types": cfg.node_view_types,
-                "edges": cfg.edges,
-                "viewport": cfg.viewport,
-            },
-            retained=True,
+        state = UIState(
+            workspace_id=cfg.workspace_id,
+            node_positions=cfg.node_positions,
+            node_view_types=cfg.node_view_types,
+            edges=cfg.edges,
+            viewport=cfg.viewport,
         )
+        self.publish("state", state.model_dump(), retained=True)
 
     # ─── @service_method bespoke helpers (operator convenience) ──────
 

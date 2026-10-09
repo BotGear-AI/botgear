@@ -452,6 +452,15 @@ class Bus:
     def clear_retained(self, topic: str) -> None:
         self._retained.pop(topic, None)
 
+    def clear_retained_prefix(self, prefix: str, keep: Optional[set] = None) -> int:
+        """Drop every retained topic that starts with ``prefix`` (except those
+        in ``keep``). Returns how many were dropped. Used when a service name
+        goes away, so its stale ``meta`` / ``state`` don't outlive it."""
+        doomed = [t for t in list(self._retained) if t.startswith(prefix) and t not in (keep or ())]
+        for t in doomed:
+            self._retained.pop(t, None)
+        return len(doomed)
+
     # ─── subscribe ───────────────────────────────────────────────────────
 
     async def subscribe(
@@ -590,6 +599,10 @@ class Bus:
 
     def has_retained(self, topic: str) -> bool:
         return topic in self._retained
+
+    def retained_get(self, topic: str) -> Optional[BusMessage]:
+        """The retained message on an exact ``topic``, or None."""
+        return self._retained.get(topic)
 
     def subscribers(self, topic: str) -> List[Dict[str, Any]]:
         """Identity of every subscriber on ``topic``, including wildcard

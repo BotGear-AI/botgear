@@ -39,11 +39,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 
-from pydantic import Field
-from rlx_bus import ServiceConfig, SubprocessService, service_method
+from pydantic import BaseModel, Field
+from rlx_bus import HALT_TOPIC, ServiceConfig, SubprocessService, halt_event, service_method
 
 from .frames import (
     FORMAT,
+    AudioFrame,
     decode_frame,
     encode_frame,
     level_rms,
@@ -74,11 +75,138 @@ class AudioDeviceConfig(ServiceConfig):
         False, description="When True the device stays connected but audio flow is suspended.")
 
 
+# ── wire schemas: retained /state per capability ──────────────────────
+
+class AudioDeviceState(BaseModel):
+    """Fields every microphone + speaker carries on its retained ``/state``."""
+    connected: bool
+    muted: bool
+    device_id: Optional[str]
+    last_connected_source: Optional[str]
+    devices: List[Dict[str, Any]] = Field(description="Backend-specific device list; ids are opaque")
+    sample_rate: int
+    channels: int
+    frame_ms: int
+    format: str
+    level_rms: float = Field(description="Normalized RMS meter 0.0-1.0")
+    dropped: int
+    last_error: Optional[str]
+    source: str = Field(description="'local' host device vs 'browser'")
+    kind: str = Field(description="'microphone' | 'speaker'")
+
+
+class MicrophoneState(AudioDeviceState):
+    recording: bool
+    recording_path: Optional[str]
+    recording_suggested_path: Optional[str]
+    recorded_bytes: int
+
+
+class SpeakerState(AudioDeviceState):
+    input_kind: Optional[str] = Field(description="None (sink) | 'topic' | 'file' | 'url'")
+    input_ref: Optional[str]
+    volume: float
+    playing: bool
+    paused: bool
+    position_s: float
+    duration_s: float
+    playlist: List[Dict[str, Any]] = Field(description="[{kind: 'file'|'url', ref, name?}]")
+    playlist_index: int
+    repeat: str = Field(description="'off' | 'all' | 'one'")
+    shuffle: bool
+
+
+class SpeechState(BaseModel):
+    """Retained on ``/speech/{id}/state``."""
+    proxy_id: Optional[str] = Field(
+        None, description="This speech service's id — lets a wildcard /speech/+/state "
+                          "subscriber (e.g. an STT echo gate) tell services apart.")
+    kind: str
+    source: str
+    voice: Optional[str]
+    voices: List[Dict[str, Any]]
+    sample_rate: int
+    channels: int
+    frame_ms: int
+    format: str
+    volume: float
+    rate: float
+    muted: bool
+    speaking: bool
+    synthesizing: bool
+    current_text: Optional[str]
+    queue: List[str] = Field(description="Texts still queued")
+    cache_count: int
+    cache_bytes: int
+    level_rms: float
+    last_error: Optional[str]
+
+
+class SpokenPayload(BaseModel):
+    """Published on ``/speech/{id}/spoken`` when an utterance starts
+    streaming (after synthesis / cache hit)."""
+    text: str
+    voice: Optional[str]
+    cache_key: str
+    path: str = Field(description="Cached WAV path on the service host")
+    cached: bool
+    duration_s: float
+    sample_rate: int
+    channels: int
+    format: str
+
+
+class SttState(BaseModel):
+    """Retained on ``/stt/{id}/state``."""
+    kind: str
+    source: str
+    model: Optional[str]
+    models: List[Dict[str, Any]]
+    input_kind: Optional[str]
+    input_ref: Optional[str]
+    sample_rate: int
+    channels: int
+    muted: bool
+    listening: bool
+    continuous: bool
+    downloading: bool
+    ready: bool = Field(description="Recognizer loaded")
+    queued: int
+    level_rms: float
+    last_partial: str
+    last_final: str
+    last_error: Optional[str]
+    echo_suppressed: bool = Field(False, description="True while a speech service is talking (or within echo_holdoff_ms after) and mic audio is being dropped")
+    stop_words_ready: bool = Field(False, description="Stop-word spotter loaded and listening (always on, even while the robot talks)")
+    last_stop_word: Optional[str] = Field(None, description="The last stop word that triggered a HALT")
+    recording_transcript: bool = Field(description="True while finalized utterances are being appended to transcript_path")
+    transcript_path: Optional[str] = Field(description="Path currently being written to, or None")
+    transcript_suggested_path: Optional[str] = Field(description="Auto-generated path start_recording would use next")
+    transcript_lines: int = Field(description="Utterances written since the current transcript_path was opened")
+
+
+class TextPayload(BaseModel):
+    """Published on ``/stt/{id}/text`` — partial and final transcripts."""
+    text: str
+    final: bool
+    seq: int
+    ts: float
+
+
+class StopWordPayload(BaseModel):
+    """Published on ``/stt/{id}/stop_word`` when the stop-word spotter fires
+    (alongside the runtime-wide HALT it triggers)."""
+    phrase: str = Field(description="The configured stop phrase that was heard")
+    level: str = Field(description="HALT level it triggered: 'stop' or 'emergency'")
+    ts: float = Field(description="Unix time of the detection")
+
+
 class AudioDeviceServiceBase(SubprocessService):
     """Common control interface for an audio input/output device."""
 
     config_class: ClassVar = AudioDeviceConfig
     publishes: ClassVar[List[str]] = ["state"]
+    state_schema: ClassVar = AudioDeviceState
     source: ClassVar[str] = "local"        # "local" host capture/playback vs "browser"
     kind: ClassVar[str] = "audio"          # "microphone" | "speaker"
     # When True the device is opened automatically on service start and there
@@ -267,7 +395,7 @@ class AudioDeviceServiceBase(SubprocessService):
         }
 
     def _snapshot(self) -> Dict[str, Any]:
-        return self._base_snapshot()
+        return AudioDeviceState(**self._base_snapshot()).model_dump()
 
     async def _publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)
@@ -290,6 +418,8 @@ class MicrophoneServiceBase(AudioDeviceServiceBase):
     kind: ClassVar[str] = "microphone"
     config_class: ClassVar = MicrophoneConfig
     publishes: ClassVar[List[str]] = ["state", "audio"]
+    state_schema: ClassVar = MicrophoneState
+    topic_schemas: ClassVar[Dict[str, Any]] = {"audio": AudioFrame}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -403,14 +533,14 @@ class MicrophoneServiceBase(AudioDeviceServiceBase):
                 logger.exception("%s: closing recording failed", self.proxy_id)
 
     def _snapshot(self) -> Dict[str, Any]:
-        snap = self._base_snapshot()
-        snap.update({
-            "recording": self._recording,
-            "recording_path": self._recording_path,
-            "recording_suggested_path": self._suggested_path,
-            "recorded_bytes": self._recorded_bytes,
-        })
-        return snap
+        state = MicrophoneState(
+            **self._base_snapshot(),
+            recording=self._recording,
+            recording_path=self._recording_path,
+            recording_suggested_path=self._suggested_path,
+            recorded_bytes=self._recorded_bytes,
+        )
+        return state.model_dump()
 
 
 # ─── speaker ──────────────────────────────────────────────────────────
@@ -453,10 +583,18 @@ class SpeakerServiceBase(AudioDeviceServiceBase):
     config_class: ClassVar = SpeakerConfig
     publishes: ClassVar[List[str]] = ["state"]
     auto_connect: ClassVar[bool] = True   # output is always-on; no connect UI
+    state_schema: ClassVar = SpeakerState
+    subscribes_schemas: ClassVar[Dict[str, Any]] = {"audio": AudioFrame}
+
+    # After a HALT, frames that were already in flight from a speech service
+    # (published before it processed the same halt) are dropped for this
+    # long, so the robot doesn't utter one more syllable after "stop".
+    _HALT_DRAIN_S = 0.3
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
         self._subscribed_topics: set = set()
+        self._halt_drain_until: float = 0.0
         # Transport state (meaningful for finite file/url sources).
         self._playing: bool = False
         self._paused: bool = False
@@ -755,8 +893,15 @@ class SpeakerServiceBase(AudioDeviceServiceBase):
         if (self.config.input_kind or None) == "topic" and (self.config.input_ref or "").strip() == topic:
             await self._render_frame(frame)
 
+    async def on_halt(self, event: Dict[str, Any]) -> None:
+        """HALT: stop file/url playback and flush the device buffer now."""
+        self._halt_drain_until = time.monotonic() + self._HALT_DRAIN_S
+        await self.m_stop()
+
     async def _render_frame(self, frame: Any) -> None:
         if not self._connected or self.muted or not isinstance(frame, dict):
+            return
+        if time.monotonic() < self._halt_drain_until:
             return
         pcm = decode_frame(frame)
         if not pcm:
@@ -773,19 +918,21 @@ class SpeakerServiceBase(AudioDeviceServiceBase):
         raise NotImplementedError
 
     def _snapshot(self) -> Dict[str, Any]:
-        snap = self._base_snapshot()
-        snap["input_kind"] = self.config.input_kind
-        snap["input_ref"] = self.config.input_ref
-        snap["volume"] = self.config.volume
-        snap["playing"] = self._playing
-        snap["paused"] = self._paused
-        snap["position_s"] = round(self._position_s, 2)
-        snap["duration_s"] = round(self._duration_s, 2)
-        snap["playlist"] = self.config.playlist
-        snap["playlist_index"] = self.config.playlist_index
-        snap["repeat"] = self.config.repeat
-        snap["shuffle"] = self.config.shuffle
-        return snap
+        state = SpeakerState(
+            **self._base_snapshot(),
+            input_kind=self.config.input_kind,
+            input_ref=self.config.input_ref,
+            volume=self.config.volume,
+            playing=self._playing,
+            paused=self._paused,
+            position_s=round(self._position_s, 2),
+            duration_s=round(self._duration_s, 2),
+            playlist=self.config.playlist,
+            playlist_index=self.config.playlist_index,
+            repeat=self.config.repeat,
+            shuffle=self.config.shuffle,
+        )
+        return state.model_dump()
 
 
 # ─── speech (text-to-speech) ────────────────────────────────────────────
@@ -809,6 +956,64 @@ class SpeechConfig(ServiceConfig):
     volume: float = Field(1.0, ge=0.0, le=1.0, description="Output volume 0.0–1.0 applied to the streamed audio.")
     rate: float = Field(1.0, ge=0.5, le=2.0, description="Speaking rate multiplier (1.0 normal, >1 faster, <1 slower).")
     muted: bool = Field(False, description="When True the utterance still runs on its timeline but no audio frames are emitted.")
+
+
+def _echo_words(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9']+", (text or "").lower())
+
+
+def _resolve_done(item: Dict[str, Any], outcome: str) -> None:
+    """Settle a queued utterance's ``speak(wait=True)`` future (idempotent)."""
+    fut = item.get("done")
+    if fut is not None and not fut.done():
+        fut.set_result(outcome)
+
+
+_MD_FENCE_RE = re.compile(r"^\s*(```|~~~).*$", re.MULTILINE)
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
+_MD_QUOTE_RE = re.compile(r"^\s{0,3}>\s?", re.MULTILINE)
+_MD_RULE_RE = re.compile(r"^\s*([-*_]\s*){3,}$", re.MULTILINE)
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^\s*[-*+•]\s+", re.MULTILINE)
+_MD_STRONG_RE = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1")
+_MD_EM_RE = re.compile(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])")
+_MD_CODE_RE = re.compile(r"`+([^`]*)`+")
+
+
+def speakable_text(text: str) -> str:
+    """Turn an LLM-style markdown reply into plain sentences for TTS.
+
+    Strips emphasis, headings, bullets, quotes, rules, code ticks and link
+    targets (keeping the visible text), turns table pipes into commas, and
+    joins lines — ending each line with a period when it has no closing
+    punctuation so list items are read as separate phrases instead of one
+    run-on. Plain text passes through unchanged apart from whitespace."""
+    s = _MD_FENCE_RE.sub("", text)
+    s = _MD_IMAGE_RE.sub(r"\1", s)
+    s = _MD_LINK_RE.sub(r"\1", s)
+    s = _MD_TABLE_SEP_RE.sub("", s)
+    s = _MD_RULE_RE.sub("", s)
+    s = _MD_HEADING_RE.sub("", s)
+    s = _MD_QUOTE_RE.sub("", s)
+    s = _MD_BULLET_RE.sub("", s)
+    s = _MD_STRONG_RE.sub(r"\2", s)
+    s = _MD_EM_RE.sub(r"\1", s)
+    s = _MD_CODE_RE.sub(r"\1", s)
+    s = re.sub(r"\*+(?=\S)|(?<=\S)\*+", "", s)     # stray emphasis marks, not a spaced "2 * 3"
+    lines = []
+    for raw in s.splitlines():
+        line = re.sub(r"\s*\|\s*", ", ", raw.strip().strip("|").strip())
+        line = re.sub(r"\s+", " ", line)
+        if not line:
+            continue
+        if line[-1] not in ".!?:;,":
+            line += "."
+        lines.append(line)
+    if len(lines) == 1 and text.strip() and text.strip()[-1] not in ".!?:;,":
+        lines[0] = lines[0][:-1]        # a single plain line keeps its own ending
+    return " ".join(lines)
 
 
 class SpeechServiceBase(SubprocessService):
@@ -840,6 +1045,8 @@ class SpeechServiceBase(SubprocessService):
     kind: ClassVar[str] = "speech"
     config_class: ClassVar = SpeechConfig
     publishes: ClassVar[List[str]] = ["state", "audio", "spoken"]
+    state_schema: ClassVar = SpeechState
+    topic_schemas: ClassVar[Dict[str, Any]] = {"audio": AudioFrame, "spoken": SpokenPayload}
     source: ClassVar[str] = "local"
 
     _STATE_PERIOD_S = 0.15   # ~6 Hz UI position/meter while speaking
@@ -898,28 +1105,61 @@ class SpeechServiceBase(SubprocessService):
     # allowed_tools.yaml allows speak/listen on /speech/*/control) — so a
     # running speech service is a drop-in TTS tool for the brain.
     @service_method("speak", publishes=["audio", "spoken", "state"])
-    async def m_speak(self, text: str = "", voice: Optional[str] = None, interrupt: bool = False) -> Dict[str, Any]:
+    async def m_speak(
+        self,
+        text: str = "",
+        voice: Optional[str] = None,
+        interrupt: bool = False,
+        wait: bool = False,
+        wait_timeout_s: float = 25.0,
+    ) -> Dict[str, Any]:
         """Speak ``text``. Enqueues behind any in-progress utterance unless
         ``interrupt`` is True (then it stops the current speech + clears the
         queue first). ``voice`` overrides the default for this utterance.
-        Returns immediately (synthesis + playback run on the queue worker)."""
-        text = (text or "").strip()
+
+        Markdown (``**bold**``, list bullets, headings, links, code ticks) is
+        stripped first — it's a common LLM reply shape and would otherwise be
+        read aloud literally ("asterisk asterisk ...").
+
+        By default returns as soon as the utterance is queued (synthesis +
+        playback run on the queue worker). ``wait=True`` instead returns once
+        this utterance has finished streaming (or was interrupted/failed), at
+        most ``wait_timeout_s`` later — the turn-taking a conversation loop
+        needs so its next ``listen`` doesn't start while the reply is still
+        playing. The default timeout stays under the brain's 30 s tool-call
+        budget; on expiry the speech keeps going and ``finished`` is False."""
+        text = speakable_text(text or "")
         if not text:
             return self._snapshot()
         if interrupt:
             await self._interrupt()
+        done: "asyncio.Future[str]" = asyncio.get_running_loop().create_future()
         item = {
             "text": text,
             "voice": (voice or self.config.voice) or None,
             "rate": self.config.rate,
             "gen": self._gen,
+            "done": done,
         }
         self._pending.append(text)
         await self._queue.put(item)
         await self._publish_state()
         key = self._cache_key(item["voice"], item["rate"], text)
-        return {"spoken": text, "queued": len(self._pending), "cache_key": key,
-                "cached": (self.cache_dir / f"{key}.wav").exists()}
+        out: Dict[str, Any] = {"spoken": text, "queued": len(self._pending), "cache_key": key,
+                               "cached": (self.cache_dir / f"{key}.wav").exists()}
+        if wait:
+            try:
+                outcome = await asyncio.wait_for(asyncio.shield(done), timeout=max(0.1, float(wait_timeout_s)))
+            except asyncio.TimeoutError:
+                outcome = "timeout"
+            out["finished"] = outcome == "finished"
+            out["outcome"] = outcome
+        return out
+
+    async def on_halt(self, event: Dict[str, Any]) -> None:
+        """HALT: same as ``stop`` — abort the current utterance (within one
+        frame) and drop everything queued."""
+        await self.m_stop()
 
     @service_method("stop", publishes=["state"])
     async def m_stop(self) -> Dict[str, Any]:
@@ -998,7 +1238,7 @@ class SpeechServiceBase(SubprocessService):
         self._pending.clear()
         while not self._queue.empty():
             try:
-                self._queue.get_nowait()
+                _resolve_done(self._queue.get_nowait(), "interrupted")
             except asyncio.QueueEmpty:
                 break
         self._speaking = False
@@ -1010,14 +1250,18 @@ class SpeechServiceBase(SubprocessService):
         while True:
             item = await self._queue.get()
             if item.get("gen") != self._gen:
+                _resolve_done(item, "interrupted")
                 continue   # a stop() landed after this was enqueued
             if self._pending and self._pending[0] == item["text"]:
                 self._pending.pop(0)
             try:
                 await self._speak_item(item)
+                _resolve_done(item, "finished" if item.get("gen") == self._gen else "interrupted")
             except asyncio.CancelledError:
+                _resolve_done(item, "interrupted")
                 raise
             except Exception as exc:  # noqa: BLE001
+                _resolve_done(item, "failed")
                 logger.exception("%s: utterance failed", self.proxy_id)
                 self._last_error = str(exc)
                 self._speaking = False
@@ -1043,11 +1287,12 @@ class SpeechServiceBase(SubprocessService):
             return
         pcm, srate, ch = await asyncio.to_thread(read_wav_pcm, str(path))
         duration_s = len(pcm) / max(1, srate * ch * 2)
-        await self.publish("spoken", {
-            "text": text, "voice": voice, "cache_key": key, "path": str(path),
-            "cached": was_cached, "duration_s": round(duration_s, 3),
-            "sample_rate": srate, "channels": ch, "format": FORMAT,
-        })
+        spoken = SpokenPayload(
+            text=text, voice=voice, cache_key=key, path=str(path),
+            cached=was_cached, duration_s=round(duration_s, 3),
+            sample_rate=srate, channels=ch, format=FORMAT,
+        )
+        await self.publish("spoken", spoken.model_dump())
         await self._stream_pcm(pcm, srate, ch, gen)
 
     async def _stream_pcm(self, pcm: bytes, srate: int, ch: int, gen: int) -> None:
@@ -1155,27 +1400,29 @@ class SpeechServiceBase(SubprocessService):
         }
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "kind": type(self).kind,
-            "source": type(self).source,
-            "voice": self.config.voice,
-            "voices": self._voices,
-            "sample_rate": self.config.sample_rate,
-            "channels": self.config.channels,
-            "frame_ms": self.config.frame_ms,
-            "format": FORMAT,
-            "volume": self.config.volume,
-            "rate": self.config.rate,
-            "muted": self.muted,
-            "speaking": self._speaking,
-            "synthesizing": self._synthesizing,
-            "current_text": self._current_text,
-            "queue": list(self._pending),
-            "cache_count": self._cache_count,
-            "cache_bytes": self._cache_bytes,
-            "level_rms": round(self._level, 4),
-            "last_error": self._last_error,
-        }
+        state = SpeechState(
+            proxy_id=self.proxy_id,
+            kind=type(self).kind,
+            source=type(self).source,
+            voice=self.config.voice,
+            voices=self._voices,
+            sample_rate=self.config.sample_rate,
+            channels=self.config.channels,
+            frame_ms=self.config.frame_ms,
+            format=FORMAT,
+            volume=self.config.volume,
+            rate=self.config.rate,
+            muted=self.muted,
+            speaking=self._speaking,
+            synthesizing=self._synthesizing,
+            current_text=self._current_text,
+            queue=list(self._pending),
+            cache_count=self._cache_count,
+            cache_bytes=self._cache_bytes,
+            level_rms=round(self._level, 4),
+            last_error=self._last_error,
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)
@@ -1204,6 +1451,25 @@ class SttConfig(ServiceConfig):
     continuous: bool = Field(False, description="When True, start transcribing on service start (publish partials/finals without a listen() pending).")
     endpoint_silence_ms: int = Field(
         800, ge=100, le=5000, description="Trailing silence (ms) that finalizes an utterance / endpoint.")
+    max_utterance_age_s: float = Field(
+        10.0, ge=0, le=3600, description="listen() skips utterances finalized longer ago than this — continuous mode queues speech even while nobody is listening, and a stale command must not be acted on later. 0 = no limit.")
+    suppress_while_speaking: bool = Field(
+        True, description="Echo gate: drop mic audio while any speech (TTS) service is talking, so the robot never transcribes its own voice.")
+    echo_holdoff_ms: int = Field(
+        700, ge=0, le=5000, description="Keep the echo gate closed this long after speech ends (speaker buffering + room reverb).")
+    echo_topics: List[str] = Field(
+        default_factory=lambda: ["/speech/+/state"],
+        description="Speech state topics the echo gate watches (speaking / synthesizing / queued).")
+    stop_words_enabled: bool = Field(
+        True, description="Run the stop-word spotter: hearing a stop word broadcasts a runtime-wide HALT. Listens all the time — even while the robot talks or transcription is idle.")
+    stop_words: List[str] = Field(
+        default_factory=lambda: ["stop", "be quiet", "stop talking"],
+        description="Phrases that HALT (level 'stop': silence speech + playback, cancel brain runs).")
+    emergency_words: List[str] = Field(
+        default_factory=lambda: ["emergency stop"],
+        description="Phrases that HALT at level 'emergency' (also stop motion).")
+    stop_words_threshold: float = Field(
+        0.25, ge=0.01, le=0.99, description="Spotter trigger threshold — lower is more sensitive (more false stops), higher is stricter.")
 
 
 class SttServiceBase(SubprocessService):
@@ -1240,7 +1506,9 @@ class SttServiceBase(SubprocessService):
     type_name: ClassVar[str] = "stt"
     kind: ClassVar[str] = "stt"
     config_class: ClassVar = SttConfig
-    publishes: ClassVar[List[str]] = ["state", "text"]
+    publishes: ClassVar[List[str]] = ["state", "text", "stop_word"]
+    state_schema: ClassVar = SttState
+    topic_schemas: ClassVar[Dict[str, Any]] = {"text": TextPayload, "stop_word": StopWordPayload}
     source: ClassVar[str] = "local"
     DEFAULT_MODEL: ClassVar[Optional[str]] = None
     _FRAME_QUEUE_MAX = 100       # ~2 s @ 20 ms frames; drop oldest on overflow
@@ -1265,24 +1533,64 @@ class SttServiceBase(SubprocessService):
         self._last_partial: str = ""
         self._last_final: str = ""
         self._last_error: Optional[str] = None
+        # ─── transcript-to-file (save-to-disk, mirrors Microphone's WAV
+        # recording) ─────────────────────────────────────────────────
+        self._transcript_fh: Optional[Any] = None
+        self._recording_transcript: bool = False
+        self._transcript_path: Optional[str] = None
+        self._transcript_suggested_path: Optional[str] = None
+        self._transcript_lines: int = 0
+        # ─── echo gate (see _on_speech_state) ─────────────────────────
+        self._speech_busy: Dict[str, float] = {}   # speech id → monotonic time of last busy state
+        self._speech_text: Dict[str, tuple] = {}   # speech id → (monotonic ts, text it was saying)
+        # ─── stop-word spotter (see _kws_loop) ─────────────────────────
+        self._kws: Optional[Any] = None
+        self._kws_exec: Optional[ThreadPoolExecutor] = None
+        self._kws_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=self._FRAME_QUEUE_MAX)
+        self._kws_task: Optional[asyncio.Task] = None
+        self._kws_build_task: Optional[asyncio.Task] = None
+        self._kws_labels: Dict[str, tuple] = {}    # spotter label → (halt level, phrase)
+        self._kws_last_fire: float = 0.0
+        self._kws_error: Optional[str] = None
+        self._last_stop_word: Optional[str] = None
+        self._halt_quiet_until: float = 0.0        # drop results finalizing just after a HALT
+        self._echo_until: float = 0.0              # gate stays closed until this monotonic time
+        self._echo_subscribed: set = set()
 
     # ─── lifecycle ────────────────────────────────────────────────────
     async def on_start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"stt-{self.proxy_id}")
         self.models_dir.mkdir(parents=True, exist_ok=True)
+        self._transcript_suggested_path = self._fresh_transcript_path()
         try:
             self._models = await asyncio.to_thread(self._list_models)
         except Exception as exc:  # noqa: BLE001
             logger.exception("%s: model enumeration failed", self.proxy_id)
             self._last_error = str(exc)
         await self._ensure_topic_sub()
+        await self._ensure_echo_subs()
         self._reco_task = asyncio.create_task(self._recognizer_loop())
+        if self.config.stop_words_enabled:
+            self._kws_exec = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"kws-{self.proxy_id}")
+            self._kws_task = asyncio.create_task(self._kws_loop())
+            # Built in the background — a first-run model download must not
+            # hold up transcription.
+            self._kws_build_task = asyncio.create_task(self._ensure_kws())
         await self._publish_state()
         if self.config.continuous:
             await self._activate()
 
     async def on_stop(self) -> None:
+        self._close_transcript()
+        for task in (self._kws_build_task, self._kws_task):
+            if task is not None:
+                task.cancel()
+        self._kws_task = self._kws_build_task = None
+        kexec, self._kws_exec = self._kws_exec, None
+        if kexec is not None:
+            kexec.shutdown(wait=False, cancel_futures=True)
+        self._kws = None
         self._gen += 1
         self._active = False
         # Cancel + AWAIT the loop so it isn't mid-await when we tear down.
@@ -1344,6 +1652,18 @@ class SttServiceBase(SubprocessService):
     def _free_recognizer(self, handle: Any) -> None:
         """Release native recognizer resources on shutdown. Default no-op."""
 
+    def _create_kws(self, phrases: Dict[str, str], sample_rate: int) -> Optional[Any]:
+        """Optional: build a keyword spotter for ``phrases`` (label → phrase,
+        labels are ``[a-z]+_<n>``) and return its handle, or None if this
+        engine has no spotter (stop words then just aren't available). Runs
+        in the spotter's own thread; may download a model."""
+        return None
+
+    def _kws_feed(self, handle: Any, pcm: bytes) -> Optional[str]:
+        """Feed one s16le frame to the spotter; return the label of a
+        keyword detected in it, else None. Runs in the spotter's thread."""
+        return None
+
     # ─── the transcription capability ─────────────────────────────────
     @service_method("listen", publishes=["state"])
     async def m_listen(self, timeout_seconds: int = 8, bearing: Optional[float] = None) -> Dict[str, Any]:
@@ -1375,10 +1695,27 @@ class SttServiceBase(SubprocessService):
             return {"text": "", "bearing": None, "timeout": False,
                     "error": self._last_error or "speech-to-text unavailable"}
         item: Optional[Dict[str, Any]] = None
+        loop = asyncio.get_running_loop()
+        ends = loop.time() + timeout
         try:
-            item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            item = None
+            while True:
+                remaining = ends - loop.time()
+                if remaining <= 0:
+                    item = None
+                    break
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    item = None
+                    break
+                max_age = self.config.max_utterance_age_s
+                age = time.time() - float(item.get("ts") or 0)
+                if max_age and age > max_age:
+                    logger.info("%s: listen skipped a stale utterance (%.0fs old): %r",
+                                self.proxy_id, age, item.get("text"))
+                    item = None
+                    continue
+                break
         finally:
             if owns:
                 self._deactivate()
@@ -1392,14 +1729,23 @@ class SttServiceBase(SubprocessService):
     async def m_start(self) -> Dict[str, Any]:
         """Begin CONTINUOUS transcription — partials/finals publish on
         ``/stt/{id}/text`` and stay active (unlike one-shot ``listen``) until
-        ``stop``. Use for live captions or always-on listening."""
+        ``stop``. Persists continuous=True (mirrors AudioDeviceServiceBase's
+        connect()/on_start() pattern for the microphone itself) so a
+        subprocess restart — backend restart, a USB hotplug cascade, crash
+        recovery — resumes listening on its own instead of silently sitting
+        idle with no visible error (on_start already checks
+        ``self.config.continuous``; this was the missing half)."""
+        await self.update_config({"continuous": True})
         await self._activate()
         await self._publish_state()
         return self._snapshot()
 
     @service_method("stop", publishes=["state"])
     async def m_stop(self) -> Dict[str, Any]:
-        """Stop transcribing and drop any buffered audio + utterances."""
+        """Stop transcribing and drop any buffered audio + utterances.
+        Also clears the persisted continuous flag so a restart doesn't
+        resume listening the operator explicitly stopped."""
+        await self.update_config({"continuous": False})
         self._deactivate()
         await self._reset_engine()
         await self._publish_state()
@@ -1499,6 +1845,76 @@ class SttServiceBase(SubprocessService):
         await self._publish_state()
         return self._snapshot()
 
+    # ─── transcript-to-file (save-to-disk) ──────────────────────────────
+    @service_method("start_recording", publishes=["state"])
+    async def m_start_recording(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """Append each finalized (non-empty) utterance to a text file, one
+        per line with a timestamp. ``path`` overrides the auto name (a bare
+        filename lands in the transcripts dir; absolute as-is). Mirrors
+        MicrophoneServiceBase's WAV start_recording/stop_recording."""
+        if self._recording_transcript:
+            self._close_transcript()
+        target = self._resolve_transcript_path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._transcript_fh = open(target, "a", encoding="utf-8")
+            self._recording_transcript = True
+            self._transcript_path = str(target)
+            self._transcript_lines = 0
+            self._last_error = None
+            logger.info("%s: transcript recording to %s", self.proxy_id, target)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("%s: could not open transcript file", self.proxy_id)
+            self._last_error = f"transcript recording failed: {exc}"
+        await self._publish_state()
+        return self._snapshot()
+
+    @service_method("stop_recording", publishes=["state"])
+    async def m_stop_recording(self) -> Dict[str, Any]:
+        """Close the transcript file (transcription keeps running)."""
+        path, lines = self._transcript_path, self._transcript_lines
+        self._close_transcript()
+        self._transcript_suggested_path = self._fresh_transcript_path()
+        await self._publish_state()
+        return {"path": path, "lines": lines}
+
+    def _transcripts_dir(self) -> Path:
+        base = os.environ.get("BOTGEAR_DATA_DIR_ABS") or os.path.join(os.getcwd(), "data")
+        return Path(base) / "transcripts"
+
+    def _fresh_transcript_path(self) -> str:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return str(self._transcripts_dir() / f"{self.proxy_id}-{stamp}.txt")
+
+    def _resolve_transcript_path(self, path: Optional[str]) -> Path:
+        chosen = (path or "").strip() or self._fresh_transcript_path()
+        p = Path(chosen)
+        if not p.is_absolute() and os.sep not in chosen and "/" not in chosen:
+            p = self._transcripts_dir() / _SAFE_NAME_RE.sub("_", chosen)
+        if p.suffix.lower() != ".txt":
+            p = p.with_suffix(".txt")
+        return p
+
+    def _write_transcript_line(self, text: str) -> None:
+        fh = self._transcript_fh
+        if fh is None:
+            return
+        try:
+            fh.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {text}\n")
+            fh.flush()
+            self._transcript_lines += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("%s: transcript write failed", self.proxy_id)
+
+    def _close_transcript(self) -> None:
+        fh, self._transcript_fh = self._transcript_fh, None
+        self._recording_transcript = False
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("%s: closing transcript failed", self.proxy_id)
+
     # ─── source subscription (mirrors SpeakerServiceBase) ──────────────
     async def _ensure_topic_sub(self) -> None:
         """Subscribe to the configured source topic (once per distinct topic).
@@ -1515,10 +1931,24 @@ class SttServiceBase(SubprocessService):
     async def _on_topic_frame(self, frame: Any, topic: str) -> None:
         if (self.config.input_kind or None) != "topic" or (self.config.input_ref or "").strip() != topic:
             return
-        if not self._active or self.muted or not isinstance(frame, dict):
+        if not isinstance(frame, dict):
+            return
+        # The stop-word spotter hears EVERYTHING — idle, muted, or while the
+        # robot talks (the echo gate only protects transcription); that's
+        # what lets "stop" interrupt a runaway robot.
+        spot = self._kws is not None
+        transcribe = self._active and not self.muted
+        if transcribe and self._echo_gated():
+            self._level = 0.0
+            transcribe = False
+        if not (spot or transcribe):
             return
         pcm = decode_frame(frame)
         if not pcm:
+            return
+        if spot:
+            self._put_latest(self._kws_q, pcm)
+        if not transcribe:
             return
         self._level = level_rms(pcm)
         try:
@@ -1593,7 +2023,7 @@ class SttServiceBase(SubprocessService):
     async def _recognizer_loop(self) -> None:
         while True:
             pcm = await self._frame_q.get()
-            if not self._active or self.muted or self._recognizer is None:
+            if not self._active or self.muted or self._recognizer is None or self._echo_gated():
                 continue
             gen = self._gen
             handle = self._recognizer
@@ -1602,9 +2032,23 @@ class SttServiceBase(SubprocessService):
                     self._exec, self._feed, handle, pcm)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 logger.exception("%s: recognizer feed failed", self.proxy_id)
+                # Every ~20ms frame would otherwise fail identically forever
+                # with NO visible signal — ready/listening stay true and the
+                # level meter keeps moving (frames ARE arriving) while
+                # nothing is ever transcribed. That's exactly what a missing
+                # runtime dependency did here undetected. Surface it once
+                # (not on every frame) so the UI shows something's wrong
+                # instead of silently doing nothing.
+                err = f"{type(exc).__name__}: {exc}"
+                if self._last_error != err:
+                    self._last_error = err
+                    await self._publish_state()
                 continue
+            if self._last_error is not None:
+                self._last_error = None
+                await self._publish_state()
             # A stop / mute / source-switch / model-change landed during the
             # feed → the result is stale; drop it rather than publish/enqueue.
             if gen != self._gen or not self._active:
@@ -1617,6 +2061,10 @@ class SttServiceBase(SubprocessService):
         unit-testable without running the executor."""
         if not res:
             return
+        if self._echo_gated():
+            return      # a result that raced the gate closing is (part) echo
+        if time.monotonic() < self._halt_quiet_until:
+            return      # the tail of the stop word that triggered a HALT
         text = (res.get("text") or "").strip()
         if res.get("final"):
             self._last_partial = ""
@@ -1627,6 +2075,7 @@ class SttServiceBase(SubprocessService):
             if text:
                 self._last_final = text
                 self._enqueue_utterance(text)
+                self._write_transcript_line(text)
         elif text and text != self._last_partial:
             self._last_partial = text
             await self._publish_text(text, False)
@@ -1644,7 +2093,197 @@ class SttServiceBase(SubprocessService):
 
     async def _publish_text(self, text: str, final: bool) -> None:
         self._seq += 1
-        await self.publish("text", {"text": text, "final": final, "seq": self._seq, "ts": time.time()})
+        await self.publish("text", TextPayload(text=text, final=final, seq=self._seq, ts=time.time()).model_dump())
+
+    _HALT_QUIET_S = 1.5
+
+    async def on_halt(self, event: Dict[str, Any]) -> None:
+        """HALT: abandon the in-progress decode and drop every buffered frame
+        + finalized utterance, so nothing heard before the stop (including
+        the stop word itself) is handed to the next ``listen``. Stays
+        running — continuous mode keeps transcribing."""
+        # The stop word itself is still being decoded when the HALT lands and
+        # would finalize ~endpoint_silence_ms later as an utterance.
+        self._halt_quiet_until = time.monotonic() + self._HALT_QUIET_S
+        self._gen += 1
+        self._drain(self._frame_q)
+        self._drain(self._queue)
+        if self._last_partial:
+            self._last_partial = ""
+            await self._publish_text("", True)
+        await self._reset_engine()
+        await self._publish_state()
+
+    # ─── stop-word spotter ──────────────────────────────────────────────
+    # A tiny always-on keyword spotter runs beside transcription on its own
+    # thread + queue. Hearing a stop word publishes a runtime-wide HALT
+    # (rlx_bus.halt) straight onto the bus — no brain, no LLM, no endpoint
+    # wait: ~0.3-0.5 s from the end of the word. While the robot is talking
+    # the spotter still listens (that's the point), but a stop word the
+    # robot ITSELF is saying right now ("I'll stop the motor") is vetoed.
+
+    _KWS_COOLDOWN_S = 2.0
+
+    @staticmethod
+    def _put_latest(q: "asyncio.Queue", item: Any) -> None:
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()
+                q.put_nowait(item)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
+
+    def _kws_phrases(self) -> Dict[str, str]:
+        phrases: Dict[str, str] = {}
+        self._kws_labels = {}
+        for level, words in (("stop", self.config.stop_words), ("emergency", self.config.emergency_words)):
+            for i, phrase in enumerate(w.strip() for w in (words or []) if w and w.strip()):
+                label = f"{level}_{i}"
+                phrases[label] = phrase
+                self._kws_labels[label] = (level, phrase)
+        return phrases
+
+    async def _ensure_kws(self) -> None:
+        phrases = self._kws_phrases()
+        if not phrases or self._kws_exec is None:
+            return
+        try:
+            self._kws = await asyncio.get_running_loop().run_in_executor(
+                self._kws_exec, self._create_kws, phrases, self.config.sample_rate)
+            self._kws_error = None
+            if self._kws is not None:
+                logger.info("%s: stop-word spotter ready (%s)", self.proxy_id, ", ".join(phrases.values()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("%s: stop-word spotter failed to build", self.proxy_id)
+            self._kws_error = f"stop words unavailable: {exc}"
+            self._last_error = self._last_error or self._kws_error
+        await self._publish_state()
+
+    async def _kws_loop(self) -> None:
+        while True:
+            pcm = await self._kws_q.get()
+            handle = self._kws
+            if handle is None or self._kws_exec is None:
+                continue
+            try:
+                label = await asyncio.get_running_loop().run_in_executor(
+                    self._kws_exec, self._kws_feed, handle, pcm)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                err = f"stop-word spotter: {type(exc).__name__}: {exc}"
+                if self._kws_error != err:
+                    logger.exception("%s: %s", self.proxy_id, err)
+                    self._kws_error = err
+                continue
+            if label:
+                await self._on_stop_word(label)
+
+    def _robot_is_saying(self, phrase: str) -> bool:
+        """Is a speech service saying ``phrase`` right now (or just did)?"""
+        words = _echo_words(phrase)
+        if not words:
+            return False
+        horizon = self.config.echo_holdoff_ms / 1000.0 + 2.0
+        now = time.monotonic()
+        for ts, text in self._speech_text.values():
+            if now - ts > horizon:
+                continue
+            said = _echo_words(text)
+            n = len(words)
+            if any(said[i:i + n] == words for i in range(len(said) - n + 1)):
+                return True
+        return False
+
+    async def _on_stop_word(self, label: str) -> None:
+        level, phrase = self._kws_labels.get(label, ("stop", label))
+        now = time.monotonic()
+        if now - self._kws_last_fire < self._KWS_COOLDOWN_S:
+            return
+        if self._robot_is_saying(phrase):
+            logger.info("%s: ignored stop word %r — the robot is saying it", self.proxy_id, phrase)
+            return
+        self._kws_last_fire = now
+        self._last_stop_word = phrase
+        logger.warning("%s: heard stop word %r → HALT (%s)", self.proxy_id, phrase, level)
+        try:
+            await self.bus.publish(HALT_TOPIC, halt_event(level, f"voice:{self.proxy_id}", f"heard '{phrase}'"))
+        except Exception:  # noqa: BLE001
+            logger.exception("%s: HALT publish failed", self.proxy_id)
+        await self.publish("stop_word", StopWordPayload(phrase=phrase, level=level, ts=time.time()).model_dump())
+        await self._publish_state()
+
+    # ─── echo gate ─────────────────────────────────────────────────────
+    # Without this the robot hears itself: a speaker next to the mic plays
+    # the speech service's reply, the recognizer transcribes it, and a
+    # conversation loop answers its own words forever (seen with the brain's
+    # general_assistant). There's no acoustic echo cancellation in the audio
+    # path, so the STT stops listening while any speech service is busy —
+    # speaking, synthesizing, or holding queued text — plus a hold-off for
+    # speaker buffering + room reverb. Works for one-shot listen() AND
+    # continuous mode, and for every consumer of /stt/{id}/text (live
+    # captions, the brain's exit-phrase watcher), because the echo is never
+    # transcribed in the first place. The cost: the operator can't barge in
+    # over the robot — the same as true half-duplex.
+
+    # A busy report older than this is ignored, so a speech service that dies
+    # mid-utterance (and never publishes idle) can't leave the STT deaf.
+    _ECHO_STALE_S = 30.0
+
+    async def _ensure_echo_subs(self) -> None:
+        for topic in self.config.echo_topics or []:
+            topic = (topic or "").strip()
+            if not topic or topic in self._echo_subscribed:
+                continue
+            self._echo_subscribed.add(topic)
+            await self.bus.subscribe(self.resolve_topic(topic), self._on_speech_state)
+
+    async def _on_speech_state(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        sid = str(payload.get("proxy_id") or "?")
+        busy = bool(payload.get("speaking") or payload.get("synthesizing") or payload.get("queue"))
+        current = payload.get("current_text")
+        if isinstance(current, str) and current.strip():
+            self._speech_text[sid] = (time.monotonic(), current)
+        was_gated = self._echo_gated()
+        was_busy = sid in self._speech_busy
+        now = time.monotonic()
+        if busy:
+            self._speech_busy[sid] = now
+        else:
+            self._speech_busy.pop(sid, None)
+            if was_busy:
+                self._echo_until = max(self._echo_until, now + self.config.echo_holdoff_ms / 1000.0)
+        gated = self._echo_gated()
+        if gated and not was_gated:
+            await self._begin_echo_gate()
+        if gated != was_gated:
+            await self._publish_state()
+
+    def _echo_gated(self) -> bool:
+        if not self.config.suppress_while_speaking:
+            return False
+        now = time.monotonic()
+        if any(now - seen < self._ECHO_STALE_S for seen in self._speech_busy.values()):
+            return True
+        return now < self._echo_until
+
+    async def _begin_echo_gate(self) -> None:
+        """Speech just started: abandon any in-progress decode (it may already
+        hold the first syllables of the echo) and buffered audio. Utterances
+        finalized BEFORE speech began stay queued — they're the operator's."""
+        self._gen += 1
+        self._drain(self._frame_q)
+        self._level = 0.0
+        if self._last_partial:
+            self._last_partial = ""
+            await self._publish_text("", True)    # clear a dangling live caption
+        await self._reset_engine()
 
     # ─── helpers ───────────────────────────────────────────────────────
     def _resolve_model(self) -> Optional[str]:
@@ -1679,26 +2318,34 @@ class SttServiceBase(SubprocessService):
         return {"text": self.resolve_topic(self.topic("text"))}
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "kind": type(self).kind,
-            "source": type(self).source,
-            "model": self._resolve_model(),
-            "models": self._models,
-            "input_kind": self.config.input_kind,
-            "input_ref": self.config.input_ref,
-            "sample_rate": self.config.sample_rate,
-            "channels": self.config.channels,
-            "muted": self.muted,
-            "listening": self._active,
-            "continuous": self.config.continuous,
-            "downloading": self._downloading,
-            "ready": self._recognizer is not None,
-            "queued": self._queue.qsize(),
-            "level_rms": round(self._level, 4),
-            "last_partial": self._last_partial,
-            "last_final": self._last_final,
-            "last_error": self._last_error,
-        }
+        state = SttState(
+            kind=type(self).kind,
+            source=type(self).source,
+            model=self._resolve_model(),
+            models=self._models,
+            input_kind=self.config.input_kind,
+            input_ref=self.config.input_ref,
+            sample_rate=self.config.sample_rate,
+            channels=self.config.channels,
+            muted=self.muted,
+            listening=self._active,
+            continuous=self.config.continuous,
+            downloading=self._downloading,
+            ready=self._recognizer is not None,
+            queued=self._queue.qsize(),
+            level_rms=round(self._level, 4),
+            last_partial=self._last_partial,
+            last_final=self._last_final,
+            last_error=self._last_error,
+            echo_suppressed=self._echo_gated(),
+            stop_words_ready=self._kws is not None,
+            last_stop_word=self._last_stop_word,
+            recording_transcript=self._recording_transcript,
+            transcript_path=self._transcript_path,
+            transcript_suggested_path=self._transcript_suggested_path,
+            transcript_lines=self._transcript_lines,
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

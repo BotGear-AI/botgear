@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
-import { useApiFetch } from '../contexts/ActiveRuntimeContext'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useApiFetch, useWsClient } from '../contexts/ActiveRuntimeContext'
+import type { InboundFrame } from '../runtime/wsClient'
 import type { ServiceProxy } from '../models/ServiceProxy'
 
 // Global cross-reference for every topic on the bus right now.
@@ -58,6 +59,41 @@ export default function Topology() {
   // the user switches runtimes via the chip bar (Phase 5) all data
   // re-fetches against the new target.
   const apiFetch = useApiFetch()
+  // Deliberately the per-runtime hook, NOT the '../runtime/wsClient'
+  // singleton the Traffic page still uses — that singleton is always
+  // same-origin, so a Traffic tab open on /r/<other-runtime>/traffic
+  // silently shows traffic for the WRONG backend. Topic inspection
+  // below needs to watch whichever runtime this page is actually
+  // scoped to, suffix and all (an inspected topic can itself be a
+  // federated ``@<peer-id>`` address).
+  const wsClient = useWsClient()
+
+  // ─── topic inspector: live messages for one selected topic ─────────
+  const [inspecting, setInspecting] = useState<string | null>(null)
+  const [messages, setMessages] = useState<{ ts: number; payload: unknown }[]>([])
+  const inspectListRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!inspecting) return
+    setMessages([])
+    const off = wsClient.subscribe(inspecting, (f: InboundFrame) => {
+      if (f.method !== 'message') return
+      setMessages((prev) => {
+        const next = prev.concat([{ ts: Date.now(), payload: f.payload }])
+        return next.length > 200 ? next.slice(-200) : next
+      })
+    })
+    return off
+  }, [inspecting, wsClient])
+
+  useEffect(() => {
+    if (!inspectListRef.current) return
+    inspectListRef.current.scrollTop = inspectListRef.current.scrollHeight
+  }, [messages])
+
+  const toggleInspect = (topic: string) => {
+    setInspecting((cur) => (cur === topic ? null : topic))
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -232,9 +268,25 @@ export default function Topology() {
               // pill in the publishers column so a glance at the table
               // tells you "this row crosses the wire".
               const peerId = parsePeerSuffix(r.topic)
+              const isInspecting = inspecting === r.topic
               return (
-              <tr key={r.topic} className="border-t border-slate-800 align-top hover:bg-slate-800/30">
+              <tr
+                key={r.topic}
+                className={`border-t border-slate-800 align-top hover:bg-slate-800/30 ${isInspecting ? 'bg-sky-950/40' : ''}`}
+              >
                 <td className="px-3 py-2 font-mono text-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => toggleInspect(r.topic)}
+                    title={isInspecting ? 'Stop watching this topic' : 'Watch live messages on this topic'}
+                    className={`mr-1.5 rounded px-1 text-[10px] ${
+                      isInspecting
+                        ? 'bg-sky-600 text-white'
+                        : 'border border-slate-700 text-slate-500 hover:border-sky-500 hover:text-sky-300'
+                    }`}
+                  >
+                    {isInspecting ? '● watching' : '👁'}
+                  </button>
                   {peerId ? (
                     <>
                       <span>{r.topic.slice(0, r.topic.lastIndexOf('@'))}</span>
@@ -308,6 +360,49 @@ export default function Topology() {
           </tbody>
         </table>
       </div>
+
+      {inspecting && (
+        <div className="mt-2 flex h-64 flex-col rounded-lg border border-sky-800 bg-slate-950">
+          <div className="flex items-center gap-2 border-b border-slate-800 px-3 py-1.5 text-xs">
+            <span className="text-slate-500">watching</span>
+            <span className="font-mono text-sky-300">{inspecting}</span>
+            <span className="text-slate-600">{messages.length} message{messages.length === 1 ? '' : 's'}</span>
+            <button
+              type="button"
+              onClick={() => setMessages([])}
+              className="ml-auto rounded border border-slate-700 px-2 py-0.5 text-slate-300 hover:border-slate-500"
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              onClick={() => setInspecting(null)}
+              className="rounded border border-slate-700 px-2 py-0.5 text-slate-300 hover:border-rose-500 hover:text-rose-300"
+            >
+              Stop
+            </button>
+          </div>
+          <div ref={inspectListRef} className="flex-1 overflow-auto px-3 py-1 font-mono text-[11px]">
+            {messages.length === 0 ? (
+              <div className="py-3 text-slate-500">
+                No messages yet — this topic is non-retained, or nothing has published since you
+                started watching.
+              </div>
+            ) : (
+              messages.map((m, i) => {
+                const time = new Date(m.ts)
+                const hms = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}:${String(time.getSeconds()).padStart(2, '0')}.${String(time.getMilliseconds()).padStart(3, '0')}`
+                return (
+                  <div key={i} className="flex gap-2 border-b border-slate-900 py-0.5">
+                    <span className="shrink-0 text-slate-600">{hms}</span>
+                    <span className="truncate text-slate-300">{JSON.stringify(m.payload)}</span>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

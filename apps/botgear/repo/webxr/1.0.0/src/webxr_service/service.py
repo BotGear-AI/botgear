@@ -9,19 +9,25 @@ service:
     origin,
   * republishes normalized topics — ``/webxr/<id>/head``,
     ``/webxr/<id>/controller/{left,right}`` — for any actuator to consume,
+  * ALSO republishes each controller's thumbstick as
+    ``/webxr/<id>/joystick/{left,right}``, shaped exactly like a real
+    gamepad's ``{axes:[x,y], buttons:[...]}`` report — so motor_control's
+    generic input_source binding (built for a physical joystick) can
+    target a Quest controller with just a topic string, no new code,
   * runs the configured mapping table to drive actuators directly (e.g.
     right-controller ray → robot_kinematics ``set_target``),
   * owns the feed-panel / layout / mapping config and publishes it
     retained on ``/webxr/<id>/panels`` for the immersive client,
   * publishes ``/webxr/<id>/state`` for the desktop control panel.
 
-Bus topics:
-  /webxr/<id>/input       incoming — headset telemetry (head/controllers)
-  /webxr/<id>/head        retained-ish — normalized head pose (robot frame)
-  /webxr/<id>/controller/left|right   normalized controller pose+buttons+axes
-  /webxr/<id>/panels      retained — feed config the client renders
-  /webxr/<id>/state       retained — session status + summary (desktop UI)
-  /webxr/<id>/control     incoming — actions (recenter, set_panel, …)
+Wire shape is declared in code below (``WebXRState``, ``HeadPayload``,
+``ControllerPayload``, ``GamepadPayload``, ``PanelsPayload`` via
+``state_schema``/``topic_schemas``; the headset's inbound ``input`` via
+``subscribes_schemas``) and introspected into
+``/runtime/runtime/types/webxr``, as are the ``control`` actions
+(recenter, set_panel, ...). ``joystick/{left,right}`` is deliberately
+gamepad-shaped (``{axes:[x,y], buttons:[...]}``) so a motor_control
+input_source binds to it exactly like a real joystick's ``/input``.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, ConfigDict, Field
 from rlx_bus import SubprocessService, service_method
 
 from . import frames
@@ -38,11 +45,125 @@ from .model import Mapping, PanelSpec, WebXRConfig
 logger = logging.getLogger(__name__)
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class RobotPose(BaseModel):
+    """A pose in the robot frame (Z-up, mm), recenter origin applied."""
+    pos: List[float] = Field(description="[x, y, z] mm")
+    quat: List[float] = Field(description="[x, y, z, w]")
+
+
+class Euler(BaseModel):
+    """Degrees. ``pan`` is heading-relative for the head (0 = facing the
+    way you faced at recenter)."""
+    pan: float
+    tilt: float
+    roll: float
+
+
+class HeadPose(RobotPose):
+    euler: Euler
+
+
+class HeadPayload(HeadPose):
+    """Published on ``/webxr/{id}/head`` per headset frame."""
+    ts: float
+
+
+class ControllerPayload(BaseModel):
+    """Published on ``/webxr/{id}/controller/{left,right}`` per headset
+    frame. ``components`` carries every gamepad component the device
+    exposes (trigger, squeeze, thumbstick, a/b/x/y, ...) as
+    ``{state, value, x, y}``."""
+    buttons: Dict[str, Any]
+    axes: Dict[str, Any]
+    components: Dict[str, Any]
+    grip: Optional[RobotPose] = None
+    ray: Optional[RobotPose] = None
+    euler: Optional[Euler] = Field(None, description="From the raw grip (else ray) orientation — drives wrist roll")
+    ts: float
+
+
+class GamepadPayload(BaseModel):
+    """Published on ``/webxr/{id}/joystick/{left,right}`` — the same
+    thumbstick reshaped exactly like repo/joystick's ``/input`` so a
+    motor_control input_source can bind to it unchanged."""
+    axes: List[float] = Field(description="[x, y] thumbstick")
+    buttons: List[int] = Field(description="[trigger, grip, thumb, a|x, b|y] as 0/1")
+    ts: float
+
+
+class PanelsPayload(BaseModel):
+    """Retained on ``/webxr/{id}/panels`` — what the immersive client renders."""
+    reference_space: str
+    publish_rate_hz: int
+    hand_tracking: bool
+    panels: List[PanelSpec]
+
+
+class SessionInfo(BaseModel):
+    active: bool
+    mode: Optional[str]
+    fps: float
+
+
+class ControllerSummary(BaseModel):
+    ray: Optional[RobotPose]
+    pos: Optional[List[float]] = Field(description="Grip (else ray) position, mm")
+    euler: Optional[Euler]
+    buttons: Dict[str, Any]
+    axes: Dict[str, Any]
+    components: Dict[str, Any]
+
+
+class WebXRState(BaseModel):
+    """Retained on ``/webxr/{id}/state`` — session status + summary for
+    the desktop control panel."""
+    enabled: bool
+    connected: bool = Field(description="Heard from a headset in the last 2s")
+    session: SessionInfo
+    reference_space: str
+    publish_rate_hz: int
+    hand_tracking: bool
+    origin_mm: Optional[List[float]]
+    head: Optional[HeadPose]
+    controller: Dict[str, Optional[ControllerSummary]] = Field(description="'left' / 'right'")
+    panels: List[PanelSpec]
+    mappings: List[Mapping]
+    teleop_enabled: bool
+    ts: float
+
+
+# ── wire schema for what this service SUBSCRIBES to (inbound) ─────────
+
+class XRInputPayload(BaseModel):
+    """Consumed from ``/webxr/{id}/input`` — one raw headset telemetry
+    frame from the xr.js client (WebXR Y-up, metres). Poses are
+    ``{position:[x,y,z], orientation:[x,y,z,w]}``."""
+    model_config = ConfigDict(extra="allow")
+    session: Optional[Dict[str, Any]] = Field(None, description="{active, mode, fps}")
+    head: Optional[Dict[str, Any]] = None
+    controllers: Optional[Dict[str, Any]] = Field(None, description="'left'/'right' -> {grip, ray, buttons, axes, components}")
+
+
 class WebXRService(SubprocessService):
     type_name = "webxr"
     heartbeat_interval_s = 1.0
     config_class = WebXRConfig
-    publishes = ["state", "head", "controller/left", "controller/right", "panels"]
+    publishes = [
+        "state", "head", "controller/left", "controller/right",
+        "joystick/left", "joystick/right", "panels",
+    ]
+    state_schema = WebXRState
+    topic_schemas = {
+        "head": HeadPayload,
+        "controller/left": ControllerPayload,
+        "controller/right": ControllerPayload,
+        "joystick/left": GamepadPayload,
+        "joystick/right": GamepadPayload,
+        "panels": PanelsPayload,
+    }
+    subscribes_schemas = {"input": XRInputPayload}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -99,7 +220,7 @@ class WebXRService(SubprocessService):
             if yaw:
                 h["euler"]["pan"] = round(raw_euler["pan"] - yaw, 3)
             norm["head"] = h
-            await self.publish("head", {**h, "ts": now})
+            await self.publish("head", HeadPayload(**h, ts=now).model_dump())
 
         controllers = payload.get("controllers") or {}
         norm["controller"] = {}
@@ -125,7 +246,8 @@ class WebXRService(SubprocessService):
             if isinstance(raw, dict) and "orientation" in raw:
                 entry["euler"] = frames.head_euler_deg(raw["orientation"])
             norm["controller"][side] = entry
-            await self.publish(f"controller/{side}", {**entry, "ts": now})
+            await self.publish(f"controller/{side}", ControllerPayload(**entry, ts=now).model_dump(exclude_none=True))
+            await self.publish(f"joystick/{side}", _joystick_payload(entry, now))
 
         self._norm = norm
 
@@ -387,40 +509,73 @@ class WebXRService(SubprocessService):
     # ─── outbound config + status ─────────────────────────────────────
     async def _publish_panels(self) -> None:
         """Retained config the immersive client renders from."""
-        await self.publish("panels", {
-            "reference_space": self.config.reference_space,
-            "publish_rate_hz": self.config.publish_rate_hz,
-            "hand_tracking": self.config.hand_tracking,
-            "panels": [p.model_dump() for p in self.config.panels],
-        }, retained=True)
+        panels = PanelsPayload(
+            reference_space=self.config.reference_space,
+            publish_rate_hz=self.config.publish_rate_hz,
+            hand_tracking=self.config.hand_tracking,
+            panels=list(self.config.panels),
+        )
+        await self.publish("panels", panels.model_dump(), retained=True)
 
     def _snapshot(self) -> Dict[str, Any]:
         head = self._norm.get("head") if isinstance(self._norm, dict) else None
         ctrl = self._norm.get("controller", {}) if isinstance(self._norm, dict) else {}
         # "connected" = we've heard from a headset in the last 2s.
         connected = (time.time() - self._last_input_ts) < 2.0 if self._last_input_ts else False
-        return {
-            "enabled": self.config.enabled,
-            "connected": connected,
-            "session": self._session,
-            "reference_space": self.config.reference_space,
-            "publish_rate_hz": self.config.publish_rate_hz,
-            "hand_tracking": self.config.hand_tracking,
-            "origin_mm": self.config.origin_mm,
-            "head": head,
-            "controller": {
+        state = WebXRState(
+            enabled=self.config.enabled,
+            connected=connected,
+            session=self._session,
+            reference_space=self.config.reference_space,
+            publish_rate_hz=self.config.publish_rate_hz,
+            hand_tracking=self.config.hand_tracking,
+            origin_mm=self.config.origin_mm,
+            head=head,
+            controller={
                 "left": _ctrl_summary(ctrl.get("left")),
                 "right": _ctrl_summary(ctrl.get("right")),
             },
-            "panels": [p.model_dump() for p in self.config.panels],
-            "mappings": [m.model_dump() for m in self.config.mappings],
-            "teleop_enabled": self.config.teleop_enabled,
-            "ts": time.time(),
-        }
+            panels=list(self.config.panels),
+            mappings=list(self.config.mappings),
+            teleop_enabled=self.config.teleop_enabled,
+            ts=time.time(),
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         self._last_state_pub = time.time()
         await self.publish("state", self._snapshot(), retained=True)
+
+
+def _joystick_payload(entry: Dict[str, Any], now: float) -> Dict[str, Any]:
+    """Reshape one controller's normalized ``entry`` (axes as a named
+    ``{x, y}`` dict, buttons as a named dict) into exactly what a real
+    gamepad's report looks like (see repo/joystick's poller.py: axes as a
+    plain array indexed by axis number, buttons as a plain array indexed
+    by button number).
+
+    This is NOT a new consumption path — motor_control's input_source
+    binding only ever does ``payload[field][index]``; it has no idea
+    whether the array on the other end came from SDL reading a USB
+    joystick or from here. ``axes[1]`` (the 2nd element = thumbstick Y,
+    matching the convention repo/joystick already publishes for a
+    physical controller's stick) means a channel already tuned against a
+    real joystick's field/index/scale can be re-pointed at a Quest
+    controller with zero new motor_control code and zero config changes
+    beyond the topic string."""
+    axes = entry["axes"] if isinstance(entry.get("axes"), dict) else {}
+    btn = entry["buttons"] if isinstance(entry.get("buttons"), dict) else {}
+    return GamepadPayload(
+        axes=[float(axes.get("x") or 0.0), float(axes.get("y") or 0.0)],
+        buttons=[
+            int(bool(btn.get("trigger"))),
+            int(bool(btn.get("grip"))),
+            int(bool(btn.get("thumb"))),
+            int(bool(btn.get("a") or btn.get("x"))),
+            int(bool(btn.get("b") or btn.get("y"))),
+        ],
+        ts=now,
+    ).model_dump()
 
 
 def _ctrl_summary(c: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

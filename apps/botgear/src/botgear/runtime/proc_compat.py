@@ -233,7 +233,7 @@ def snapshot_child_pids(pid: int) -> List[int]:
     orphaned children. POSIX reaps the whole group via ``killpg``, so this
     returns ``[]`` there (and never touches psutil, per the module
     contract). A Job Object would make the sweep unnecessary — see
-    docs/TODO_WINDOWS_SUPPORT.md.
+    AGENTS.md's "Windows support" section.
     """
     if not IS_WINDOWS or not _valid_pid(pid):
         return []

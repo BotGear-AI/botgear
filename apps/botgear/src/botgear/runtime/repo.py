@@ -119,7 +119,7 @@ class PackageManifest:
     # installs. None = no license gate. Shown by the install wizard.
     license: Optional[str] = None
     # Optional frontend UI bundle shipped with this service (Option B —
-    # see docs/TODO_SERVICE_UI_BUNDLES.md). Shape:
+    # see repo/README.md's "Adding a UI" section). Shape:
     #   {entry: "ui/dist/ui.js", css?: "ui/dist/ui.css", sdk: "^1.0"}
     # The host dynamically imports the built ESM at runtime; None means no
     # bundled UI (the host falls back to its static serviceViews registry

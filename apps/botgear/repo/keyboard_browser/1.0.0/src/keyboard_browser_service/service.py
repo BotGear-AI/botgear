@@ -14,6 +14,10 @@ operator's BROWSER:
   * STATUS flows UP: the browser reports capturing + a heartbeat on
     ``/keyboard/{id}/report``, folded into ``/keyboard/{id}/state``.
 
+Those three topics' shapes are declared below (``KeyboardCmd``,
+``KeyboardReport``; ``event`` is the base's ``KeyEvent``) and introspected
+into ``/runtime/runtime/types/keyboard_browser`` with everything else.
+
 A browser keyboard only exists while an authorized tab is open + focused; a
 stale heartbeat marks ``last_error:"no browser client"`` and clears
 ``capturing`` (which also fires the keymap all-stop via the base).
@@ -23,9 +27,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Literal, Optional
 
-from rlx_input import KeyboardServiceBase
+from pydantic import BaseModel, ConfigDict, Field
+from rlx_input import KeyEvent, KeyboardServiceBase
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +38,27 @@ _STALE_AFTER_S = 5.0
 _CHECK_EVERY_S = 2.0
 
 
+class KeyboardCmd(BaseModel):
+    """Published on ``/keyboard/{id}/cmd`` — a command to the browser half."""
+    action: Literal["start", "stop", "set_scope", "set_suppress"]
+    scope: Optional[str] = Field(None, description="start / set_scope")
+    suppress: Optional[bool] = Field(None, description="start / set_suppress")
+
+
+class KeyboardReport(BaseModel):
+    """Consumed from ``/keyboard/{id}/report`` — the browser's status +
+    heartbeat; a stale one (>5s) marks the keyboard disconnected."""
+    model_config = ConfigDict(extra="allow")
+    capturing: Optional[bool] = None
+    error: Optional[str] = None
+    ts: Optional[float] = None
+
+
 class KeyboardBrowserService(KeyboardServiceBase):
     source = "browser"
+    publishes = [*KeyboardServiceBase.publishes, "cmd"]
+    topic_schemas: Dict[str, Any] = {**KeyboardServiceBase.topic_schemas, "cmd": KeyboardCmd}
+    subscribes_schemas = {"report": KeyboardReport, "event": KeyEvent}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -56,20 +80,19 @@ class KeyboardBrowserService(KeyboardServiceBase):
 
     # ─── control hooks — relay to the browser ─────────────────────────
     async def _start_capture_backend(self) -> None:
-        await self.publish("cmd", {
-            "action": "start",
-            "scope": self.config.scope,
-            "suppress": self.config.suppress,
-        })
+        await self._cmd(KeyboardCmd(action="start", scope=self.config.scope, suppress=self.config.suppress))
 
     async def _stop_capture_backend(self) -> None:
-        await self.publish("cmd", {"action": "stop"})
+        await self._cmd(KeyboardCmd(action="stop"))
 
     async def _on_scope_changed(self, scope: str) -> None:
-        await self.publish("cmd", {"action": "set_scope", "scope": scope})
+        await self._cmd(KeyboardCmd(action="set_scope", scope=scope))
 
     async def _on_suppress_changed(self, suppress: bool) -> None:
-        await self.publish("cmd", {"action": "set_suppress", "suppress": suppress})
+        await self._cmd(KeyboardCmd(action="set_suppress", suppress=suppress))
+
+    async def _cmd(self, cmd: KeyboardCmd) -> None:
+        await self.publish("cmd", cmd.model_dump(exclude_none=True))
 
     # ─── browser → backend keys + status ──────────────────────────────
     async def _on_event(self, payload: Any) -> None:

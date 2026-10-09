@@ -95,7 +95,7 @@ export default function OscopeView({ proxy }: { proxy: ServiceProxy }) {
   // buffer (seconds). Drag pans, wheel zooms, ⟲ resets.
   const view = useRef<{ vZoom: number; vPan: number; tPan: number }>({ vZoom: 1, vPan: 0, tPan: 0 })
   const panDrag = useRef<{ x: number; y: number } | null>(null)
-  const [viewNudge, setViewNudge] = useState(0)   // re-render toolbar's "offset?" indicator
+  const [, setViewNudge] = useState(0)   // re-render toolbar's "offset?" indicator
   const resetView = () => { view.current = { vZoom: 1, vPan: 0, tPan: 0 }; setViewNudge((n) => n + 1) }
 
   const send = useCallback((action: string, args: Record<string, any> = {}) => {
@@ -203,7 +203,6 @@ export default function OscopeView({ proxy }: { proxy: ServiceProxy }) {
   const channels = s?.channels ?? []
   const trig = s?.trigger
   const tbSec = (s?.timebase_ms ?? 2000) / 1000
-  const tEnd = lastFrame.current.t
   const stats = useMemo(() => {
     const t1 = lastFrame.current.t, t0 = t1 - tbSec
     return channels.map((c) => ({ c, m: windowStats(bufs.current.get(c.id), t0, t1) }))
@@ -360,7 +359,7 @@ export default function OscopeView({ proxy }: { proxy: ServiceProxy }) {
 }
 
 // ── source picker: discover signal_source proxies + manual entry ─────────
-function SourcePicker({ apiFetch, ctl, onAdd, onClose }: {
+function SourcePicker({ apiFetch, onAdd, onClose }: {
   apiFetch: <T = any>(p: string, i?: RequestInit) => Promise<T>
   ctl: ReturnType<typeof useServiceRequest<any>>
   onAdd: (a: Record<string, any>) => void

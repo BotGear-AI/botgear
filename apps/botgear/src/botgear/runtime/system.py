@@ -126,31 +126,54 @@ def restart() -> None:
     os.execv(exec_path, new_argv)  # process image is replaced here
 
 
-def graceful_restart() -> None:
-    """Drain, then restart. Enter draining state (reject new services), stop
-    every non-singleton managed service so subprocesses are terminated (no
-    orphans) and rows aren't left stale-'running', then re-exec. The active
-    config set's start_order services come back fresh on boot."""
+def drain_for_exit(reason: str, *, snapshot: bool = True) -> int:
+    """(Snapshot +) drain before the process ends — shared by graceful
+    restart, graceful shutdown, and the plain SIGTERM/Ctrl-C exit path
+    (event_handlers.on_shutdown). Enters draining state (reject new
+    services), optionally snapshots every service's state so the next boot
+    restores it exactly, then stops every non-singleton service so no
+    subprocess outlives the backend. Never raises. Returns how many were
+    drained.
+
+    ``snapshot=False`` for the plain process exit: the snapshot rewrites
+    every service's yml from its IN-MEMORY config, so a yml edited by hand
+    while the backend ran (then "restart to apply") would be silently
+    reverted. Stopping doesn't touch ``desired_state``, so services that
+    were running still come back on the next boot without it."""
     set_draining(True)
-    logger.warning("system: graceful restart — draining services before re-exec")
-    from botgear.runtime import lifecycle  # lazy: avoid import cycle
+    logger.warning("system: %s — %sdrain services", reason, "snapshot + " if snapshot else "")
+    from botgear.runtime import lifecycle, process_manager  # lazy: avoid import cycle
     # Snapshot BEFORE draining, while status + live runtime state still
     # reflect reality. drain stops the services (and would flip a ticking
     # clock to paused), so capturing desired_state + is_clock_running first
     # is what lets the next boot restore the exact pre-shutdown state.
+    if snapshot:
+        try:
+            report = lifecycle.save_all_service_config()
+            logger.warning("system: snapshotted services — saved=%s", report.get("saved"))
+        except Exception:  # noqa: BLE001 — never block exit on a save failure
+            logger.exception("system: pre-drain snapshot failed; continuing")
+    # Signal every subprocess at once (one shared SIGTERM→SIGKILL deadline)
+    # so drain_services below isn't paying the stop timeout per service.
     try:
-        report = lifecycle.save_all_service_config()
-        logger.warning(
-            "system: snapshotted services before drain — saved=%s",
-            report.get("saved"),
-        )
-    except Exception:  # noqa: BLE001 — never block restart on a save failure
-        logger.exception("system: pre-drain snapshot failed; restarting anyway")
+        process_manager.stop_all()
+    except Exception:  # noqa: BLE001
+        logger.exception("system: stopping subprocesses failed; draining anyway")
     try:
         n = lifecycle.drain_services()
-        logger.warning("system: drained %d service(s); re-exec", n)
-    except Exception:  # noqa: BLE001 — never get stuck; restart regardless
-        logger.exception("system: drain failed; restarting anyway")
+        logger.warning("system: drained %d service(s)", n)
+        return n
+    except Exception:  # noqa: BLE001 — never get stuck; exit regardless
+        logger.exception("system: drain failed; continuing")
+        return 0
+
+
+def graceful_restart() -> None:
+    """Drain, then restart. Stops every non-singleton managed service so
+    subprocesses are terminated (no orphans) and rows aren't left
+    stale-'running', then re-exec. The active config set's start_order
+    services come back fresh on boot."""
+    drain_for_exit("graceful restart")
     restart()
 
 
@@ -174,22 +197,7 @@ def graceful_shutdown() -> None:
     graceful_restart: same pre-flight so the next manual start restores
     the exact pre-shutdown state — but ends the process instead of
     re-execing it."""
-    set_draining(True)
-    logger.warning("system: graceful shutdown — snapshot + drain before exit")
-    from botgear.runtime import lifecycle  # lazy: avoid import cycle
-    try:
-        report = lifecycle.save_all_service_config()
-        logger.warning(
-            "system: snapshotted services before shutdown — saved=%s",
-            report.get("saved"),
-        )
-    except Exception:  # noqa: BLE001 — never block shutdown on a save failure
-        logger.exception("system: pre-shutdown snapshot failed; shutting down anyway")
-    try:
-        n = lifecycle.drain_services()
-        logger.warning("system: drained %d service(s); exiting", n)
-    except Exception:  # noqa: BLE001 — never get stuck; exit regardless
-        logger.exception("system: drain failed; exiting anyway")
+    drain_for_exit("graceful shutdown")
     shutdown()
 
 

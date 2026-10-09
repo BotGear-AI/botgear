@@ -9,9 +9,11 @@
 Parallel to rlx_audio: one shared base so a browser-captured and a
 host-captured keyboard publish the IDENTICAL bus shape and can't drift.
 """
-from .base import KeyboardConfig, KeyboardServiceBase
+from .base import KeyboardConfig, KeyboardServiceBase, KeyboardState
 from .events import (
     MODIFIERS,
+    KeyEvent,
+    Modifiers,
     binding_matches,
     event_matches,
     event_token,
@@ -23,6 +25,9 @@ from .events import (
 __all__ = [
     "KeyboardServiceBase",
     "KeyboardConfig",
+    "KeyboardState",
+    "KeyEvent",
+    "Modifiers",
     "MODIFIERS",
     "make_event",
     "normalize_event",

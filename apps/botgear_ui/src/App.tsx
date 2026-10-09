@@ -6,6 +6,7 @@ import ProtectedRoute from './components/ProtectedRoute'
 import { RedirectToActive } from './components/RedirectToActive'
 import { RuntimeSwitcher } from './components/RuntimeSwitcher'
 import RuntimeNav from './components/RuntimeNav'
+import { HaltBanner } from './components/HaltControl'
 import { ConfigSetSwitcher } from './components/ConfigSetSwitcher'
 import SaveAllButton from './components/SaveAllButton'
 import LoadAllButton from './components/LoadAllButton'
@@ -161,6 +162,8 @@ function RuntimeLayout() {
     <div className="flex h-screen flex-col">
       {/* Persistent primary navigation — shared across every page. */}
       <RuntimeNav />
+      {/* Runtime-wide HALT status — shown on every page while halted. */}
+      <HaltBanner />
       {/* Runtime + config-set context selectors. */}
       <div className="flex items-center justify-between gap-2 border-b border-slate-800 bg-slate-950">
         <RuntimeSwitcher />

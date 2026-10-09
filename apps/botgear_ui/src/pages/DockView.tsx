@@ -20,11 +20,11 @@
 // runtime. The bus is the source of truth, so a value changed in the
 // canvas window shows up here (and vice-versa) without any cross-window
 // messaging — both ends just subscribe to the same topics.
-import { useCallback, useEffect, useReducer, useState } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
+import { useCallback, useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { X } from 'lucide-react'
 
-import { useActiveRuntime } from '../contexts/ActiveRuntimeContext'
+import { usePoppedOutProxy } from '../hooks/usePoppedOutProxy'
 import { DockProvider } from '../contexts/DockContext'
 import {
   DEFAULT_VIEW_ID,
@@ -38,9 +38,7 @@ import type { ServiceRequest } from '../models/ServiceRequest'
 
 
 export default function DockView() {
-  const { proxyId = '' } = useParams<{ proxyId: string }>()
-  const { runtimeId, connection } = useActiveRuntime()
-  const decodedId = decodeProxyId(proxyId)
+  const { runtimeId, connection, decodedId, proxy, error, setProxy, setError } = usePoppedOutProxy()
 
   const [searchParams, setSearchParams] = useSearchParams()
   // Current view shape — seeded from ``?view=`` (the shape the node was
@@ -66,56 +64,12 @@ export default function DockView() {
     [setSearchParams],
   )
 
-  const [proxy, setProxy] = useState<ServiceProxy | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  // RuntimeConnection mutates ``state`` in place + notifies listeners;
-  // it does NOT swap the object reference. ActiveRuntimeProvider's
-  // memoized value therefore stays identical across a
-  // connecting→connected transition, so this component would never
-  // re-render to notice. Subscribe directly to the connection and force
-  // a re-render on every notify (state flip, auth change). Also kick
-  // the socket open explicitly — idempotent; covers the case where
-  // nothing else has subscribed yet to trigger the lazy connect.
-  const [, forceRender] = useReducer((n: number) => n + 1, 0)
-  useEffect(() => {
-    if (!connection) return
-    const off = connection.subscribe(forceRender)
-    connection.ws.connect()
-    return off
-  }, [connection])
-
   // Title the OS window after the service so a row of popups is
   // distinguishable on the taskbar / alt-tab.
   useEffect(() => {
     const label = proxy?.name ?? decodedId
     document.title = label ? `${label} — botgear` : 'botgear'
   }, [proxy?.name, decodedId])
-
-  // Fetch the proxy record once the connection is live. The view itself
-  // pulls its live data off the bus; this is just the static descriptor
-  // (id + service_meta_id + name) the view components need. Re-runs if
-  // the connection flips to connected after an initial disconnected
-  // render.
-  useEffect(() => {
-    if (!connection || connection.state !== 'connected') return
-    let cancelled = false
-    setError(null)
-    connection
-      .apiFetch<ServiceProxy[]>('/v1/service-proxy-list')
-      .then((list) => {
-        if (cancelled) return
-        const found = (list ?? []).find((p) => (p.id ?? p.name) === decodedId)
-        if (found) setProxy(found)
-        else setError(`No service "${decodedId}" on ${runtimeId}.`)
-      })
-      .catch((err: Error) => {
-        if (!cancelled) setError(err.message)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [connection, connection?.state, decodedId, runtimeId])
 
   // Minimal lifecycle dispatcher for the full view's title-bar buttons
   // (Start / Stop / Release). The canvas dispatcher additionally drives
@@ -277,15 +231,4 @@ function Placeholder({
       </p>
     </div>
   )
-}
-
-
-/** The proxy id rides through the URL path; decode any percent-encoded
- * special chars (ids can contain ``@``, ``.``, ``-``). */
-function decodeProxyId(raw: string): string {
-  try {
-    return decodeURIComponent(raw)
-  } catch {
-    return raw
-  }
 }

@@ -5,6 +5,7 @@
 // See docs/TODO_SERVICE_UI_BUNDLES.md.
 const U = window.__RLX__.rlxUi
 export const {
-  useWsClient, useApiFetch, useActiveRuntime, useServiceRequest,
+  useWsClient, useApiFetch, useActiveRuntime, useRuntimeConnections, useServiceRequest,
   Panel, KeymapEditor, NumberInput, ConfirmDialog, PromptDialog, CopyButton, ContextMenu,
+  MicrophoneSourcePicker, useMicrophoneOptions,
 } = U

@@ -5,11 +5,10 @@ The second framework singleton (after ``runtime``). Auto-started by the
 config-set loader BEFORE any service whose config carries an
 ``Encrypted--`` field that needs decryption.
 
-Bus actions
------------
-  /security/security-1/control  <- {"action": "encrypt", "plaintext": "...", "reply_to": ...}
-                                 | {"action": "decrypt", "ciphertext": "Encrypted--...", "reply_to": ...}
-                                 | {"action": "status", "reply_to": ...}
+Wire shape (``SecurityState`` via ``state_schema``) and the
+encrypt/decrypt/status ``control`` actions are introspected into
+``/runtime/runtime/types/security`` off the code below, not
+hand-documented here.
 
 Wire format
 -----------
@@ -52,7 +51,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from cryptography.fernet import Fernet, InvalidToken
-from pydantic import Field
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -197,10 +196,18 @@ class SecurityConfig(ServiceConfig):
     )
 
 
+class SecurityState(BaseModel):
+    """Retained on ``/security/{id}/state`` — where the key came from,
+    never the key itself."""
+    ready: bool
+    key_source: str = Field(description="'override' | 'env:<VAR>' | 'file:<path>' | 'file:<path>(generated)'")
+
+
 class SecurityService(Service):
     """Singleton crypto service. One per backend process."""
 
     config_class = SecurityConfig
+    state_schema = SecurityState
     publishes = ["state"]
     _core: SecurityCore
     _control_task: Optional[asyncio.Task] = None
@@ -215,11 +222,8 @@ class SecurityService(Service):
         _current = self
         # Retained state — operators can see where the key came from
         # without being able to read it. Never publishes the key itself.
-        self.publish(
-            "state",
-            {"ready": True, "key_source": self._core.key_source},
-            retained=True,
-        )
+        state = SecurityState(ready=True, key_source=self._core.key_source)
+        self.publish("state", state.model_dump(), retained=True)
         self._control_task = asyncio.create_task(self.run_control_loop())
 
     async def on_stop(self) -> None:

@@ -93,7 +93,7 @@ def _scan_service_subprocesses() -> List[Dict[str, Any]]:
     dead runtime's children reparenting and on ppids not being reused.
     Windows does neither reliably, so cross-session orphan reaping there
     degrades to best-effort (own live children are still found). See
-    docs/TODO_WINDOWS_SUPPORT.md.
+    AGENTS.md's "Windows support" section.
     """
     out: List[Dict[str, Any]] = []
     my_pid = os.getpid()

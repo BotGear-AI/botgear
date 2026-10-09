@@ -103,6 +103,7 @@ class SubprocessAdapter(ServiceAdapter):
                 doc=m.get("doc"),
                 publishes=list(m.get("publishes") or []),
                 publish_return=m.get("publish_return"),
+                args_schema=m.get("args_schema"),
             ))
         return out
 

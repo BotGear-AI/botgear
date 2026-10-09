@@ -8,27 +8,27 @@ bus payloads serialise from these; run logs are JSON lines of these.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+# Tool shapes + tool policy are botgear's shared agent surface (see
+# docs/AGENT_ROADMAP.md, Phase 0) — re-exported here so every brain module
+# and test keeps importing them from brain.schemas.
+from botgear.agent_surface.models import (  # noqa: F401
+    SafetyVerdict,
+    ToolCallRecord,
+    ToolDescriptor,
+    ToolPattern,
+    ToolPolicy,
+    ToolResult,
+)
+
+# brain's historical name for a workflow's tool policy (allowed_tools.yaml).
+AllowedTools = ToolPolicy
 
 
 # ─── workflow definition (parsed from disk) ──────────────────────────
-
-
-class ToolPattern(BaseModel):
-    """One row of allowed_tools.yaml ``allowed`` or ``blocked``."""
-    topic: str = Field(..., description="Topic glob, e.g. /video/*/control or /movement/* ")
-    actions: List[str] = Field(
-        default_factory=list,
-        description="Action names allowed on the matched topic. Empty/omitted = no actions.",
-    )
-
-
-class AllowedTools(BaseModel):
-    """Parsed allowed_tools.yaml for one workflow."""
-    allowed: List[ToolPattern] = Field(default_factory=list)
-    blocked: List[ToolPattern] = Field(default_factory=list)
 
 
 class WorkflowInput(BaseModel):
@@ -82,12 +82,28 @@ class ExitOnPhrase(BaseModel):
     matches: List[str] = Field(default_factory=list)
     case_insensitive: bool = True
     whole_message: bool = True
-    listen_topic: Optional[str] = Field(
+    listen_topic: Optional[Union[str, List[str]]] = Field(
         default=None,
-        description="Wildcard or exact topic to subscribe to for exit-phrase detection. "
+        description="Wildcard or exact topic(s) to subscribe to for exit-phrase detection. "
                     "Payload's ``text`` field is the candidate string. "
-                    "Example: ``/chat/+/inbox`` to catch every chat instance.",
+                    "Example: ``/chat/+/inbox`` to catch every chat instance. Accepts a LIST "
+                    "of topics too — needed when more than one `messaging`-capability service "
+                    "type might be running (see docs/TODO_MESSAGING.md): a single MQTT-style "
+                    "pattern can wildcard one path SEGMENT but can't alternate between "
+                    "different literal type-name segments, e.g. it can't express "
+                    "'/chat/+/inbox OR /discord/+/inbox' as one string.",
     )
+
+    @property
+    def listen_topics(self) -> List[str]:
+        """Normalized list form of ``listen_topic`` — empty if unset, a
+        single-element list for the common string case, or the list
+        itself when multiple topics were given."""
+        if self.listen_topic is None:
+            return []
+        if isinstance(self.listen_topic, str):
+            return [self.listen_topic]
+        return list(self.listen_topic)
 
 
 class LoopOnTimeout(BaseModel):
@@ -107,6 +123,42 @@ class LoopOnTimeout(BaseModel):
     tool: str = Field(..., description="Action name of the tool whose result triggers the re-loop.")
     field: str = Field(..., description="Key on the tool's result dict to inspect.")
     value: Any = Field(..., description="Matched value of that key — when equal, re-dispatch.")
+
+
+class EchoFilter(BaseModel):
+    """Backstop against the robot answering its own voice: a ``listen``
+    result that mostly repeats something the robot ``speak``-ed within the
+    last ``window_seconds`` is treated as an echo and silently re-listened
+    (same fast path as LoopOnTimeout). The primary defence is the STT
+    service's echo gate (it stops transcribing while speech plays); this
+    catches what that can't see, e.g. a speaker the runtime doesn't control.
+
+    ``threshold`` is the fraction of the heard words that appear, in order,
+    in the spoken text. Utterances shorter than ``min_words`` are never
+    filtered ("yes", "stop"). An operator who really does repeat the robot
+    just says it again: the same text heard twice in a row passes."""
+    enabled: bool = True
+    window_seconds: float = 15.0
+    min_words: int = 3
+    threshold: float = 0.75
+
+
+class LoopBreaker(BaseModel):
+    """Automatic circuit breaker for a conversation run that has stopped
+    making sense — the model talking to itself instead of the operator.
+    Trips (run ends as a failure + its speech is stopped) when either:
+
+      * ``max_consecutive_speaks`` ``speak`` calls succeed with no real
+        operator utterance heard in between (the general_assistant loop
+        spoke 3-4 times in a row), or
+      * the echo filter drops ``max_echo_drops`` utterances within
+        ``echo_drop_window_seconds`` (the robot keeps hearing itself).
+
+    0 disables that individual check."""
+    enabled: bool = True
+    max_consecutive_speaks: int = 4
+    max_echo_drops: int = 3
+    echo_drop_window_seconds: float = 60.0
 
 
 class RunConfiguration(BaseModel):
@@ -165,6 +217,33 @@ class Workflow(BaseModel):
     timeout_seconds: int = 120
     max_tokens_per_run: Optional[int] = None
     requires_human_approval: bool = False
+    # Progressive tool disclosure. Off by default — zero behavior
+    # change for every existing workflow. When True, the model isn't
+    # shown full schemas for every allowed action up front; only for
+    # whatever's in `always_loaded_prefixes` (plus the implicit
+    # "brain" prefix, for describe_capability itself + brain's own
+    # core actions) and whatever it has asked `describe_capability`
+    # about so far THIS run. Everything else is summarized as a
+    # compact index in context instead of a full tool definition.
+    # Exists because the full live catalog's token cost scales with
+    # how many services happen to be running, which crowds out
+    # conversation history fastest in exactly the workflows (broad,
+    # default_policy: allow ones) that most want headroom for it. See
+    # WorkflowEngine._lazy_tool_descriptors / _capability_index_text.
+    lazy_tools: bool = False
+    # Capability/topic-prefixes (see safety_gate.capability_prefix)
+    # whose actions are ALWAYS fully loaded regardless of discovery
+    # state — typically the conversation-I/O capability this
+    # workflow's own listen/speak loop structurally depends on every
+    # turn (e.g. ["stt", "speech"]). Only meaningful when lazy_tools
+    # is True; ignored otherwise.
+    always_loaded_prefixes: List[str] = Field(default_factory=list)
+    # lazy_tools only kicks in when the allowed live catalog has MORE
+    # than this many actions (~90 actions ≈ 6k tokens of schema) —
+    # below it, everything is loaded up front: no describe_capability
+    # round trips, nothing for the model to wrongly claim it "doesn't
+    # have". 0 = always lazy.
+    lazy_tools_threshold: int = 120
     inputs: Dict[str, WorkflowInput] = Field(default_factory=dict)
     steps: List[WorkflowStep] = Field(default_factory=lambda: [WorkflowStep()])
     context: List[str] = Field(
@@ -188,6 +267,30 @@ class Workflow(BaseModel):
     # ``listen``). On match, engine re-dispatches the tool without an
     # LLM round trip. See LoopOnTimeout.
     loop_on_timeout: Optional[LoopOnTimeout] = None
+    # Turn-taking: the engine adds ``wait: true`` to every ``speak`` on a
+    # /speech/*/control topic (unless the call sets ``wait`` itself), so the
+    # next ``listen`` can't start while the reply is still playing.
+    speak_wait: bool = True
+    # Self-echo backstop for ``listen`` results. See EchoFilter.
+    echo_filter: EchoFilter = Field(default_factory=EchoFilter)
+    # Phrase-terminated (exit_on_phrase) conversations: when the model
+    # emits ``done`` mid-conversation, speak its text if it wasn't already
+    # spoken (small models often put the reply there instead of calling
+    # speak) and go straight back to listening — same run, same context —
+    # instead of ending. Ignored for workflows without exit_on_phrase.
+    resume_on_done: bool = True
+    # Append the current local time ("[now: Saturday 2026-10-03 14:05
+    # PDT]") to every real heard ``listen`` result, so a long-running
+    # conversation can answer "what time is it" — the Environment
+    # section's run-start time goes stale. A few tokens per turn.
+    stamp_time: bool = True
+    # System One reflex bypass (brain/reflex_engine.py): before each model
+    # turn, a direct light/switch or pan-tilt command in the latest
+    # utterance is executed without the model. Off by default — it
+    # actuates hardware on heuristics, so a workflow opts in.
+    fast_reflex: bool = False
+    # Runaway-conversation circuit breaker. See LoopBreaker.
+    loop_breaker: LoopBreaker = Field(default_factory=LoopBreaker)
     # Sliding conversation window. When set, the engine trims the
     # messages array after each turn to keep only the system message
     # + the last N entries. Bounds token usage on long-running
@@ -218,29 +321,6 @@ class ChatMessage(BaseModel):
     tool_args: Optional[Dict[str, Any]] = None
 
 
-class ToolDescriptor(BaseModel):
-    """JSON-Schema'd tool advertised to the model. Derived from the
-    service's @service_method args_schema + the bus topic the action
-    is dispatched to.
-
-    Adapters translate this into the provider's native tool format
-    (OpenAI functions, Anthropic tool_use, Ollama tools)."""
-    topic: str = Field(..., description="e.g. /video/video-1/control")
-    action: str = Field(..., description="e.g. capture_frame")
-    description: str = ""
-    parameters: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="JSON Schema for the action's arguments.",
-    )
-
-    @property
-    def name(self) -> str:
-        """Stable identifier used in tool-call response routing.
-        Provider tool name has to be a single string — we encode the
-        topic + action via ``::`` so the parser can split on it."""
-        return f"{self.topic}::{self.action}"
-
-
 class ProposedAction(BaseModel):
     """The model's output, parsed into something the brain can validate.
 
@@ -265,28 +345,32 @@ class ModelUsage(BaseModel):
 
 
 class ModelResponse(BaseModel):
-    """Everything an adapter returns from .complete()."""
+    """Everything an adapter returns from .complete().
+
+    ``actions`` holds every proposed action from this one model
+    round-trip, in the order the provider returned them — a model can
+    (and, observed in practice, sometimes does) emit several tool calls
+    in a single response, e.g. an action plus its own confirmation
+    ``speak()`` (see docs/TODO_BRAIN_GAP_FIXES.md Gap 5). Always has at
+    least one entry: an adapter that only constructs ``action`` (single-
+    action response, or any path written before this field existed)
+    gets ``actions=[action]`` for free via the validator below.
+    ``action`` is ``actions[0]`` and stays a real field, not just a
+    property, for backward compatibility with any code that reads it
+    directly."""
     action: ProposedAction
+    actions: List[ProposedAction] = Field(default_factory=list)
     raw: Dict[str, Any] = Field(default_factory=dict, description="provider-specific response")
     usage: ModelUsage = Field(default_factory=ModelUsage)
 
+    @model_validator(mode="after")
+    def _default_actions_to_action(self) -> "ModelResponse":
+        if not self.actions:
+            self.actions = [self.action]
+        return self
+
 
 # ─── safety + execution ─────────────────────────────────────────────
-
-
-class SafetyVerdict(BaseModel):
-    allowed: bool
-    reason: str = ""
-    # Filled when a guard short-circuited (max_steps / max_tokens / approval).
-    guard: Optional[Literal["allow_list", "block_list", "max_steps", "max_tokens", "timeout", "approval", "unknown_target", "schema"]] = None
-
-
-class ToolResult(BaseModel):
-    """What we record after publishing a tool call + getting the reply."""
-    status: Literal["ok", "error", "timeout"] = "ok"
-    value: Any = None
-    error: Optional[str] = None
-    duration_ms: int = 0
 
 
 # ─── run record (the thing logged to disk + bus) ─────────────────────
@@ -302,16 +386,6 @@ class StepRecord(BaseModel):
     verdict: SafetyVerdict
     tool_call_id: Optional[str] = None
     usage: ModelUsage = Field(default_factory=ModelUsage)
-
-
-class ToolCallRecord(BaseModel):
-    ts: str
-    step: int
-    tool_call_id: str
-    topic: str
-    action: str
-    args: Dict[str, Any]
-    result: ToolResult
 
 
 class RunRecord(BaseModel):
@@ -335,5 +409,7 @@ class RunRecord(BaseModel):
     model_id: Optional[str] = None
     steps_used: int = 0
     tokens_used: int = 0
+    # Provider-reported spend (session minds report it; None = not known).
+    cost_usd: Optional[float] = None
     result_summary: str = ""
     failure_reason: Optional[str] = None

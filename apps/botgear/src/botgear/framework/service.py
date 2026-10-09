@@ -82,10 +82,15 @@ def _get_local_security_core() -> Any:
         return None
 
 
-def _safe_args_schema(svc: "Service", attr: str) -> Dict[str, Any]:
+def _safe_args_schema(svc: "Service", attr: str, override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Return the JSON Schema for ``svc.attr``'s parameters, or {} on
-    any failure. Never raises — meta publish runs at startup and a
-    broken schema generator must not crash a service."""
+    any failure. A hand-written ``@service_method(args_schema=...)``
+    (``override``) wins — the same priority as the subprocess path
+    (rlx_bus ``_methods_payload``) and ``rlx_bus.introspect.methods``.
+    Never raises — meta publish runs at startup and a broken schema
+    generator must not crash a service."""
+    if override is not None:
+        return override
     try:
         from botgear.runtime.schema_introspect import method_args_schema
         fn = getattr(svc, attr, None)
@@ -158,6 +163,15 @@ class Service:
         here will run to completion if they're awaited.
         """
 
+    async def on_halt(self, event: Dict[str, Any]) -> None:
+        """Runtime-wide HALT (see ``rlx_bus.halt``). Stop what you're doing
+        NOW — silence output, drop queued work, stop motion — but stay
+        running and ready. Default no-op; ``event['level']`` is ``stop``
+        or ``emergency``. The in-process adapter subscribes for you."""
+
+    async def on_resume(self, event: Dict[str, Any]) -> None:
+        """The operator lifted a HALT. Default no-op."""
+
     async def on_release(self) -> None:
         """Optional one-shot cleanup when the service is released from the
         registry (uninstalled). Default is to call on_stop().
@@ -220,7 +234,7 @@ class Service:
                  # advertises as zero-arg, which fools the model into
                  # never calling it (qwen2.5 et al silently skip
                  # zero-arg tools they can't reason about).
-                 "args_schema": _safe_args_schema(self, m.attr or m.name)}
+                 "args_schema": _safe_args_schema(self, m.attr or m.name, m.args_schema)}
                 for m in self.methods()
             ],
         }
@@ -321,7 +335,7 @@ class Service:
             elif info is not None and info.publish_return == "event":
                 self.publish(f"return/{info.name}", result)
 
-    # ─── config persistence (file-based; see docs/TODO_CONFIG_SETS.md) ──
+    # ─── config persistence (file-based; see AGENTS.md's "Config sets") ──
     #
     # Persistence rules (stone 3 of the config-sets spec):
     #   * The active config set on disk is the source of truth.

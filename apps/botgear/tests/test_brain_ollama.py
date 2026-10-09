@@ -110,19 +110,21 @@ def test_encode_tools_uses_action_name_when_unique():
     assert decode["write_memory"].action == "write_memory"
 
 
-def test_encode_tools_falls_back_to_indexed_on_collision():
+def test_encode_tools_falls_back_to_proxy_qualified_on_collision():
     """When two tools share the same action name (same method on two
-    proxies), the second one falls back to the indexed ``tool_NNN``
-    form so neither collides in the provider's name registry."""
+    proxies), the second one falls back to ``<proxy_id>_<action>`` —
+    legible and matches the operator's own words for the device —
+    instead of an opaque ``tool_NNN`` (see docs/TODO_BRAIN_GAP_FIXES.md
+    Gap 1)."""
     tools = [
         ToolDescriptor(topic="/video/video-1/control", action="capture_frame"),
         ToolDescriptor(topic="/video/video-2/control", action="capture_frame"),
     ]
     encoded, decode = _encode_tools(tools)
     assert encoded[0]["function"]["name"] == "capture_frame"
-    assert encoded[1]["function"]["name"] == "tool_001"
+    assert encoded[1]["function"]["name"] == "video-2_capture_frame"
     assert decode["capture_frame"].topic == "/video/video-1/control"
-    assert decode["tool_001"].topic == "/video/video-2/control"
+    assert decode["video-2_capture_frame"].topic == "/video/video-2/control"
     # Description carries the original topic/action so a human staring
     # at the wire is unconfused.
     assert "/video/video-1/control" in encoded[0]["function"]["description"]
@@ -168,6 +170,53 @@ def test_parse_response_unknown_tool_becomes_done():
     resp = _parse_response(body, {"tool_000": ToolDescriptor(topic="/a/a-1/control", action="x")})
     assert resp.action.kind == "done"
     assert "unknown tool" in resp.action.rationale
+
+
+def test_parse_response_multiple_tool_calls_all_kept():
+    """A model that acts AND confirms in one turn (the real failure
+    mode this fixes — see docs/TODO_BRAIN_GAP_FIXES.md Gap 5): both
+    tool calls must survive in order, not just the first."""
+    decode = {
+        "power_set": ToolDescriptor(topic="/tasmota/sonoff-cord/control", action="power_set"),
+        "speak": ToolDescriptor(topic="/discord/workE/control", action="speak"),
+    }
+    body = {
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "power_set", "arguments": {"on": True}}},
+                {"function": {"name": "speak", "arguments": {"text": "Turned it on."}}},
+            ],
+        },
+        "done": True,
+        "prompt_eval_count": 10,
+        "eval_count": 5,
+    }
+    resp = _parse_response(body, decode)
+    assert len(resp.actions) == 2
+    assert resp.action is resp.actions[0]
+    assert resp.actions[0].action == "power_set"
+    assert resp.actions[1].action == "speak"
+    assert resp.actions[1].args == {"text": "Turned it on."}
+
+
+def test_parse_response_one_unknown_one_valid_keeps_the_valid_one():
+    """A hallucinated name alongside a real one should drop only the
+    bad call, not the whole batch."""
+    decode = {"speak": ToolDescriptor(topic="/discord/workE/control", action="speak")}
+    body = {
+        "message": {
+            "tool_calls": [
+                {"function": {"name": "not_a_real_tool", "arguments": {}}},
+                {"function": {"name": "speak", "arguments": {"text": "hi"}}},
+            ],
+        },
+        "done": True,
+    }
+    resp = _parse_response(body, decode)
+    assert len(resp.actions) == 1
+    assert resp.actions[0].action == "speak"
 
 
 def test_parse_response_string_arguments_decoded():
@@ -236,12 +285,15 @@ async def test_observe_room_via_ollama(workspace, tool_catalog):
     (against a fake provider) gives an identical run."""
     wf = _bundled_observe_room()
 
-    # Map (topic, action) → which indexed tool name the adapter will
-    # send. The brain's allowed_tool_descriptors() filters the catalog
-    # to the workflow's allowed set BEFORE handing to the adapter,
-    # which then assigns tool_000..tool_N. We have 4 allowed
-    # descriptors in observe_room — order is determined by the
-    # adapter's _encode_tools, which preserves the input order.
+    # Map (topic, action) → which tool name the adapter will send. The
+    # brain's allowed_tool_descriptors() filters the catalog to the
+    # workflow's allowed set BEFORE handing to the adapter, which then
+    # names each tool via resolve_tool_names() (bare action name here,
+    # since all 4 are unique — see the collision case in
+    # test_encode_tools_falls_back_to_proxy_qualified_on_collision).
+    # We have 4 allowed descriptors in observe_room — order is
+    # determined by the adapter's _encode_tools, which preserves the
+    # input order.
     #
     # The engine builds the filtered list by iterating tool_catalog
     # values, so we have to know the iteration order. Build it

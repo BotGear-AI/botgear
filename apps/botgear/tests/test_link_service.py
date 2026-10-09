@@ -104,6 +104,45 @@ def test_declared_input_subscription(monkeypatch):
     assert link["origin"] == "declared"
 
 
+# ─── declared: flat audio-consumer binding (microphone → stt/speaker) ──
+
+
+def test_declared_audio_input_kind_ref_binding(monkeypatch):
+    """rlx_audio's AudioDeviceServiceBase descendants (SttServiceBase /
+    SpeakerServiceBase) bind their source via a sibling input_kind/
+    input_ref pair rather than nesting it under a "topic" key — a
+    DIFFERENT shape from the joystick→motor_control case above, and one
+    _walk_config must recognize on its own."""
+    proxies = [
+        {"id": "microphone", "service_config": {}},
+        {"id": "ear", "service_config": {
+            "input_kind": "topic", "input_ref": "/microphone/microphone/audio",
+        }},
+    ]
+    _patch(monkeypatch, proxies)
+    links = link_service.get_all_link(None, None)
+    assert len(links) == 1
+    link = links[0]
+    assert link["source_proxy_id"] == "microphone"
+    assert link["target_proxy_id"] == "ear"
+    assert link["source_topic"] == "/microphone/microphone/audio"
+    assert link["kind"] == "input"
+    assert link["origin"] == "declared"
+
+
+def test_audio_input_kind_other_than_topic_is_ignored(monkeypatch):
+    """input_kind 'file'/'url' (Speaker's other source kinds) reference no
+    proxy — must not produce a spurious link."""
+    proxies = [
+        {"id": "speaker-1", "service_config": {
+            "input_kind": "file", "input_ref": "/some/server/path.wav",
+        }},
+    ]
+    _patch(monkeypatch, proxies)
+    links = link_service.get_all_link(None, None)
+    assert links == []
+
+
 # ─── declared: capability binding (motor_control → sabertooth) ────────
 
 

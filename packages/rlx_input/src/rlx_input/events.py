@@ -1,19 +1,8 @@
 """Canonical key-event schema + keymap matching for botgear keyboards.
 
 Every keyboard service type — browser-captured or host-captured — publishes
-the SAME event shape on ``/keyboard/{id}/event`` so a consumer (teleop,
-brain, …) subscribes by capability, not by backend:
-
-    {
-      "type":      "down" | "up",
-      "key":       "w",            # logical key (KeyboardEvent.key, lowercased)
-      "code":      "KeyW",         # physical code (KeyboardEvent.code) — layout-
-                                   #   independent, the right thing for teleop
-      "modifiers": {"ctrl": false, "alt": false, "shift": false, "meta": false},
-      "repeat":    false,          # OS auto-repeat
-      "ts":        1234567.89,     # epoch seconds
-      "source":    "browser" | "local"
-    }
+the SAME event shape on ``/keyboard/{id}/event`` — ``KeyEvent`` below —
+so a consumer (teleop, brain, …) subscribes by capability, not by backend.
 
 Keymap bindings (the teleop/hotkey layer) match a ``combo`` string like
 ``"KeyW"`` or ``"ctrl+shift+KeyS"`` against an event. The key token matches
@@ -22,9 +11,29 @@ layout-independent (``KeyW``) or logical (``w``).
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Literal, Optional, Set, Tuple
+
+from pydantic import BaseModel, Field
 
 MODIFIERS: Tuple[str, ...] = ("ctrl", "alt", "shift", "meta")
+
+
+class Modifiers(BaseModel):
+    ctrl: bool = False
+    alt: bool = False
+    shift: bool = False
+    meta: bool = False
+
+
+class KeyEvent(BaseModel):
+    """The canonical key event, published on ``/keyboard/{id}/event``."""
+    type: Literal["down", "up"]
+    key: str = Field(description="Logical key (KeyboardEvent.key), e.g. 'w'")
+    code: str = Field(description="Physical code (KeyboardEvent.code), e.g. 'KeyW' — layout-independent, the right thing for teleop")
+    modifiers: Modifiers
+    repeat: bool = Field(description="OS auto-repeat")
+    ts: float = Field(description="Epoch seconds")
+    source: str = Field(description="'browser' | 'local'")
 
 
 def make_event(
@@ -40,15 +49,15 @@ def make_event(
     """Build a normalized key-event dict. ``type_`` is coerced to
     'down'/'up'; modifiers are coerced to a full 4-key bool map."""
     mods = {m: bool((modifiers or {}).get(m)) for m in MODIFIERS}
-    return {
-        "type": "up" if type_ == "up" else "down",
-        "key": str(key or ""),
-        "code": str(code or ""),
-        "modifiers": mods,
-        "repeat": bool(repeat),
-        "ts": float(ts or 0.0),
-        "source": source,
-    }
+    return KeyEvent(
+        type="up" if type_ == "up" else "down",
+        key=str(key or ""),
+        code=str(code or ""),
+        modifiers=Modifiers(**mods),
+        repeat=bool(repeat),
+        ts=float(ts or 0.0),
+        source=source,
+    ).model_dump()
 
 
 def normalize_event(ev: Dict[str, Any]) -> Dict[str, Any]:

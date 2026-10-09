@@ -25,7 +25,7 @@ author: CloudSeeder
 tags: [hardware, audio, microphone, input]
 icon: icon.svg
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md).
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section).
 ui:
   entry: ui/dist/ui.js
   sdk: "^1.0"

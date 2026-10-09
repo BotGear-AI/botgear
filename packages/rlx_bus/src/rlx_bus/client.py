@@ -152,13 +152,32 @@ class BusClient:
 
     async def _send(self, frame: dict) -> bool:
         """Send the frame if connected, else queue it. Returns True if
-        actually written to the socket."""
+        actually written to the socket.
+
+        Encoding and transmission are deliberately NOT one try/except:
+        a payload that isn't JSON-serializable (e.g. a caller passed a
+        live Pydantic model instance into publish() instead of
+        ``.model_dump()``'d plain data — confirmed to actually happen,
+        silently, in network_scanner's known_devices/labels updates)
+        will NEVER succeed no matter how many times it's retried, so
+        queuing it in ``_outbound`` "for the next reconnect" just holds
+        a dead frame forever while the caller believes the publish
+        went through (update_config's config_patch never raises on
+        this path). Only a genuine transport failure belongs in the
+        reconnect-and-flush queue.
+        """
+        try:
+            encoded = json.dumps(frame)
+        except TypeError:
+            logger.error("bus: dropping unserializable publish on %s: %r",
+                         (frame.get("data") or {}).get("topic"), frame, exc_info=True)
+            return False
         if self._ws is None:
             self._outbound.append(frame)
             return False
         try:
             async with self._send_lock:
-                await self._ws.send(json.dumps(frame))
+                await self._ws.send(encoded)
             return True
         except Exception:  # noqa: BLE001
             # Connection just died under us — preserve the frame.

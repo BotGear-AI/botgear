@@ -43,7 +43,13 @@ exit_on_phrase:
     - terminate workflow
   case_insensitive: true
   whole_message: true
-  listen_topic: /chat/+/inbox
+  # A list — any of the `messaging`-capability providers (see
+  # docs/TODO_MESSAGING.md) may be the one actually running.
+  listen_topic:
+    - /chat/+/inbox
+    - /discord/+/inbox
+    - /slack/+/inbox
+    - /google_chat/+/inbox
 
 # E2 — short-circuit re-dispatch of chat.listen when it times out
 # without an utterance. The engine re-listens silently until the

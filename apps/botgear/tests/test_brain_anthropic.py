@@ -117,6 +117,22 @@ def test_encode_tools_action_names_with_input_schema():
     assert decode["do_it"].topic == "/x/x-1/control"
 
 
+def test_encode_tools_falls_back_to_proxy_qualified_on_collision():
+    """Three proxies of the same type exposing the same action (e.g.
+    three tasmota switches' power_set) — only the first keeps the bare
+    name; the rest get <proxy_id>_<action>, not opaque indices (see
+    docs/TODO_BRAIN_GAP_FIXES.md Gap 1)."""
+    tools = [
+        ToolDescriptor(topic="/tasmota/office-cord/control", action="power_set"),
+        ToolDescriptor(topic="/tasmota/sonoff-cord/control", action="power_set"),
+        ToolDescriptor(topic="/tasmota/sonoff-office-light/control", action="power_set"),
+    ]
+    encoded, decode = _encode_tools(tools)
+    names = [e["name"] for e in encoded]
+    assert names == ["power_set", "sonoff-cord_power_set", "sonoff-office-light_power_set"]
+    assert decode["sonoff-cord_power_set"].topic == "/tasmota/sonoff-cord/control"
+
+
 def test_parse_response_tool_use_block():
     """A tool_use content block → ProposedAction(kind=tool)."""
     decode = {"tool_000": ToolDescriptor(topic="/x/x-1/control", action="do_it")}

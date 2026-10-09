@@ -12,8 +12,9 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from pydantic import BaseModel, Field
 from rlx_bus import (
     ServiceConfig,
     SubprocessService,
@@ -76,18 +77,43 @@ logger = logging.getLogger(__name__)
 # is currently using.
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class ArduinoState(BaseModel):
+    """Retained on ``/arduino/{id}/state`` — connection + pin snapshot."""
+    connected: bool
+    port: Optional[str]
+    ports: List[Dict[str, Any]] = Field(description="rlx_bus.list_serial_ports(): {device, description, hwid, holders, available}")
+    firmata_version: Optional[str]
+    firmware_name: Optional[str]
+    firmware_version: Optional[str]
+    pins: Dict[str, Dict[str, Any]] = Field(description="Pin label ('6', 'A0') -> {mode, value, ...} as last seen")
+    polling: Dict[str, int] = Field(description="Streaming pin label -> sampling interval ms")
+    sampling_interval_ms: int
+    differential: int
+    board_pins: List[str] = Field(description="Pin labels this board has (from its Firmata analog map); empty if unrecognised")
+    last_port: Optional[str]
+    last_baud: int
+    autoreconnect: bool
+    connect_error: Optional[str] = Field(description="Last connect attempt's error; None on success")
+
+
+class PinPayload(BaseModel):
+    """Published on ``/arduino/{id}/pin/{label}`` — streamed (with
+    ``ts``) while a pin is being polled, and after every read/write."""
+    value: Optional[Union[int, float]] = Field(description="Digital 0/1, analog counts, PWM 0..255, or servo angle")
+    ts: Optional[float] = Field(None, description="Present on streamed samples")
+
+
+class SonarPayload(BaseModel):
+    """Published on ``/arduino/{id}/sonar/{trigger_pin}`` after a read."""
+    distance_cm: Optional[float]
+
+
 class ArduinoService(SubprocessService):
-    """Bus-facing wrapper around the pymata4 board.
-
-    Topic layout (inherited from SubprocessService's namespace
-    convention, with this service's ``type_name='arduino'``):
-
-        /arduino/{id}/state        retained — connection + pin snapshot
-        /arduino/{id}/heartbeat    1Hz, automatic via base class
-        /arduino/{id}/control      incoming actions
-        /arduino/{id}/pin/{N}      per-pin value updates
-        /arduino/{id}/sonar/{N}    sonar distance updates
-    """
+    """Bus-facing wrapper around the pymata4 board. Wire shape is
+    declared by the models above (``state_schema``/``topic_schemas``);
+    per-pin and sonar topics are templated suffixes."""
 
     type_name = "arduino"
     heartbeat_interval_s = 1.0   # base class publishes /arduino/{id}/heartbeat
@@ -96,6 +122,9 @@ class ArduinoService(SubprocessService):
     # transient enumeration miss; ~2-3s to flip the UI red on a real unplug.
     _MISSING_LIMIT = 2
     config_class = ArduinoConfig
+    publishes = ["state"]
+    state_schema = ArduinoState
+    topic_schemas = {"pin/{label}": PinPayload, "sonar/{trigger_pin}": SonarPayload}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -218,7 +247,7 @@ class ArduinoService(SubprocessService):
                 batch, self._pin_pending = self._pin_pending, {}   # await-free swap
                 for label, (value, ts) in batch.items():
                     try:
-                        await self.bus.publish(self.pin_topic(label), {"value": value, "ts": ts})
+                        await self.bus.publish(self.pin_topic(label), PinPayload(value=value, ts=ts).model_dump())
                     except Exception:  # noqa: BLE001 — one bad publish must not kill the drain
                         logger.exception("arduino %s: pin publish(%s) failed", self.proxy_id, label)
         except asyncio.CancelledError:
@@ -339,35 +368,30 @@ class ArduinoService(SubprocessService):
 
     # ─── state ───────────────────────────────────────────────────────
     def _snapshot(self, ports: list) -> Dict[str, Any]:
-        return {
-            "connected": self.board.connected,
-            "port": self.board.port if self.board.connected else None,
-            "ports": ports,
-            "firmata_version": self._info.get("firmata_version"),
-            "firmware_name": self._info.get("firmware_name"),
-            "firmware_version": self._info.get("firmware_version"),
+        state = ArduinoState(
+            connected=self.board.connected,
+            port=self.board.port if self.board.connected else None,
+            ports=ports,
+            firmata_version=self._info.get("firmata_version"),
+            firmware_name=self._info.get("firmware_name"),
+            firmware_version=self._info.get("firmware_version"),
             # Build from a snapshot copy — an executor-thread manual read/write
             # may add a key concurrently.
-            "pins": dict(list(self.board.pins.items())),
-            "polling": dict(self.config.pin_polls or {}),
-            "sampling_interval_ms": self.config.sampling_interval_ms,
-            "differential": self.config.differential,
-            # Pin labels this board actually has (discovered from its Firmata
-            # analog map) — the UI offers these as a typeahead picklist, and
-            # falls back to free-form entry when empty (board not recognised).
-            "board_pins": list(self.board.available_pins),
-            # Persisted config — UI uses last_port to pre-select the
-            # dropdown on next session.
-            "last_port": self.config.last_port,
-            "last_baud": self.config.last_baud,
-            # Desired connection state (drives auto-reconnect on start).
-            "autoreconnect": self.config.autoreconnect,
-            # Last connect attempt's error string, or None if the most
-            # recent attempt succeeded / no attempts yet. Always
-            # included in /state so a successful connect publishes
-            # explicit None and clears any stale red banner in the UI.
-            "connect_error": self._connect_error,
-        }
+            pins=dict(list(self.board.pins.items())),
+            polling=dict(self.config.pin_polls or {}),
+            sampling_interval_ms=self.config.sampling_interval_ms,
+            differential=self.config.differential,
+            # Pin labels this board actually has — the UI offers these as a
+            # typeahead picklist, free-form entry when empty.
+            board_pins=list(self.board.available_pins),
+            last_port=self.config.last_port,
+            last_baud=self.config.last_baud,
+            autoreconnect=self.config.autoreconnect,
+            # Always included so a successful connect publishes explicit
+            # None and clears any stale red banner in the UI.
+            connect_error=self._connect_error,
+        )
+        return state.model_dump()
 
     async def publish_state(self) -> None:
         ports = await self._ports()
@@ -491,13 +515,13 @@ class ArduinoService(SubprocessService):
     async def m_digital_write(self, pin, value: int) -> Dict[str, Any]:
         await self.board.digital_write(pin, int(value))
         v = int(bool(value))
-        await self.bus.publish(self.pin_topic(pin), {"value": v})
+        await self.bus.publish(self.pin_topic(pin), PinPayload(value=v).model_dump(exclude_none=True))
         return {"pin": self.board.canon(pin), "value": v}
 
     @service_method("digital_read")
     async def m_digital_read(self, pin) -> Dict[str, Any]:
         v = await self.board.digital_read(pin)
-        await self.bus.publish(self.pin_topic(pin), {"value": v})
+        await self.bus.publish(self.pin_topic(pin), PinPayload(value=v).model_dump(exclude_none=True))
         return {"pin": self.board.canon(pin), "value": v}
 
     @service_method("analog_read")
@@ -505,14 +529,14 @@ class ArduinoService(SubprocessService):
         _, num = self.board._split(pin)
         label = f"A{num}"                       # analog reads live under the A<n> label
         v = await self.board.analog_read(pin)
-        await self.bus.publish(self.pin_topic(label), {"value": v})
+        await self.bus.publish(self.pin_topic(label), PinPayload(value=v).model_dump(exclude_none=True))
         return {"pin": label, "value": v}
 
     @service_method("analog_write")
     async def m_analog_write(self, pin, value: int) -> Dict[str, Any]:
         v = max(0, min(255, int(value)))
         await self.board.analog_write(pin, v)
-        await self.bus.publish(self.pin_topic(pin), {"value": v})
+        await self.bus.publish(self.pin_topic(pin), PinPayload(value=v).model_dump(exclude_none=True))
         return {"pin": self.board.canon(pin), "value": v}
 
     @service_method("release_pin", publishes=["state"])
@@ -707,7 +731,7 @@ class ArduinoService(SubprocessService):
         """Drive a servo to ``angle`` degrees (0..180)."""
         angle = max(0, min(180, int(angle)))
         await self.board.servo_write(pin, angle)
-        await self.bus.publish(self.pin_topic(pin), {"value": angle})
+        await self.bus.publish(self.pin_topic(pin), PinPayload(value=angle).model_dump(exclude_none=True))
         return {"pin": self.board.canon(pin), "angle": angle}
 
     @service_method("servo_detach")
@@ -728,5 +752,5 @@ class ArduinoService(SubprocessService):
     @service_method("sonar_read")
     async def m_sonar_read(self, trigger_pin: int) -> Dict[str, Any]:
         d = await self.board.sonar_read(int(trigger_pin))
-        await self.bus.publish(self.sonar_topic(int(trigger_pin)), {"distance_cm": d})
+        await self.bus.publish(self.sonar_topic(int(trigger_pin)), SonarPayload(distance_cm=d).model_dump())
         return {"trigger": int(trigger_pin), "distance_cm": d}

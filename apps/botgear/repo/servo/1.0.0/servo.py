@@ -30,10 +30,12 @@ robot_kinematics / ik_solver are the reference VIRTUAL implementations.
 Any service that declares ``implements: [servo_controller]`` in its package.yml
 must accept these actions on its control topic.
 
-Bus topics published by this service
-------------------------------------
-  /servo/{id}/state    retained — full snapshot of attach + angle
-  /servo/{id}/control  incoming actions (attach/detach/write/sweep)
+Wire shape for what this service PUBLISHES on its own topics
+(``state``, ``motion_events``) is declared below via ``ServoState`` /
+``MotionEventPayload`` + ``state_schema``/``topic_schemas`` —
+introspected into ``/runtime/runtime/types/servo``. ``control`` actions
+(attach/detach/write/sweep/...) are discoverable the same way, off
+their @service_method signatures.
 
 NOTE: This module deliberately does NOT use ``from __future__ import
 annotations``. ServoConfig uses ``Optional[...]`` fields, and Pydantic
@@ -49,7 +51,7 @@ from typing import Any, Dict, Optional
 
 from typing import List
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -193,11 +195,50 @@ class ServoConfig(ServiceConfig):
         return data
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class ServoState(BaseModel):
+    """Retained on ``/servo/{id}/state`` — full snapshot of attach + angle."""
+    controllers: List[ControllerBinding]
+    controller_type: Optional[str] = Field(description="(legacy) mirrors controllers[0]")
+    controller_id: Optional[str] = Field(description="(legacy) mirrors controllers[0]")
+    pin: Optional[int] = Field(description="(legacy) mirrors controllers[0]")
+    angle: int = Field(description="Commanded target angle")
+    current_angle: int = Field(description="Live angle, tracks interpolation mid-move")
+    moving: bool
+    sweeping: bool
+    speed_control_enabled: bool
+    speed_deg_per_s: int
+    min_angle: int
+    max_angle: int
+    attached: bool = Field(description="Operator intent AND at least one controller bound")
+
+
+class MotionEventPayload(BaseModel):
+    """Published (non-retained) on ``/servo/{id}/motion_events`` —
+    one ``started`` and one matching ``ended`` per non-zero move. The
+    ``source``/``from``/``to``/``speed_deg_per_s`` tuple is identical on
+    both so consumers can pair them."""
+    model_config = ConfigDict(populate_by_name=True)
+    event: str = Field(description="'started' | 'ended'")
+    ts: float
+    source: str = Field(description="What initiated the move, e.g. 'write' or 'sweep'")
+    from_: int = Field(alias="from")
+    to: int
+    speed_deg_per_s: int
+    interpolated: bool
+    estimated_duration_s: float
+    actual_duration_s: Optional[float] = Field(None, description="'ended' only")
+    cancelled: Optional[bool] = Field(None, description="'ended' only")
+
+
 class ServoService(Service):
     """In-process servo positioner. See module docstring for the wire
     contract any servo_controller must implement."""
 
     config_class = ServoConfig
+    state_schema = ServoState
+    topic_schemas = {"motion_events": MotionEventPayload}
     # Always-on topics declared at the class level. The Composer's
     # Topics tab and the Topology page read this so the user can see
     # what this service-type emits without running an instance.
@@ -594,26 +635,27 @@ class ServoService(Service):
 
     def _snapshot(self) -> Dict[str, Any]:
         cur = self._current_angle if self._current_angle is not None else self.config.angle
-        return {
-            "controllers": [b.model_dump() for b in self.config.controllers],
-            "controller_type": self.config.controller_type,
-            "controller_id": self.config.controller_id,
-            "pin": self.config.pin,
-            "angle": self.config.angle,
-            "current_angle": int(cur),
-            "moving": bool(self._moving),
-            "sweeping": bool(self._sweep_task is not None and not self._sweep_task.done()),
-            "speed_control_enabled": bool(self.config.speed_control_enabled),
-            "speed_deg_per_s": self.config.speed_deg_per_s,
-            "min_angle": self.config.min_angle,
-            "max_angle": self.config.max_angle,
+        state = ServoState(
+            controllers=list(self.config.controllers),
+            controller_type=self.config.controller_type,
+            controller_id=self.config.controller_id,
+            pin=self.config.pin,
+            angle=self.config.angle,
+            current_angle=int(cur),
+            moving=bool(self._moving),
+            sweeping=bool(self._sweep_task is not None and not self._sweep_task.done()),
+            speed_control_enabled=bool(self.config.speed_control_enabled),
+            speed_deg_per_s=self.config.speed_deg_per_s,
+            min_angle=self.config.min_angle,
+            max_angle=self.config.max_angle,
             # ``attached`` = operator intent AND the config is sufficient
             # to act on it. The Basic view's toggle reads this; a servo
             # that's been detached but still has its controller config
             # reports attached=False AND emits controller_id/pin so the
             # UI can offer a no-arg re-attach.
-            "attached": bool(self.config.attached and self.config.controllers),
-        }
+            attached=bool(self.config.attached and self.config.controllers),
+        )
+        return state.model_dump()
 
     async def _cancel_motion(self) -> None:
         """Cancel + wait for the in-flight motion task. Idempotent."""
@@ -665,8 +707,8 @@ class ServoService(Service):
         back into the motion loop (we'd rather miss an event than
         crash the run)."""
         try:
-            payload: Dict[str, Any] = {"event": event, "ts": time.time(), **fields}
-            self.publish("motion_events", payload, retained=False)
+            payload = MotionEventPayload(event=event, ts=time.time(), **fields)
+            self.publish("motion_events", payload.model_dump(by_alias=True, exclude_none=True), retained=False)
         except Exception:  # noqa: BLE001
             logger.exception("servo %s: motion_event publish failed", self.proxy_id)
 

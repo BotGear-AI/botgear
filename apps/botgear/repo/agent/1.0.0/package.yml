@@ -1,0 +1,27 @@
+name: agent
+title: Agent
+description: |
+  Runs checked, minutes-scale agent work on the live robot — e.g. a robot
+  health report — on a rented agent (Claude Code) through
+  packages/agent_harness. The agent reaches the robot only through
+  botgear's MCP gateway, and each workflow's checks verify its claims
+  against the robot before a run counts as completed.
+  In-process service. Bundled workflows live in content/ next to this
+  file; per-instance workflows, skills and run workspaces under
+  ``<data_dir>/agent/<proxy-id>/``. See README.md.
+language: builtin
+status: development
+author: CloudSeeder
+tags: [ai, agent, workflow]
+icon: icon.svg
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+bundled: true
+publish: true
+install:
+  kind: builtin
+entry:
+  in_process:
+    module: agent_runner
+    class: AgentService

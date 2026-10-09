@@ -20,7 +20,7 @@ author: CloudSeeder
 tags: [ros, ros2, urdf, xacro, kinematics, import]
 icon: icon.svg
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md). Add a
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section). Add a
 # ui/ bundle later; the export actions are bus-callable without one.
 
 # Heavy/optional deps + niche use → not shipped in the base binary. Install

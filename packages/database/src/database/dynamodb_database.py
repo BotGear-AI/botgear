@@ -82,6 +82,33 @@ class DynamoDBDatabase(DatabaseAdapter):
         except (BotoCoreError, ClientError) as e:
             raise RuntimeError(f"DynamoDB get failed: {e}")
 
+    def get_binary_item(self, table: str, key: str) -> bytes:
+        """Retrieve the binary payload of an item, or b"" when there is none.
+
+        Mirrors MongoDBDatabase.get_binary_item: the bytes live in a "data"
+        attribute on the item rather than being the item itself, because
+        DynamoDB has no object body to read. boto3 hands a Binary attribute
+        back as a boto3.dynamodb.types.Binary wrapper, so unwrap it.
+        """
+        item = self.get_item(table, key)
+        data = item.get("data") if item else None
+        if data is None:
+            return b""
+        return bytes(data.value) if hasattr(data, "value") else bytes(data)
+
+    def search_by_key_part(self, table: str, key_part: str, regex: bool = False) -> List[Dict[str, Any]]:
+        """Find items whose "id" starts with key_part, or matches it as a regex.
+
+        Same contract as S3Database.search_by_key_part, including skipping items
+        that carry no "id". DynamoDB cannot filter on a key prefix server-side
+        without a sort key, so this scans and filters client-side.
+        """
+        items = self.get_all_items(table)
+        if regex:
+            pattern = re.compile(key_part)
+            return [i for i in items if "id" in i and pattern.search(str(i["id"]))]
+        return [i for i in items if "id" in i and str(i["id"]).startswith(key_part)]
+
     def get_all_items(self, table: str) -> list:
         """Retrieve all items from a DynamoDB table (fully-paginated scan).
 
@@ -221,13 +248,18 @@ class DynamoDBDatabase(DatabaseAdapter):
         # Create a dictionary from columns and values
         item = dict(zip(columns, values))
         
-        # Ensure we have an id field for DynamoDB
+        # Ensure we have an id field for DynamoDB. The coerced string is written back onto the
+        # item, not just kept in `key`: ensure_table declares id as AttributeType 'S' with
+        # KeyType 'HASH', so a non-string id (an int, say) serializes as a Number and DynamoDB
+        # rejects the put with "Type mismatch for key id expected: S actual: N". It also keeps
+        # the IGNORE probe below -- which looks up Key={'id': key} -- addressing the same row
+        # the put writes, rather than the two disagreeing about the key.
         if 'id' not in columns:
             key = str(uuid.uuid4())
-            item['id'] = key
         else:
             key = str(item['id'])
-        
+        item['id'] = key
+
         try:
             table_ref = self._get_table(table)
             
@@ -243,9 +275,14 @@ class DynamoDBDatabase(DatabaseAdapter):
             elif conflict_strategy not in ["IGNORE", "REPLACE"]:
                 logger.warning(f"Unsupported conflict strategy '{conflict_strategy}' for DynamoDBDatabase, using IGNORE")
             
-            # Serialize and insert the item
-            serialized_item = self._serialize_item(item)
-            table_ref.put_item(Item=serialized_item)
+            # Put the plain dict, NOT _serialize_item(item). _get_table returns a
+            # boto3 *resource* Table, which serializes to DynamoDB wire format
+            # itself; handing it an already-serialized item makes every value a
+            # Map and the put fails with "Type mismatch for key id expected: S
+            # actual: M". insert_item hit the same thing and its
+            # _serialize_item call is commented out one method above; this one
+            # was never fixed, so insert_columns raised on every call.
+            table_ref.put_item(Item=item)
             logger.debug(f"Inserted item with key {key} into table {table}")
             
         except (BotoCoreError, ClientError) as e:

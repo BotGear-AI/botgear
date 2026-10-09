@@ -9,6 +9,9 @@
                                 re-read one service's yml + apply it live
   POST /v1/system/restart       graceful drain + re-exec
   POST /v1/system/shutdown      graceful drain + exit (no re-exec)
+  GET  /v1/system/halt          current runtime-wide HALT status
+  POST /v1/system/halt          broadcast a HALT (any signed-in user)
+  POST /v1/system/resume        lift a HALT (any signed-in user)
 
 Restart re-execs the backend with its recorded launch command (see
 runtime/system.py) so config-set switches / upgrades can be applied from the
@@ -21,6 +24,7 @@ from typing import Any, Dict
 from auth import create_auth_dependencies
 from config import create_app_settings
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 
 from botgear.models.config import Config
 from botgear.runtime import system
@@ -30,6 +34,51 @@ auth_deps = create_auth_dependencies(config_provider)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ─── runtime-wide HALT (see runtime/halt.py + rlx_bus.halt) ─────────────
+# Halt + resume deliberately accept ANY authenticated caller, not just
+# Admin: a stop must never be blocked by a role check, and the operator
+# who stopped the robot must be able to start it again.
+
+
+class HaltRequest(BaseModel):
+    level: str = Field("stop", description="'stop' (silence + idle conversation) or 'emergency' (also stop motion)")
+    reason: str = Field("", description="Free-text note recorded with the halt")
+
+
+class ResumeRequest(BaseModel):
+    reason: str = Field("", description="Free-text note recorded with the resume")
+
+
+def _caller_name(user: Any) -> str:
+    if isinstance(user, dict):
+        return str(user.get("email") or user.get("id") or user.get("name") or "user")
+    return "user"
+
+
+@router.get("/system/halt")
+def get_system_halt(_: Any = Depends(auth_deps.get_current_user_or_service)) -> Dict[str, Any]:
+    from botgear.runtime import halt
+    return halt.state()
+
+
+@router.post("/system/halt")
+def post_system_halt(
+    body: HaltRequest = HaltRequest(),
+    user: Any = Depends(auth_deps.get_current_user_or_service),
+) -> Dict[str, Any]:
+    from botgear.runtime import halt
+    return halt.request_halt(body.level, source=f"ui:{_caller_name(user)}", reason=body.reason or "Stop button")
+
+
+@router.post("/system/resume")
+def post_system_resume(
+    body: ResumeRequest = ResumeRequest(),
+    user: Any = Depends(auth_deps.get_current_user_or_service),
+) -> Dict[str, Any]:
+    from botgear.runtime import halt
+    return halt.request_resume(source=f"ui:{_caller_name(user)}", reason=body.reason)
 
 
 @router.get("/system/info")

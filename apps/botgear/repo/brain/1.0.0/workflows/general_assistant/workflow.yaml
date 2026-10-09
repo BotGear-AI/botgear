@@ -1,0 +1,113 @@
+description: |
+  A general-purpose conversational assistant with broad, default-allow
+  access instead of a hand-enumerated per-action allowlist: anything
+  live on the bus is reachable UNLESS explicitly blocked. The block
+  list is the shared hardware-danger excludes (movement / arm / system
+  / video / sabertooth / motor_control — see
+  botgear/agent_surface/excludes.py) PLUS this workflow's own block
+  on brain's self-control actions (start_workflow, cancel, approve,
+  backend credential management, clear_runs, ...) — see
+  allowed_tools.yaml for why those specifically.
+
+  Built to answer "what can you do / what do you have" style questions
+  by actually calling the relevant list_*/get_* actions live instead of
+  guessing, and to carry out simple configuration changes (e.g. "change
+  voice to Alan") by discovering the live options first — no
+  hand-written allowlist entry needed per capability per device, unlike
+  conversation_session/conversation_servo/mic_switch_control. Same
+  listen-respond-speak loop shape as those workflows: audio in via
+  stt_local.listen, audio out via speech_local.speak; chat-style
+  channels (chat/discord/slack/google_chat) also work if running.
+
+  This is the first workflow using default_policy: allow — see the
+  brain safety-gate design discussion this came out of for the
+  tradeoffs (default-allow means a NEW service added later is
+  reachable-by-default unless the shared excludes file is updated —
+  the opposite of every other workflow's safety posture). Expect the
+  live tool catalog exposed to the model to be large (effectively the
+  whole bus, minus excludes) and to grow as more services come online —
+  measured ~6900 tokens for tool definitions alone against the current
+  (small, 7-topic) set of live services, which is why ollama_num_ctx
+  was raised to 32768 (from 8192) specifically to give this workflow
+  room; qwen3:8b supports up to 40960.
+
+preferred_backend: ollama
+preferred_model: qwen3:8b
+# Same proven choice as every other workflow on this instance (see
+# conversation_session's workflow.yaml for the original reasoning —
+# smaller models were observed silently falling back to plain-text
+# replies instead of tool calls on later turns).
+
+lazy_tools: true
+# Progressive disclosure — the whole reason this matters here: with
+# default_policy: allow, the live catalog is ~100 actions / ~6900
+# tokens today and grows with every service that starts, which eats
+# straight into conversation history inside a fixed context window.
+# With lazy_tools, only the prefixes below (+ brain, always) are fully
+# loaded up front; everything else is a one-line entry in context
+# until the model calls describe_capability(capability=<name>) for it.
+always_loaded_prefixes:
+  - stt
+  - speech
+  - chat
+  - discord
+  - slack
+  - google_chat
+  - runtime
+# These are the conversation-I/O capability this workflow's own
+# listen/respond loop structurally needs every single turn — lazily
+# hiding them would mean the model has to "discover" how to talk
+# before it can talk at all. runtime (get_time, get_info, get_power,
+# get_system_state, list_services — read-only, argless, cheap) answers
+# the everyday "what time is it / how's your battery" questions without
+# a discovery round trip. Everything else (tasmota, microphone,
+# network_scanner, speaker, ...) starts lazy.
+
+max_steps: 500
+timeout_seconds: 86400
+requires_human_approval: false
+# Same reasoning as the other conversational workflows: a human-click
+# gate on every tool call defeats the point of a voice assistant. The
+# shared excludes + this workflow's own brain-self-control block are
+# the actual safety boundary here, not a human in the loop per call.
+
+exit_on_phrase:
+  matches:
+    - goodbye
+    - good by     # STT often splits it: "GOOD BY", "good bye" (substring match)
+  case_insensitive: true
+  whole_message: false
+  # Audio (stt_local publishes every transcript, partial+final, to
+  # /stt/{id}/text — see mic_switch_control for the same mechanism)
+  # plus every messaging-capability inbox, so this works whichever
+  # conversation channel is actually live.
+  listen_topic:
+    - /stt/+/text
+    - /chat/+/inbox
+    - /discord/+/inbox
+    - /slack/+/inbox
+    - /google_chat/+/inbox
+
+loop_on_timeout:
+  tool: listen
+  field: timeout
+  value: true
+
+inputs:
+  listen_window_seconds:
+    type: integer
+    required: false
+    default: 8
+    description: |
+      How long stt_local listens for each turn before returning a
+      timeout (handled by loop_on_timeout — silently re-listens, no LLM
+      round trip, no step consumed).
+
+steps:
+  - id: default
+    prompt: prompt.md
+    on_success: success.md
+    on_failure: failure.md
+
+context:
+  - memory/general_assistant.md

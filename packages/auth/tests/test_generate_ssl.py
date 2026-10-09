@@ -1,8 +1,18 @@
+import importlib
 import os
 import tempfile
-import shutil
-import pytest
+
+import auth.generate_ssl as generate_ssl_module
 from auth.generate_ssl import generate_self_signed_cert
+
+
+def test_import_does_not_generate_certificate(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("certificate generation must not run during import")
+
+    monkeypatch.setattr(generate_ssl_module.os, "makedirs", fail_if_called)
+    importlib.reload(generate_ssl_module)
+
 
 def test_generate_self_signed_cert_creates_files():
     with tempfile.TemporaryDirectory() as tmpdir:

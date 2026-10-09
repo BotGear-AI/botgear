@@ -119,6 +119,21 @@ def _walk_config(
                 _add(out, source=owner[1], topic=topic, target=consumer_id,
                      sink=ctx, kind="input", origin="declared")
 
+        # Flat audio-consumer binding: rlx_audio's AudioDeviceServiceBase
+        # descendants (SttServiceBase / SpeakerServiceBase — e.g. a
+        # microphone→stt or microphone→speaker attach) name their source
+        # via a sibling ``input_kind``/``input_ref`` pair rather than
+        # nesting it under a "topic" key, so the generic check above
+        # never sees it. Recognized the same way: input_kind == "topic"
+        # names the source topic in input_ref.
+        if node.get("input_kind") == "topic":
+            input_ref = node.get("input_ref")
+            if _looks_like_topic(input_ref):
+                owner = _proxy_from_topic(input_ref)
+                if owner and owner[1] in known and owner[1] != consumer_id:
+                    _add(out, source=owner[1], topic=input_ref, target=consumer_id,
+                         sink=ctx, kind="input", origin="declared")
+
         for v in node.values():
             _walk_config(v, consumer_id, known, out, ctx)
     elif isinstance(node, list):

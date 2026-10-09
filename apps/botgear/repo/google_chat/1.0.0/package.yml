@@ -1,0 +1,56 @@
+name: google_chat
+title: Google Chat
+description: |
+  Google Chat integration implementing the ``messaging`` capability
+  (see docs/TODO_MESSAGING.md) — SEND-ONLY in this version.
+  ``speak()``/``send()``-via-outbound work; ``listen()`` always returns
+  ``timeout: true`` (never raises) because this integration has no way
+  to receive messages. ``state.capabilities.listen`` is ``false`` so a
+  consumer can feature-detect this rather than hang.
+
+  Why send-only: real bidirectional Google Chat needs either a Pub/Sub
+  subscription or a publicly-reachable HTTPS endpoint Google calls
+  directly — both need a real Google Cloud project + (for the HTTP
+  option) a public DNS name, neither of which a robot laptop on a home
+  LAN has. An INCOMING WEBHOOK needs none of that: one Chat space
+  member clicks "Apps & integrations -> Manage webhooks", pastes a
+  name, and gets back a URL — paste that URL here as ``webhook_url``.
+  Full bidirectional Google Chat is a documented future phase, not
+  blocked by this integration.
+
+  ``webhook_url`` is bearer-equivalent (anyone holding it can post to
+  the space) — stored as a Pydantic ``SecretStr`` (encrypted at rest,
+  masked on any bus/API egress) same as the token fields on
+  discord/slack.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [messaging, google_chat, chat, brain]
+icon: icon.svg
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+implements: [messaging]
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/google_chat/1.0.0"
+
+entry:
+  argv: [python, -m, google_chat_service]
+
+wizard_config:
+  - id: auth
+    title: Webhook
+    fields:
+      - id: webhook_url
+        type: password
+        title: Incoming webhook URL
+        description: "From the target Chat space: Apps & integrations -> Manage webhooks. Send-only — see this service's description for why."
+        default: ""

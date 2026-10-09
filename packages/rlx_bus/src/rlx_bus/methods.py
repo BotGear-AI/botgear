@@ -50,6 +50,19 @@ class MethodInfo:
     no auto-publish; ``"last"`` → publish to
     ``/{type}/{id}/return/{name}`` with ``retained=True``; ``"event"``
     → publish to the same topic non-retained.
+
+    ``args_schema`` — optional hand-written JSON Schema for this
+    method's arguments (``{"type": "object", "properties": {...}}``).
+    Subprocess services can't get real type-hint-derived schemas the
+    way in-process services do (``types_index.py::introspect_methods``
+    needs to ``import`` the class, impossible cross-venv) — every
+    subprocess method's schema is ``{}`` otherwise, which starves a
+    brain tool call of any argument guidance. See
+    docs/TODO_BRAIN_GAP_FIXES.md Gap 6 for the concrete failure this
+    caused (a model both hallucinating a phantom argument and guessing
+    a wrong default). This is a narrow, opt-in escape hatch, not real
+    introspection — pass it explicitly on methods a brain workflow
+    needs to call reliably.
     """
 
     name: str
@@ -57,6 +70,7 @@ class MethodInfo:
     attr: Optional[str] = None
     publishes: List[str] = field(default_factory=list)
     publish_return: Optional[str] = None
+    args_schema: Optional[dict] = None
 
 
 def service_method(
@@ -64,6 +78,7 @@ def service_method(
     *,
     publishes: Optional[List[str]] = None,
     publish_return: Optional[str] = None,
+    args_schema: Optional[dict] = None,
 ) -> Callable[[Callable[..., object]], Callable[..., object]]:
     """Mark a Service method as callable through the service interface.
 
@@ -99,6 +114,7 @@ def service_method(
             doc=(fn.__doc__ or "").strip() or None,
             publishes=list(publishes or []),
             publish_return=publish_return,
+            args_schema=args_schema,
         )
         setattr(fn, _SERVICE_METHOD_ATTR, info)
         return fn
@@ -138,6 +154,7 @@ def collect_methods(instance: object) -> List[MethodInfo]:
             attr=attr,
             publishes=list(info.publishes),
             publish_return=info.publish_return,
+            args_schema=info.args_schema,
         ))
     found.sort(key=lambda m: m.name)
     return found

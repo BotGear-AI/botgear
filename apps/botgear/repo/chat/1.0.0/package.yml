@@ -19,7 +19,13 @@ author: CloudSeeder
 tags: [chat, conversation, builtin, brain]
 icon: icon.svg
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md).
+# messaging capability — see docs/TODO_MESSAGING.md. discord/slack/
+# google_chat implement the same wire contract (listen/speak/send/
+# list_channels), so any of them can stand in for chat in a brain
+# workflow.
+implements: [messaging]
+
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section).
 ui:
   entry: ui/dist/ui.js
   sdk: "^1.0"

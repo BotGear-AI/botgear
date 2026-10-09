@@ -83,6 +83,54 @@ async def test_connect_is_idempotent(fresh_bus, fake_peer):
     assert pc1 is pc2
 
 
+@pytest.mark.asyncio
+async def test_connect_without_secret_uses_shared_jwt(fresh_bus, fake_peer):
+    """Default (no secret) — Option A, reported as 'shared_secret' in
+    the snapshot, auth_param defaults to 'token'."""
+    pc = peer_manager.connect(f"ws://127.0.0.1:{fake_peer.port}")
+    assert pc.auth_param == "token"
+    assert peer_manager.peer_secret(pc.url) is None
+    for _ in range(40):
+        if pc.remote_id is not None:
+            break
+        await asyncio.sleep(0.05)
+    snap = peer_manager.peers()
+    assert snap["silly-droid"]["auth"] == "shared_secret"
+
+
+@pytest.mark.asyncio
+async def test_connect_with_secret_uses_option_b(fresh_bus, fake_peer):
+    """A supplied secret switches to Option B: auth_param='api_key',
+    the secret is used directly as the credential (no JWT minting),
+    stored for persistence, and surfaced in the snapshot."""
+    url = f"ws://127.0.0.1:{fake_peer.port}"
+    pc = peer_manager.connect(url, secret="peer-specific-secret")
+    assert pc.auth_param == "api_key"
+    assert peer_manager.peer_secret(url) == "peer-specific-secret"
+    for _ in range(40):
+        if pc.remote_id is not None:
+            break
+        await asyncio.sleep(0.05)
+    snap = peer_manager.peers()
+    assert snap["silly-droid"]["auth"] == "api_key"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_forgets_secret(fresh_bus, fake_peer):
+    url = f"ws://127.0.0.1:{fake_peer.port}"
+    pc = peer_manager.connect(url, secret="peer-specific-secret")
+    for _ in range(40):
+        if pc.remote_id is not None:
+            break
+        await asyncio.sleep(0.05)
+    assert pc.remote_id == "silly-droid"
+    # Disconnect by remote_id — what the real caller (peer_service's
+    # disconnect action, keyed off the snapshot's "key" field) uses
+    # once a peer has identified.
+    await peer_manager.disconnect(pc.remote_id)
+    assert peer_manager.peer_secret(url) is None
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Outbound: local publish → peer
 # ─────────────────────────────────────────────────────────────────────

@@ -41,7 +41,7 @@ def create_registration(item: Registration, user: dict, request: Request):
 
 # read - get all items
 def get_all_registration(user: dict, request: Request):
-    logger.info("===============get_all_registration called==============")
+    logger.debug("===============get_all_registration called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("registration")
@@ -49,18 +49,20 @@ def get_all_registration(user: dict, request: Request):
 
 # read - get an item
 def get_registration(id: str, user: dict, request: Request):
-    logger.info("===============get_registration called==============")
-    logger.info(f"Received request to retrieve registration with id: {id}")
+    logger.debug("===============get_registration called==============")
+    logger.debug(f"Received request to retrieve registration with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("registration", id)
     return item
 
 # read - get_path an item
 def get_path_registration(path: str, user: dict, request: Request):
-    logger.info("===============get_registration called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_registration called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("registration", path)
     return item
@@ -90,6 +92,7 @@ def delete_registration(id: str, user: dict, request: Request):
     logger.info("===============delete_registration called==============")
     logger.info(f"Received request to delete registration with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("registration", id)
         if not item:

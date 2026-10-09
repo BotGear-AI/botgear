@@ -14,6 +14,12 @@ export {
   useApiFetch,
   useActiveRuntime,
 } from '../contexts/ActiveRuntimeContext'
+// Every known runtime connection (not just the active one) — lets a
+// service view discover + address instances of another service type
+// running on a DIFFERENT connected runtime (e.g. motor_control binding
+// a channel to a joystick that lives on a peered runtime).
+export { useRuntimeConnections } from '../contexts/RuntimeConnectionsContext'
+export type { RuntimeConnection } from '../runtime/RuntimeConnection'
 // Request/reply hook (spinner + result state) used by attach/connect views.
 export { useServiceRequest } from '../runtime/useServiceRequest'
 export type { ServiceProxy } from '../models/ServiceProxy'
@@ -25,6 +31,8 @@ export type { InboundFrame, WsClient } from '../runtime/wsClient'
 export { Panel } from './Panel'
 export { KeymapEditor } from './KeymapEditor'
 export type { KeyBinding, KeymapEditorProps } from './KeymapEditor'
+export { MicrophoneSourcePicker, useMicrophoneOptions } from './MicrophoneSourcePicker'
+export type { MicrophoneOption } from './MicrophoneSourcePicker'
 export { NumberInput } from '../components/NumberInput'
 export { ConfirmDialog } from '../components/ConfirmDialog'
 export { PromptDialog } from '../components/PromptDialog'

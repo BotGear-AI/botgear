@@ -2,7 +2,8 @@
 """Tests for runtime/identity.py — step 1 of multi-runtime federation.
 
 Covers:
-  * generate_id() yields adjective-noun shape
+  * generate_id() defaults to the sanitized machine hostname, falling
+    back to an adjective-noun pair when the hostname won't sanitize
   * is_valid_id() format check (per the @<id> topic suffix grammar)
   * resolve_runtime_id picks: explicit > env > persisted > fresh+write
   * Cache + reset_for_tests round-trip
@@ -34,7 +35,15 @@ def _reset_cache_and_env(monkeypatch) -> Iterator[None]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_generate_id_yields_two_parts_joined_by_hyphen():
+def test_generate_id_defaults_to_sanitized_hostname(monkeypatch):
+    monkeypatch.setattr(identity.socket, "gethostname", lambda: "My-Robot.local")
+    val = identity.generate_id()
+    assert val == "my-robot"
+    assert identity.is_valid_id(val)
+
+
+def test_generate_id_falls_back_to_random_pair_when_hostname_unusable(monkeypatch):
+    monkeypatch.setattr(identity.socket, "gethostname", lambda: "@@@")
     val = identity.generate_id()
     parts = val.split("-")
     assert len(parts) == 2
@@ -42,12 +51,41 @@ def test_generate_id_yields_two_parts_joined_by_hyphen():
     assert identity.is_valid_id(val)
 
 
-def test_generate_id_varies_across_calls():
+def test_generate_id_falls_back_when_hostname_lookup_raises(monkeypatch):
+    def _boom():
+        raise OSError("no hostname")
+    monkeypatch.setattr(identity.socket, "gethostname", _boom)
+    val = identity.generate_id()
+    assert identity.is_valid_id(val)
+
+
+def test_generate_random_id_yields_two_parts_joined_by_hyphen():
+    val = identity._generate_random_id()
+    parts = val.split("-")
+    assert len(parts) == 2
+    assert all(p for p in parts)
+    assert identity.is_valid_id(val)
+
+
+def test_generate_random_id_varies_across_calls():
     """20 calls should not all return the same value — the pool has
     ~400 combinations so 20 identical draws would be a generator bug,
     not random luck."""
-    seen = {identity.generate_id() for _ in range(20)}
+    seen = {identity._generate_random_id() for _ in range(20)}
     assert len(seen) > 1
+
+
+def test_sanitize_hostname_strips_domain_and_invalid_chars():
+    assert identity._sanitize_hostname("My_Robot.example.com") == "my-robot"
+
+
+def test_sanitize_hostname_prefixes_non_letter_lead():
+    assert identity._sanitize_hostname("123-bot") == "host-123-bot"
+
+
+def test_sanitize_hostname_returns_none_when_nothing_usable():
+    assert identity._sanitize_hostname("...") is None
+    assert identity._sanitize_hostname("") is None
 
 
 def test_is_valid_id_format_constraints():

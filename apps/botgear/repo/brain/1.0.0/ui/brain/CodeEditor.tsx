@@ -1,5 +1,5 @@
-// Code viewer for non-markdown brain workspace files (stone B of
-// docs/TODO_BRAIN_VIEWER.md).
+// Code viewer for non-markdown brain workspace files (stone B; see
+// README.md's "Workspace file browser (UI)" section).
 //
 // Reads-only in stone B; stone C flips the ``readOnly`` prop to false
 // when the user clicks Edit. CodeMirror 6 via @uiw/react-codemirror —

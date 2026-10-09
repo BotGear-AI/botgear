@@ -6,9 +6,17 @@ def generate_totp_secret(username: str) -> str:
     import pyotp  # Dynamically import the pyotp library
     return pyotp.random_base32()
 
-def get_totp_uri(username: str, secret: str, issuer: str = "App") -> str:
+def get_totp_uri(username: str, secret: str, issuer: str | None = "App") -> str:
     import pyotp  # Dynamically import the pyotp library
-    return pyotp.totp.TOTP(secret).provisioning_uri(name=username, issuer_name=issuer)
+    # `issuer or "App"`, not a bare `issuer`. Callers commonly pass a
+    # settings-derived base_url into this slot, and that setting can default
+    # to None on a deployment that hasn't configured it. An explicit None
+    # does NOT fall back to the default in the signature above: it reaches
+    # pyotp, which then drops the issuer from the URI entirely —
+    # `otpauth://totp/alice%40x.com?secret=...`, no issuer label and no
+    # issuer parameter — so the authenticator app lists a bare user id under
+    # no application name.
+    return pyotp.totp.TOTP(secret).provisioning_uri(name=username, issuer_name=issuer or "App")
 
 def generate_qr_code(uri: str) -> StreamingResponse:
     import qrcode  # Dynamically import the qrcode library

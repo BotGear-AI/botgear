@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google_chat_service"
+version = "1.0.0"
+description = "botgear Google Chat integration — the `messaging` capability's speak-only tier, via a plain incoming-webhook POST (stdlib urllib, no SDK). rlx_bus + rlx_messaging are pre-installed into the venv by runtime/installer.py."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+google_chat_service = "google_chat_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,5 +1,12 @@
 import { WsClient } from './wsClient'
-import { createApiFetch, getAuthToken } from '../lib/api'
+import {
+  createApiFetch,
+  getAuthToken,
+  getRefreshToken,
+  setAuthToken,
+  setRefreshToken,
+  performTokenRefresh,
+} from '../lib/api'
 
 /**
  * One connection to a botgear runtime.
@@ -126,15 +133,45 @@ export class RuntimeConnection {
     // connection holds its own credentials.
     const resolveToken = (): string | null =>
       this.auth.accessToken ?? getAuthToken()
+    // Same fallback shape as resolveToken, one level down: a connection
+    // with no refresh token of its own rides the shared legacy one too
+    // (today, that's every connection — see the comment above).
+    const resolveRefreshToken = (): string | null =>
+      this.auth.refreshToken ?? getRefreshToken()
+
+    // Refresh-before-giving-up, mirroring lib/api.ts's defaultTryRefresh
+    // but persisting to whichever store the refresh token actually came
+    // from — this connection's own auth state if it has one, else the
+    // shared global pair (so the shared fallback stays self-consistent
+    // for every other connection reading it too).
+    const tryRefresh = async (): Promise<string | null> => {
+      const rt = resolveRefreshToken()
+      if (!rt) return null
+      try {
+        const { accessToken, refreshToken } = await performTokenRefresh(this.url, rt)
+        if (this.auth.refreshToken) {
+          this.setTokens({ accessToken, refreshToken })
+        } else {
+          setAuthToken(accessToken)
+          setRefreshToken(refreshToken)
+        }
+        return accessToken
+      } catch {
+        return null
+      }
+    }
 
     this.ws = new WsClient({
       baseUrl: this.url,
       getToken: resolveToken,
+      tryRefresh,
+      onAuthExpired: () => this.handleAuthExpired(),
     })
 
     this.apiFetch = createApiFetch({
       baseUrl: this.url,
       getToken: resolveToken,
+      tryRefresh,
       onAuthExpired: () => this.handleAuthExpired(),
     })
 
@@ -258,14 +295,37 @@ export class RuntimeConnection {
 
   /** Per-connection 401 handler. Today it just zeroes the access
    * token + nudges state — Phase 6 will add a refresh attempt before
-   * giving up. We DON'T fire window-level ``auth:expired`` because
-   * that would sign the user out of every other connection too. */
+   * giving up.
+   *
+   * Whether this ALSO signs the user out globally depends on whose
+   * token just got rejected. Per resolveToken() in the constructor, a
+   * connection without its own accessToken is riding the legacy shared
+   * ``botgear.access_token`` (today's reality for every connection,
+   * since Phase 5/6's per-connection login hasn't landed) — so its 401
+   * means that SHARED session expired, and every other connection on
+   * the same fallback is equally dead even though nothing told them
+   * yet. Without the global event, the user was left staring at a bare
+   * "Invalid or expired token" error with no path back to /login short
+   * of a manual reload (and a reload doesn't even help — AuthContext's
+   * token decode doesn't check ``exp``, so it happily reinstates the
+   * same expired token). Firing auth:expired here routes through
+   * AuthContext's existing listener (clears the shared token, drops
+   * `user`, ProtectedRoute redirects to /login) — the same recovery
+   * every other 401 already gets.
+   *
+   * A connection that HAS its own accessToken (Phase 5/6, once real)
+   * is a genuinely independent session — its expiry stays local, exactly
+   * as originally intended here. */
   private handleAuthExpired(): void {
+    const wasOnSharedToken = !this.auth.accessToken
     this.auth.accessToken = null
     this.auth.expiresAt = null
     this.state = 'disconnected'
     this.auth.lastError = 'token expired'
     this.notify()
+    if (wasOnSharedToken && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('auth:expired'))
+    }
   }
 }
 

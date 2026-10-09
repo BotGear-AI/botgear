@@ -11,6 +11,9 @@ happens in the operator's BROWSER:
   * STATUS flows UP: the browser reports output devices + connected/muted +
     level + a heartbeat on ``/speaker/{id}/report``, folded into state.
 
+The ``cmd``/``report`` shapes are declared below (``SpeakerCmd``,
+``SpeakerReport``) and introspected with the rest of the type.
+
 A browser speaker only exists while an authorized tab is open; a stale
 heartbeat marks ``last_error:"no browser client"``.
 """
@@ -19,8 +22,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Literal, Optional
 
+from pydantic import BaseModel, ConfigDict, Field
 from rlx_audio import AudioDeviceServiceBase, SpeakerServiceBase
 
 logger = logging.getLogger(__name__)
@@ -29,7 +33,43 @@ _STALE_AFTER_S = 5.0
 _CHECK_EVERY_S = 2.0
 
 
+class SpeakerCmd(BaseModel):
+    """Published on ``/speaker/{id}/cmd`` — a command to the browser half."""
+    action: Literal["enumerate", "connect", "disconnect", "set_muted", "set_input", "set_volume", "transport"]
+    device_id: Optional[str] = Field(None, description="connect")
+    sample_rate: Optional[int] = Field(None, description="connect")
+    channels: Optional[int] = Field(None, description="connect")
+    input_kind: Optional[str] = Field(None, description="connect / set_input")
+    input_ref: Optional[str] = Field(None, description="connect / set_input")
+    muted: Optional[bool] = Field(None, description="set_muted")
+    volume: Optional[float] = Field(None, description="set_volume")
+    op: Optional[str] = Field(None, description="transport: play / pause / stop / seek / ...")
+    position_s: Optional[float] = Field(None, description="transport")
+    playing: Optional[bool] = Field(None, description="transport")
+    paused: Optional[bool] = Field(None, description="transport")
+
+
+class SpeakerReport(BaseModel):
+    """Consumed from ``/speaker/{id}/report`` — browser status, transport
+    position (authoritative while it plays) + heartbeat."""
+    model_config = ConfigDict(extra="allow")
+    devices: Optional[List[Dict[str, Any]]] = None
+    connected: Optional[bool] = None
+    muted: Optional[bool] = None
+    level_rms: Optional[float] = None
+    playing: Optional[bool] = None
+    paused: Optional[bool] = None
+    position_s: Optional[float] = None
+    duration_s: Optional[float] = None
+    ended: Optional[bool] = Field(None, description="Natural end-of-track — advances the play set")
+    error: Optional[str] = None
+    ts: Optional[float] = None
+
+
 class SpeakerBrowserService(SpeakerServiceBase):
+    publishes = [*SpeakerServiceBase.publishes, "cmd"]
+    topic_schemas = {"cmd": SpeakerCmd}
+    subscribes_schemas = {**SpeakerServiceBase.subscribes_schemas, "report": SpeakerReport}
     source = "browser"
 
     def __init__(self, proxy_id, bus) -> None:
@@ -53,43 +93,49 @@ class SpeakerBrowserService(SpeakerServiceBase):
 
     # ─── transport hooks — relay to the browser ───────────────────────
     async def _enumerate_devices(self):
-        await self.publish("cmd", {"action": "enumerate"})
+        await self._cmd(SpeakerCmd(action="enumerate"))
         return list(self._devices)
 
     async def _open(self) -> None:
-        await self.publish("cmd", {
-            "action": "connect",
-            "device_id": self.config.device_id,
-            "sample_rate": self.config.sample_rate,
-            "channels": self.config.channels,
-            "input_kind": self.config.input_kind,
-            "input_ref": self.config.input_ref,
-        })
+        await self._cmd(SpeakerCmd(
+            action="connect",
+            device_id=self.config.device_id,
+            sample_rate=self.config.sample_rate,
+            channels=self.config.channels,
+            input_kind=self.config.input_kind,
+            input_ref=self.config.input_ref,
+        ))
 
     async def _close(self) -> None:
-        await self.publish("cmd", {"action": "disconnect"})
+        await self._cmd(SpeakerCmd(action="disconnect"))
 
     async def _on_mute_changed(self, muted: bool) -> None:
-        await self.publish("cmd", {"action": "set_muted", "muted": muted})
+        await self._cmd(SpeakerCmd(action="set_muted", muted=muted))
 
     async def _on_input_changed(self) -> None:
         # Relay the new source to the browser, which (re)loads + plays it.
-        await self.publish("cmd", {
-            "action": "set_input",
-            "input_kind": self.config.input_kind,
-            "input_ref": self.config.input_ref,
-        })
+        await self._cmd(SpeakerCmd(
+            action="set_input",
+            input_kind=self.config.input_kind,
+            input_ref=self.config.input_ref,
+        ))
 
     async def _on_volume_changed(self, volume: float) -> None:
-        await self.publish("cmd", {"action": "set_volume", "volume": volume})
+        await self._cmd(SpeakerCmd(action="set_volume", volume=volume))
 
     async def _on_transport(self, action: str) -> None:
         # Relay transport + the resulting position so the browser's player
         # play/pause/stop/seek stays in sync.
-        await self.publish("cmd", {
-            "action": "transport", "op": action,
-            "position_s": self._position_s, "playing": self._playing, "paused": self._paused,
-        })
+        await self._cmd(SpeakerCmd(
+            action="transport", op=action,
+            position_s=self._position_s, playing=self._playing, paused=self._paused,
+        ))
+
+    async def _cmd(self, cmd: SpeakerCmd) -> None:
+        # exclude_unset (not exclude_none) so an explicitly-passed None —
+        # e.g. connect's device_id=None (browser default device) or a
+        # cleared input_kind — still reaches the browser, as before.
+        await self.publish("cmd", cmd.model_dump(exclude_unset=True))
 
     async def _play_pcm(self, pcm: bytes, frame) -> None:
         # The browser plays; the backend never renders audio.

@@ -15,13 +15,25 @@
 // runtime from the Quest via `adb reverse tcp:8998 tcp:8998` (USB) so it
 // appears at http://localhost:8998 (a secure context) — no TLS.
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
 import * as THREE from 'three'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Grid, Text, useGLTF } from '@react-three/drei'
 import { createXRStore, XR, useXRInputSourceState } from '@react-three/xr'
 import html2canvas from 'html2canvas'
-import { useWsClient } from '@rlx/ui'
 import type { ServiceProxy, InboundFrame, WsClient } from '@rlx/ui'
+
+// This bundle does NOT externalize react/react-dom (see package.json's
+// description for why: @react-three/fiber vendors its own react-reconciler
+// build, and sharing the host's React singleton across that boundary
+// repeatedly broke on React's unstable internals — ReactSharedInternals.S,
+// .use, dispatcher.getOwner — as fiber's vendored reconciler and the
+// host's react-dom patch versions drifted apart). Instead this whole
+// bundle is a SELF-CONTAINED React tree: `mount()` below is the default
+// export (a plain function, not a component) — the host dynamically
+// imports this module and calls mount() into a plain <div>, passing
+// `ws` as a prop instead of this tree calling useWsClient() itself (it
+// has no access to the host's Context providers, being a separate root).
 
 // One store for the page. createXRStore configures the session; inputs
 // (controllers/hands) are included by default in v6. emulate:false keeps
@@ -954,9 +966,14 @@ function MenuSystem({ panels, arrange, services, onToggleArrange, onRecenter, on
 
   const openServices = () => { onRefreshServices(); setPage(0); setMode('services') }
   const toggleOpen = () => setOpen((o) => { if (o) setMode('main'); return !o })
+  // The only way out otherwise is the headset's own system menu (a home-
+  // button chord, not obvious mid-session) — store is the same module-
+  // level XRStore <XR store={store}> renders with, so ending the session
+  // from here is exactly the documented `store.getState().session?.end()`.
+  const onExitVR = () => { setOpen(false); store.getState().session?.end() }
 
   const rows = panels.length
-  const h = 0.77 + rows * 0.12              // main menu height (+ teleop toggle row)
+  const h = 0.89 + rows * 0.12              // main menu height (+ teleop + exit rows)
   const PAGE = 7
   const pageCount = Math.max(1, Math.ceil(services.length / PAGE))
   const pageItems = services.slice(page * PAGE, page * PAGE + PAGE)
@@ -1010,9 +1027,12 @@ function MenuSystem({ panels, arrange, services, onToggleArrange, onRecenter, on
                   onClick={() => { setOpen(false); setCal(4) }} />
               </group>
             </group>
+            <group position={[0, h / 2 - 0.65, 0]}>
+              <MenuButton label="Exit VR" onClick={onExitVR} color="#7f1d1d" />
+            </group>
             {/* per-panel: anchor cycle + show/hide */}
             {panels.map((p, i) => {
-              const y = h / 2 - 0.69 - i * 0.12
+              const y = h / 2 - 0.81 - i * 0.12
               const anchor = (p.placement ?? 'world') as Anchor
               const next = ANCHOR_CYCLE[(ANCHOR_CYCLE.indexOf(anchor) + 1) % ANCHOR_CYCLE.length]
               return (
@@ -1182,8 +1202,7 @@ function Reference() {
 }
 
 // ── component ────────────────────────────────────────────────────────
-export default function WebXRImmersiveView({ proxy }: { proxy: ServiceProxy }) {
-  const ws = useWsClient()
+function WebXRImmersiveView({ proxy, ws }: { proxy: ServiceProxy; ws: WsClient }) {
   const proxyId = proxy.id ?? proxy.name ?? ''
   const [type] = (proxy.service_meta_id ?? 'webxr@1.0.0').split('@')
   const inputTopic = `/${type}/${proxyId}/input`
@@ -1380,11 +1399,34 @@ export default function WebXRImmersiveView({ proxy }: { proxy: ServiceProxy }) {
     xr.isSessionSupported('immersive-vr').then(setSupported).catch(() => setSupported(false))
   }, [])
 
+  // <Canvas>'s WebGLRenderer (and <XR>'s store.setWebXRManager call, which
+  // runs during ITS render) mounts asynchronously — r3f schedules the GL
+  // context creation after the initial commit, not synchronously with it.
+  // "Enter VR" only gets disabled once `supported` resolves to false, so
+  // on a fast tap right after page load (or a slow device) the click can
+  // land before that connection exists. @pmndrs/xr's own store.js has a
+  // dedicated error for exactly this ("...or the canvas is not yet
+  // loaded?"), which confirms this is a known race, not a config bug —
+  // so retry a few times with a short backoff before surfacing an error.
   const onEnter = async () => {
     setErr(null); setEntering(true)
-    try { await store.enterVR() }
-    catch (e) { setErr(String((e as Error)?.message ?? e)) }
-    finally { setEntering(false) }
+    const NOT_CONNECTED = /not connected to three\.js/i
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await store.enterVR()
+        setEntering(false)
+        return
+      } catch (e) {
+        const message = String((e as Error)?.message ?? e)
+        if (attempt < 4 && NOT_CONNECTED.test(message)) {
+          await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)))
+          continue
+        }
+        setErr(message)
+        break
+      }
+    }
+    setEntering(false)
   }
 
   return (
@@ -1435,4 +1477,29 @@ export default function WebXRImmersiveView({ proxy }: { proxy: ServiceProxy }) {
       </Canvas>
     </div>
   )
+}
+
+// Mount entry point — the host (XrView.tsx) dynamically imports this
+// module and calls this into a plain <div> it owns, instead of rendering
+// `WebXRImmersiveView` as a normal JSX child of its own tree. This is a
+// SEPARATE React root using this bundle's OWN bundled react/react-dom
+// (not the host's externalized singleton) — see the comment at the top
+// of the file for why. Returns an unmount function the host calls on
+// cleanup (route change, unmount).
+export default function mount(
+  container: HTMLElement,
+  props: { proxy: ServiceProxy; ws: WsClient },
+  // The host has no error boundary around this tree (it's not a normal
+  // JSX child anymore) — onUncaughtError/onCaughtError are React 19's
+  // createRoot-level equivalent, so a render crash still reaches the
+  // host's on-screen diagnostic instead of only the (headset-inaccessible)
+  // console.
+  onError?: (error: unknown) => void,
+): () => void {
+  const root: Root = createRoot(container, {
+    onUncaughtError: (error) => onError?.(error),
+    onCaughtError: (error) => onError?.(error),
+  })
+  root.render(<WebXRImmersiveView {...props} />)
+  return () => root.unmount()
 }

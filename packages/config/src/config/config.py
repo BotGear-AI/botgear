@@ -15,6 +15,50 @@ logger = logging.getLogger(__name__)
 # Internal cache for singleton behavior
 _settings_cache = {}
 
+# Substrings that make a settings FIELD NAME secret-shaped, independent of how
+# its value arrived.
+#
+# The startup "Creating Settings" dump used to mask by encryption provenance
+# alone — a field was hidden only if its .env value came in as `Encrypted--`.
+# Anything left in plaintext in .env (which is the normal state for a local or
+# freshly provisioned deployment) was printed in full at INFO on every boot:
+# postgres_password, llm_api_key, slack_token, twilio_auth_token, smtp_password.
+# Provenance is not a security property; the field name is what tells you the
+# value is a credential.
+#
+# Deliberately NOT here: `auth` (matches auth_type, a Literal), `credentials`
+# (matches ocr_credentials_file, a PATH worth seeing — and its companion
+# ocr_credentials_file_key is caught by the _key suffix rule anyway), and the
+# twilio *_sid identifiers.
+_SECRET_NAME_SUBSTRINGS = (
+    "password", "passwd", "secret", "token", "authorization",
+)
+
+
+def _is_secret_field_name(name: str) -> bool:
+    lowered = (name or "").lower()
+    if any(part in lowered for part in _SECRET_NAME_SUBSTRINGS):
+        return True
+    # smtp_key, llm_api_key, ocr_credentials_file_key, private_key, ...
+    return lowered == "key" or lowered.endswith("_key")
+
+
+def _loggable_setting_value(name: str, value: Any, *, was_encrypted: bool) -> Any:
+    """Mask a settings value for the startup dump.
+
+    The dump exists to answer "what config is this process actually running
+    with", so it keeps as much of that as it safely can: for a secret-shaped
+    field, an EMPTY value stays visible as itself. That preserves the question
+    an operator is usually asking of a credential at startup — "is it set at
+    all?" / "why is this integration not authenticating?" — while never
+    printing the value. Non-secret fields are untouched.
+    """
+    if was_encrypted:
+        return "****"          # unchanged from the previous behavior
+    if _is_secret_field_name(name) and value not in (None, ""):
+        return "****"
+    return value
+
 # Contract: Each app supplies its app_name and its Pydantic config model (Config)
 # Usage: settings, config_provider = create_app_settings("property_scout", PropertyScoutConfig)
 
@@ -89,7 +133,15 @@ def create_app_settings(
         generated_key = Fernet.generate_key().decode()
         with open(key_path, 'w') as f:
             f.write(generated_key)
-        logger.warning(f"No Fernet key found. Generated new .private.key: {key_path}\nKey: {generated_key}")
+        # Log the PATH, never the key. This is the master key for every
+        # Encrypted-- value in the app's config; printing it to the log stream
+        # puts it wherever logs go (stdout/`docker logs`, the log_event table,
+        # a pasted bug report) and makes every encrypted secret readable by
+        # anyone who can read a log. The operator does not need it echoed —
+        # it is already written to the file named here.
+        logger.warning("No Fernet key found. Generated new key file: %s "
+                       "(back it up — encrypted values cannot be recovered "
+                       "without it)", key_path)
         fernet_key = generated_key
         key_source = 'generated .private.key'
 
@@ -120,7 +172,7 @@ def create_app_settings(
 
     redacted_fields = {field_name for field_name, _, _ in decrypt_fields}
     loggable = {
-        k: ("****" if k in redacted_fields else v)
+        k: _loggable_setting_value(k, v, was_encrypted=k in redacted_fields)
         for k, v in settings.model_dump().items()
     }
     logger.info(f"Creating Settings: {json.dumps(loggable, indent=2, sort_keys=True)}")

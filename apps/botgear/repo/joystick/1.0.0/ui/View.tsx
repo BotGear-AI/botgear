@@ -41,6 +41,8 @@ interface JoystickState {
   poll_hz?: number
   deadzone?: number
   last_index?: number | null
+  autoreconnect?: boolean
+  retrying?: boolean
   last_error?: string | null
 }
 
@@ -108,8 +110,13 @@ export default function JoystickFullView({ proxy }: { proxy: ServiceProxy }) {
   }, [selectedIndex, sendAction])
   const onDetach = useCallback(() => sendAction({ action: 'detach' }), [sendAction])
   const onRefresh = useCallback(() => sendAction({ action: 'list_devices' }), [sendAction])
+  const onToggleAutoConnect = useCallback(
+    (checked: boolean) => sendAction({ action: 'set_auto_connect', enabled: checked }),
+    [sendAction],
+  )
 
   const attached = !!state.attached
+  const retrying = !!state.retrying
   const enabled = state.enabled ?? true
   const comps = state.components ?? { axes: 0, buttons: 0, hats: 0, balls: 0 }
   const device = state.device ?? null
@@ -145,13 +152,30 @@ export default function JoystickFullView({ proxy }: { proxy: ServiceProxy }) {
             </div>
           </label>
           <div className="ml-auto flex items-center gap-2">
+            {/* Auto-connect toggle — keeps retrying the last controller
+                (matched by GUID) in the background whenever detached,
+                including after it's unplugged and plugged back in. */}
+            <label
+              className="flex items-center gap-1.5 font-mono text-[10px] text-slate-400"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <input
+                type="checkbox"
+                checked={!!state.autoreconnect}
+                onChange={(e) => onToggleAutoConnect(e.target.checked)}
+                className="nodrag nopan accent-emerald-500"
+              />
+              auto-connect
+            </label>
             {/* Connectivity light */}
             <span className="flex items-center gap-1.5 font-mono text-[10px]">
               <span className={`inline-block h-2.5 w-2.5 rounded-full ${
-                attached ? (streaming ? 'bg-emerald-400 shadow-[0_0_6px_1px] shadow-emerald-500/60' : 'bg-amber-400') : 'bg-slate-600'
+                attached
+                  ? (streaming ? 'bg-emerald-400 shadow-[0_0_6px_1px] shadow-emerald-500/60' : 'bg-amber-400')
+                  : retrying ? 'animate-pulse bg-amber-400' : 'bg-slate-600'
               }`} />
-              <span className={attached ? (streaming ? 'text-emerald-300' : 'text-amber-300') : 'text-slate-500'}>
-                {attached ? (streaming ? 'streaming' : 'paused') : 'detached'}
+              <span className={attached ? (streaming ? 'text-emerald-300' : 'text-amber-300') : retrying ? 'text-amber-300' : 'text-slate-500'}>
+                {attached ? (streaming ? 'streaming' : 'paused') : retrying ? 'reconnecting…' : 'detached'}
               </span>
             </span>
             {attached && (

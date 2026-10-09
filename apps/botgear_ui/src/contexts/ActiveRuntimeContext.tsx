@@ -1,8 +1,8 @@
 import { createContext, useContext, useEffect, useMemo, type ReactNode } from 'react'
-import { useParams } from 'react-router-dom'
+import { Navigate, useLocation, useParams } from 'react-router-dom'
 import type { RuntimeConnection } from '../runtime/RuntimeConnection'
 import type { WsClient } from '../runtime/wsClient'
-import { saveActiveId } from '../runtime/connectionsStorage'
+import { loadActiveId, saveActiveId } from '../runtime/connectionsStorage'
 import { useRuntimeConnections } from './RuntimeConnectionsContext'
 
 
@@ -49,7 +49,8 @@ const Context = createContext<ActiveRuntimeValue | null>(null)
  * page reload restores the same view. */
 export function ActiveRuntimeProvider({ children }: { children: ReactNode }) {
   const { runtimeId = '' } = useParams<{ runtimeId: string }>()
-  const { get } = useRuntimeConnections()
+  const { connections, get } = useRuntimeConnections()
+  const location = useLocation()
 
   // Decode the param — runtime ids can contain ``-`` and ``.`` etc.
   // but they pass through URL paths cleanly. Decode in case anything
@@ -67,10 +68,36 @@ export function ActiveRuntimeProvider({ children }: { children: ReactNode }) {
     if (connection) saveActiveId(decodedId)
   }, [decodedId, connection])
 
+  // All hooks above run unconditionally on every render — the redirect
+  // below is a plain early return of JSX, not a hook, so it's safe
+  // after this point (Rules of Hooks only constrains hook CALLS).
   const value = useMemo<ActiveRuntimeValue>(() => ({
     runtimeId: decodedId,
     connection,
   }), [decodedId, connection])
+
+  // The URL names a connection that no longer exists — removed via the
+  // chip bar's disconnect button, or a stale/bookmarked id. Every
+  // strict consumer below (useWsClient/useApiFetch) THROWS on a null
+  // connection, and nothing catches that render-time throw, so letting
+  // ``children`` render here blanks the entire app (see the crash this
+  // fixes: removing the active runtime left RuntimeNav rendering
+  // against a dangling id). Bounce to another known connection instead
+  // — same fallback order as RedirectToActive — or /no-runtimes if none
+  // remain. RuntimeSwitcher's remove flow navigates proactively before
+  // calling remove() so this is normally a no-op safety net, not the
+  // primary path.
+  if (!connection) {
+    if (connections.length === 0) {
+      return <Navigate to="/no-runtimes" replace />
+    }
+    const persistedId = loadActiveId()
+    const fallback = (persistedId ? connections.find((c) => c.id === persistedId) : undefined) ?? connections[0]
+    const m = location.pathname.match(/^\/r\/[^/]+(\/.*)?$/)
+    const suffix = m?.[1] ?? ''
+    const next = `/r/${encodeURIComponent(fallback.id)}${suffix}${location.search}${location.hash}`
+    return <Navigate to={next} replace />
+  }
 
   return <Context.Provider value={value}>{children}</Context.Provider>
 }

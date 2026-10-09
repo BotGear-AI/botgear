@@ -1,5 +1,6 @@
 # unmanaged
-"""Remote service registry — Phase 2 + 3 + 4 of docs/TODO_REPO.md.
+"""Remote service registry — Phase 2 + 3 + 4 of the registry design
+(see repo/README.md's "Lifecycle states" section).
 
 Bridges a remote catalog (catalog.yml at a URL) to the local
 ``repo/<type>/<version>/`` layout that the rest of the runtime already

@@ -1,0 +1,63 @@
+name: slack
+title: Slack
+description: |
+  Slack bot implementing the ``messaging`` capability (see
+  docs/TODO_MESSAGING.md) — the same ``listen``/``speak``/``send``/
+  ``list_channels`` contract ``chat`` exposes.
+
+  Full bidirectional via Socket Mode — an OUTBOUND websocket the bot
+  opens to Slack, so no public HTTPS endpoint or port-forwarding is
+  needed (works from a robot laptop behind a home NAT).
+
+  Requires TWO credentials from api.slack.com/apps: a bot token
+  (``xoxb-...``, from OAuth & Permissions — needs at least
+  ``chat:write`` and ``channels:read`` scopes) AND an app-level token
+  (``xapp-...``, from Basic Information → App-Level Tokens — needs the
+  ``connections:write`` scope, and Socket Mode must be toggled on for
+  the app). Both are stored as Pydantic ``SecretStr`` (encrypted at
+  rest, masked on any bus/API egress).
+
+  Set ``default_channel`` (a Slack channel id, e.g. ``C0123456789``) so
+  ``speak()`` has somewhere to send by default.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [messaging, slack, chat, brain]
+icon: icon.svg
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+implements: [messaging]
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/slack/1.0.0"
+
+entry:
+  argv: [python, -m, slack_service]
+
+wizard_config:
+  - id: auth
+    title: Bot credentials
+    fields:
+      - id: bot_token
+        type: password
+        title: Bot token (xoxb-...)
+        description: "OAuth & Permissions tab of your Slack app. Needs chat:write + channels:read scopes."
+        default: ""
+      - id: app_token
+        type: password
+        title: App-level token (xapp-...)
+        description: "Basic Information -> App-Level Tokens. Needs connections:write scope. Socket Mode must be enabled for the app."
+        default: ""
+      - id: default_channel
+        type: string
+        title: Default channel id
+        description: Channel speak() targets when the caller doesn't pass one explicitly.
+        default: ""

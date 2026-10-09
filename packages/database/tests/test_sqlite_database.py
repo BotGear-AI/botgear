@@ -143,6 +143,85 @@ def test_query_sqlite_query(sqlite_db):
     assert results[0]["id"] == "1"
 
 
+def test_insert_item_duplicate_key_raises(sqlite_db):
+    """insert_item must refuse a duplicate key, matching TinyDBDatabase and
+    PostgresDatabase — botgear's first-user-claim race guard depends on this
+    raise to detect a concurrent duplicate rather than silently overwriting."""
+    sqlite_db.insert_item("test", "dup", {"uuid": "dup", "value": "first"})
+    with pytest.raises(ValueError):
+        sqlite_db.insert_item("test", "dup", {"uuid": "dup", "value": "second"})
+    # Original row must be untouched by the failed insert.
+    assert sqlite_db.get_item("test", "dup")["value"] == "first"
+
+
+def test_upsert_item_still_overwrites_on_duplicate(sqlite_db):
+    """upsert_item is unaffected by the insert_item duplicate-key fix."""
+    sqlite_db.insert_item("test", "up1", {"uuid": "up1", "value": "first"})
+    sqlite_db.upsert_item("test", "up1", {"uuid": "up1", "value": "second"})
+    assert sqlite_db.get_item("test", "up1")["value"] == "second"
+
+
+def test_copy_table_overwrites_existing_dest_rows(sqlite_db):
+    """copy_table must still overwrite on a re-run (matches TinyDBDatabase's
+    raw-insert overwrite semantics) even though insert_item now refuses dups."""
+    ensure_table(sqlite_db, "src2")
+    ensure_table(sqlite_db, "dest2")
+    sqlite_db.insert_item("src2", "1", {"uuid": "1", "value": "new"})
+    sqlite_db.insert_item("dest2", "1", {"uuid": "1", "value": "stale"})
+    sqlite_db.copy_table("src2", "dest2")
+    assert sqlite_db.get_item("dest2", "1")["value"] == "new"
+
+
+def test_ensure_table_adds_missing_columns_for_schema_drift(sqlite_db):
+    """A model that gains a field after its table already exists (routine —
+    templates/apps/*.yml grows a field, regenerate) must not break inserts
+    against the live table. TinyDB's schemaless JSON tolerates this for
+    free; sqlite's ensure_table must ALTER TABLE ADD COLUMN instead."""
+    class V1(BaseModel):
+        id: str
+        value: str | None = None
+
+    class V2(BaseModel):
+        id: str
+        value: str | None = None
+        new_field: str | None = None
+
+    sqlite_db.ensure_table(V1, table_name="drift")
+    sqlite_db.insert_item("drift", "1", {"value": "old"})
+
+    sqlite_db.ensure_table(V2, table_name="drift")
+    sqlite_db.insert_item("drift", "2", {"value": "new", "new_field": "hello"})
+
+    assert sqlite_db.get_item("drift", "1")["value"] == "old"
+    assert sqlite_db.get_item("drift", "2")["new_field"] == "hello"
+
+
+def test_insert_item_self_heals_undeclared_column(sqlite_db):
+    """A write can carry a key that was never on the Pydantic model passed
+    to ensure_table at all (e.g. botgear's config/default seed injects
+    `created_at` ad hoc). insert_item/upsert_item must add the column
+    on the fly rather than raising 'table has no column named ...'."""
+    sqlite_db.insert_item("test", "adhoc1", {"uuid": "adhoc1", "totally_undeclared_field": "surprise"})
+    assert sqlite_db.get_item("test", "adhoc1")["totally_undeclared_field"] == "surprise"
+
+
+def test_upsert_item_self_heals_undeclared_column(sqlite_db):
+    sqlite_db.upsert_item("test", "adhoc2", {"uuid": "adhoc2", "another_undeclared_field": 42})
+    assert sqlite_db.get_item("test", "adhoc2")["another_undeclared_field"] == 42
+
+
+def test_list_tables(sqlite_db):
+    ensure_table(sqlite_db, "another_table")
+    tables = sqlite_db.list_tables()
+    assert "test" in tables
+    assert "another_table" in tables
+
+
+def test_journal_mode_is_wal(sqlite_db):
+    cur = sqlite_db.conn.execute("PRAGMA journal_mode")
+    assert cur.fetchone()[0].lower() == "wal"
+
+
 def test_distinct_paths_get_distinct_instances(tmp_path):
     """#298: SqliteDatabase must isolate instances per sqlite_path — a second
     config with a different path must not be silently bound to the first file."""

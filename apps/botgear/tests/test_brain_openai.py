@@ -83,15 +83,36 @@ def test_encode_message_carries_tool_call_id():
 
 
 def test_encode_tools_openai_function_shape():
-    """OpenAI uses {type: function, function: {name, description, parameters}}."""
+    """OpenAI uses {type: function, function: {name, description, parameters}}.
+
+    Names come from adapters.base.resolve_tool_names (see
+    docs/TODO_BRAIN_GAP_FIXES.md Gap 1) — a unique action name encodes
+    under its own bare name, matching ollama/anthropic and what a
+    workflow prompt says to call. Previously this adapter alone always
+    used opaque tool_NNN, even with no collision."""
     tools = [ToolDescriptor(topic="/x/x-1/control", action="do_it",
                             parameters={"type": "object", "properties": {"k": {"type": "string"}}})]
     encoded, decode = _encode_tools(tools)
     assert encoded[0]["type"] == "function"
     fn = encoded[0]["function"]
-    assert fn["name"] == "tool_000"
+    assert fn["name"] == "do_it"
     assert fn["parameters"]["properties"]["k"]["type"] == "string"
-    assert decode["tool_000"].topic == "/x/x-1/control"
+    assert decode["do_it"].topic == "/x/x-1/control"
+
+
+def test_encode_tools_falls_back_to_proxy_qualified_on_collision():
+    """Three proxies of the same type exposing the same action (e.g.
+    three tasmota switches' power_set) — only the first keeps the bare
+    name; the rest get <proxy_id>_<action>, not opaque indices."""
+    tools = [
+        ToolDescriptor(topic="/tasmota/office-cord/control", action="power_set"),
+        ToolDescriptor(topic="/tasmota/sonoff-cord/control", action="power_set"),
+        ToolDescriptor(topic="/tasmota/sonoff-office-light/control", action="power_set"),
+    ]
+    encoded, decode = _encode_tools(tools)
+    names = [e["function"]["name"] for e in encoded]
+    assert names == ["power_set", "sonoff-cord_power_set", "sonoff-office-light_power_set"]
+    assert decode["sonoff-cord_power_set"].topic == "/tasmota/sonoff-cord/control"
 
 
 def test_parse_response_tool_call_with_string_arguments():
@@ -169,7 +190,7 @@ async def test_adapter_posts_to_chat_completions():
             "choices": [{"message": {
                 "tool_calls": [{
                     "id": "call_x", "type": "function",
-                    "function": {"name": "tool_000", "arguments": "{\"k\": \"v\"}"},
+                    "function": {"name": "do_it", "arguments": "{\"k\": \"v\"}"},
                 }],
             }}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 2},
@@ -202,22 +223,25 @@ async def test_observe_room_via_openai(workspace, tool_catalog):
     """Fourth adapter, same workflow, same outcome."""
     wf = _bundled_observe_room()
 
-    def _resp(tool_idx: int, args: dict, *, in_tok: int, out_tok: int) -> Dict[str, Any]:
+    def _resp(tool_idx: int, name: str, args: dict, *, in_tok: int, out_tok: int) -> Dict[str, Any]:
+        # Names come from resolve_tool_names — bare action name here,
+        # since all 4 allowed actions in this workflow are unique (see
+        # docs/TODO_BRAIN_GAP_FIXES.md Gap 1).
         return {
             "choices": [{"message": {
                 "tool_calls": [{
                     "id": f"call_{tool_idx}", "type": "function",
-                    "function": {"name": f"tool_{tool_idx:03d}", "arguments": json.dumps(args)},
+                    "function": {"name": name, "arguments": json.dumps(args)},
                 }],
             }}],
             "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok},
         }
 
     responses = [
-        _resp(0, {"camera": 0},                     in_tok=100, out_tok=20),
-        _resp(1, {"frame_id": "f-001"},             in_tok=120, out_tok=25),
-        _resp(2, {"text": "Saw a red cube."},       in_tok=140, out_tok=22),
-        _resp(3, {"kind": "observations", "content": "Saw a red cube."},
+        _resp(0, "capture_frame", {"camera": 0},                     in_tok=100, out_tok=20),
+        _resp(1, "detect_objects", {"frame_id": "f-001"},             in_tok=120, out_tok=25),
+        _resp(2, "speak", {"text": "Saw a red cube."},       in_tok=140, out_tok=22),
+        _resp(3, "write_memory", {"kind": "observations", "content": "Saw a red cube."},
                                                     in_tok=160, out_tok=18),
         # Final step: plain text completion → terminal done.
         {"choices": [{"message": {"content": "Room observed.", "role": "assistant"}}],

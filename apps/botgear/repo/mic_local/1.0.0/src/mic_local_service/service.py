@@ -16,9 +16,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from rlx_audio import MicrophoneServiceBase
+from rlx_audio import MicrophoneServiceBase, resample_s16le
 
 logger = logging.getLogger(__name__)
+
+# PortAudio's paInvalidSampleRate. Raw ALSA hw:X,Y device nodes bypass
+# ALSA's plug/dmix layer (unlike "default"/plughw) and reject any rate
+# but their own fixed native one outright — see _open()'s fallback.
+_PA_INVALID_SAMPLE_RATE = -9997
 
 
 def _sd():
@@ -36,6 +41,12 @@ class MicLocalService(MicrophoneServiceBase):
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
         self._stream: Optional[Any] = None
+        # Actual PortAudio capture rate — may differ from
+        # self.config.sample_rate (the wire rate) when the device
+        # rejected it and _open() fell back to the device's native
+        # rate. _on_audio resamples back to the wire rate when they
+        # differ, so encode_frame/downstream consumers never see it.
+        self._capture_rate: int = 0
 
     # ─── transport hooks ──────────────────────────────────────────────
     async def _enumerate_devices(self) -> List[Dict[str, Any]]:
@@ -60,18 +71,46 @@ class MicLocalService(MicrophoneServiceBase):
             await self._close()
         sd = _sd()
         device = int(self.config.device_id) if self.config.device_id not in (None, "") else None
-        stream = sd.RawInputStream(
-            samplerate=self.config.sample_rate,
-            blocksize=self.frame_samples,
+        wire_rate = self.config.sample_rate
+        try:
+            stream = self._start_stream(sd, device, wire_rate)
+            self._capture_rate = wire_rate
+        except sd.PortAudioError as exc:
+            if len(exc.args) < 2 or exc.args[1] != _PA_INVALID_SAMPLE_RATE:
+                raise
+            # The device won't open at the configured wire rate at all
+            # (common for a raw hw:X,Y node whose codec only runs at a
+            # fixed rate, e.g. 44100/48000). Retry at its own native
+            # rate; _on_audio resamples every captured chunk back down
+            # to wire_rate before it's emitted.
+            device_info = sd.query_devices(device) if device is not None else sd.query_devices(kind="input")
+            native_rate = int(round(device_info["default_samplerate"]))
+            logger.warning(
+                "mic_local %s: device rejected %sHz (%s) — retrying at its native %sHz, "
+                "resampling to %sHz in software",
+                self.proxy_id, wire_rate, exc, native_rate, wire_rate,
+            )
+            stream = self._start_stream(sd, device, native_rate)
+            self._capture_rate = native_rate
+        stream.start()
+        self._stream = stream
+        logger.info("mic_local %s: capture started (device=%s rate=%s ch=%s capture_rate=%s)",
+                    self.proxy_id, device, wire_rate, self.config.channels, self._capture_rate)
+
+    def _start_stream(self, sd: Any, device: Optional[int], samplerate: int) -> Any:
+        # blocksize is computed off the STREAM's own rate (not the wire
+        # rate) so each callback still covers frame_ms of audio even
+        # when capturing at a device's native rate different from the
+        # configured wire rate.
+        blocksize = max(1, int(round(samplerate * self.config.frame_ms / 1000)))
+        return sd.RawInputStream(
+            samplerate=samplerate,
+            blocksize=blocksize,
             channels=self.config.channels,
             dtype="int16",
             device=device,
             callback=self._on_audio,
         )
-        stream.start()
-        self._stream = stream
-        logger.info("mic_local %s: capture started (device=%s rate=%s ch=%s)",
-                    self.proxy_id, device, self.config.sample_rate, self.config.channels)
 
     async def _close(self) -> None:
         stream, self._stream = self._stream, None
@@ -88,5 +127,11 @@ class MicLocalService(MicrophoneServiceBase):
         if status:
             logger.debug("mic_local %s: stream status %s", self.proxy_id, status)
         # indata is a CFFI buffer for RawInputStream; bytes() copies the
-        # interleaved int16 PCM out. Marshal onto the service loop.
-        self.emit_pcm_threadsafe(bytes(indata))
+        # interleaved int16 PCM out.
+        pcm = bytes(indata)
+        if self._capture_rate and self._capture_rate != self.config.sample_rate:
+            # _open() fell back to the device's native rate — bring it
+            # back to the configured wire rate before it's encoded.
+            pcm = resample_s16le(pcm, self._capture_rate, self.config.sample_rate, self.config.channels)
+        # Marshal onto the service loop.
+        self.emit_pcm_threadsafe(pcm)

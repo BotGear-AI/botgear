@@ -15,6 +15,7 @@ implementation (Sabertooth is the first) must accept.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -49,10 +50,13 @@ def mc(monkeypatch):
     monkeypatch.setattr(svc, "publish", _publish)
     monkeypatch.setattr(svc, "save_config", lambda: None)
     svc._published = published  # type: ignore[attr-defined]
-    # Outputs are normally seeded in on_start; seed here so handlers that
-    # read self._outputs don't trip over the class-level default.
+    # These are normally seeded in on_start; seed here so handlers that
+    # read them don't trip over — or leak into each other via — the
+    # class-level mutable default dicts.
     svc._outputs = {}
     svc._last_sent = {}
+    svc._input_last_seen = {}
+    svc._input_stale = {}
     return svc
 
 
@@ -251,6 +255,77 @@ async def test_clear_input_unbinds_and_zeros(mc, monkeypatch):
     assert ch.input_source is None
     assert ch.value == 0.0
     assert mc._snapshot()["channels"][0]["input_source"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# input-source watchdog
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_watchdog_noop_for_manual_channel(mc):
+    ch = _mk_channel(value=0.5)  # no input_source
+    assert mc._check_input_watchdog(ch, time.monotonic()) is False
+    assert ch.value == 0.5
+
+
+def test_watchdog_leaves_fresh_input_alone(mc):
+    from motor_control import InputSource
+    ch = _mk_channel(value=0.5, input_source=InputSource(topic="t", index=3, timeout_s=0.2))
+    mc._input_last_seen["left"] = time.monotonic()  # just now
+    assert mc._check_input_watchdog(ch, time.monotonic()) is False
+    assert ch.value == 0.5
+
+
+def test_watchdog_zeros_target_after_timeout(mc):
+    from motor_control import InputSource
+    ch = _mk_channel(value=0.5, input_source=InputSource(topic="t", index=3, timeout_s=0.1))
+    mc._input_last_seen["left"] = time.monotonic() - 1.0  # long past timeout_s
+    assert mc._check_input_watchdog(ch, time.monotonic()) is True
+    assert ch.value == 0.0
+    assert mc._input_stale["left"] is True
+
+
+def test_watchdog_treats_never_seen_as_stale(mc):
+    """No _input_last_seen entry at all (shouldn't happen in real operation —
+    _resync seeds it when a subscription starts — but staleness must be the
+    safe default if it somehow does)."""
+    from motor_control import InputSource
+    ch = _mk_channel(value=0.5, input_source=InputSource(topic="t", index=3, timeout_s=0.1))
+    assert mc._check_input_watchdog(ch, time.monotonic()) is True
+    assert ch.value == 0.0
+
+
+def test_watchdog_recovers_once_input_resumes(mc):
+    from motor_control import InputSource
+    ch = _mk_channel(value=0.5, input_source=InputSource(topic="t", index=3, timeout_s=0.1))
+    now = time.monotonic()
+    mc._input_last_seen["left"] = now - 1.0
+    assert mc._check_input_watchdog(ch, now) is True
+    # A fresh message arrives (as _input_loop would record) …
+    mc._input_last_seen["left"] = now
+    ch.value = 0.3  # … and _apply_input would set a new target
+    assert mc._check_input_watchdog(ch, now) is False
+    assert ch.value == 0.3
+    assert mc._input_stale["left"] is False
+
+
+def test_watchdog_logs_stale_transition_once(mc, caplog):
+    import logging
+    from motor_control import InputSource
+    ch = _mk_channel(value=0.5, input_source=InputSource(topic="/joystick/joystick-2/input", index=3, timeout_s=0.1))
+    now = time.monotonic()
+    mc._input_last_seen["left"] = now - 1.0
+    with caplog.at_level(logging.WARNING):
+        mc._check_input_watchdog(ch, now)
+        mc._check_input_watchdog(ch, now)  # still stale — must not re-log
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "joystick-2" in warnings[0].message
+
+
+def _mk_channel(*, value, input_source=None):
+    from motor_control import MotorChannel
+    return MotorChannel(id="left", value=value, input_source=input_source)
 
 
 class _DummyEstop:

@@ -646,7 +646,7 @@ class AppServer:
         # the catalog/sources aren't CRUD collections. DEFICIT: (a) attaching
         # actions to a non-CRUD/aggregate resource, and (b) async action
         # handlers (the generated -request handler is sync). See
-        # docs/TODO_REPO.md.
+        # repo/README.md's "Lifecycle states" section.
         from botgear.api.registry_api import register_registry_routes
         register_registry_routes(self.app, self.get_db_provider)
 
@@ -1286,6 +1286,8 @@ class AppServer:
                     reset_token=reset_token,
                 )
                 logger.info(f"Password reset email sent to {request.email}")
+            except HTTPException:
+                raise  # preserve the intended 404 instead of masking it as a 500 (same pattern as reset-password)
             except Exception as e:
                 logger.error(f"Error handling forgot password request: {e}")
                 raise HTTPException(status_code=500, detail="Failed to process forgot password request")
@@ -1561,9 +1563,12 @@ class AppServer:
             logging.info("Uvicorn access log enabled: %s", access_log_enabled)
         if self.settings.ssl_enabled:
             logging.info("SSL enabled")
-            generate_self_signed_cert()
             config_kwargs["ssl_keyfile"] = "ssl/key.pem"
             config_kwargs["ssl_certfile"] = "ssl/cert.pem"
+            generate_self_signed_cert(
+                cert_file=config_kwargs["ssl_certfile"],
+                key_file=config_kwargs["ssl_keyfile"],
+            )
         config = Config(**config_kwargs)
         server = Server(config)
         await server.serve()

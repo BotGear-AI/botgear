@@ -1,7 +1,7 @@
 # unmanaged
 """brain service — folder-defined, AI-agnostic workflow brain.
 
-See ``docs/TODO_BRAIN.md`` for the full spec. Public entry point is
+See this type's ``README.md`` for the full spec. Public entry point is
 ``BrainService``; everything else under this package is implementation
 detail.
 """

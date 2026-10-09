@@ -23,6 +23,19 @@ def auth_provider(tinydb_instance):
     provider.database = tinydb_instance
     return provider
 
+def test_get_user_rejects_single_purpose_token(auth_provider):
+    # An mfa_pending token carries a purpose claim and must not authenticate on
+    # ANY token->access path (get_user/refresh_token/logout), or it could be
+    # replayed as a bearer credential. Rejection is centralized in
+    # jwt_util.verify_jwt so every path is covered.
+    from auth.jwt_util import mint_purpose_token, MFA_PENDING_PURPOSE
+
+    token = mint_purpose_token("u@example.com", MFA_PENDING_PURPOSE, ttl_minutes=5)
+    assert auth_provider.get_user(token) is None
+    assert auth_provider.refresh_token(token) is None
+    assert auth_provider.logout(token) is False
+
+
 def test_register_and_authenticate(auth_provider):
     username = "testuser@example.com"
     password = "testpass"
@@ -135,3 +148,46 @@ def test_generate_token_falls_back_to_env_when_no_arg(auth_provider, monkeypatch
     import time
     delta = decoded["exp"] - int(time.time())
     assert 230 <= delta <= 250, f"Expected ~240s (4 min), got {delta}s"
+
+
+class _MemoryDB:
+    """Just enough of the database interface for LocalAuthProvider."""
+    def __init__(self):
+        self.rows = {}
+
+    def get_all_items(self, table):
+        return list(self.rows.values())
+
+    def get_item(self, table, key):
+        return dict(self.rows[key]) if key in self.rows else None
+
+    def insert_item(self, table, key, record):
+        self.rows[key] = dict(record)
+
+    def update_item(self, table, key, record, **kw):
+        self.rows.setdefault(key, {}).update(record)
+
+
+def test_seeded_admin_is_stored_with_its_password_hash(monkeypatch):
+    # AuthUser excludes password_hash from model_dump(); the admin_seed write
+    # path must add it back or the seeded admin can never log in.
+    monkeypatch.setattr(LocalAuthProvider, "_get_or_create_admin_password", lambda self: "seed-pw")
+    LocalAuthProvider._instance = None
+    provider = LocalAuthProvider({"foo": "bar"})
+    provider.database = _MemoryDB()
+    provider._bootstrap_mode = "admin_seed"
+    provider._initialize_users()
+    assert provider.database.get_item("user", "admin@cloudseeder.ai")["password_hash"]
+    assert provider.authenticate("admin@cloudseeder.ai", "seed-pw") is not None
+
+
+def test_registered_user_record_keeps_secrets_but_responses_do_not(auth_provider):
+    from models.auth_user import AuthUser
+    username = "secrets@example.com"
+    if auth_provider.database.get_item("user", username):
+        auth_provider.database.delete_item("user", username)
+    auth_provider.register_user(username, password_hash=auth_provider.generate_hash("pw"))
+    stored = auth_provider.database.get_item("user", username)
+    assert stored["password_hash"]                                   # written
+    assert "password_hash" not in AuthUser(**stored).model_dump()    # still never in a response
+    auth_provider.database.delete_item("user", username)

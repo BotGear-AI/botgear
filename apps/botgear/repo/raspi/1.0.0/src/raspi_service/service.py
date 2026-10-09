@@ -4,21 +4,18 @@ Subprocess service. On start: detect board + open the right backend.
 Exposes per-pin set_pin_mode/digital_read/digital_write/pwm_write plus
 continuous polling and I2C scan/read/write.
 
-Bus topics
-----------
-
-  /raspi/{id}/state        retained — full snapshot (board info + pin states + mode)
-  /raspi/{id}/control      incoming @service_method actions
-  /raspi/{id}/heartbeat    1Hz (base-class)
-  /raspi/{id}/pin/{N}      per-pin value updates (poll_pin + read/write echoes)
-  /raspi/{id}/i2c/scan     i2c_scan result (last)
+Wire shape is declared in code below (``RaspiState``, ``PinPayload``,
+``I2CScanPayload`` via ``state_schema``/``topic_schemas``; per-pin
+topics are the templated ``pin/{pin}``) and introspected into
+``/runtime/runtime/types/raspi``, as are the ``control`` actions.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig, SubprocessService, service_method
 
 from .board import detect_board
@@ -39,6 +36,28 @@ class RaspiConfig(ServiceConfig):
     pin_polls: Dict[str, int] = {}     # 'pin' (BCM, str) → interval_ms
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class RaspiState(BaseModel):
+    """Retained on ``/raspi/{id}/state`` — board info + pin states."""
+    board: Dict[str, Any] = Field(description="board.detect_board(): kind ('pi' | 'mock'), model, gpio_pins, pin_functions, ...")
+    backend_mode: str
+    pins: Dict[str, Dict[str, Any]] = Field(description="BCM pin -> {mode, value, ...}")
+    polling: Dict[str, int] = Field(description="Polled pin -> interval ms")
+
+
+class PinPayload(BaseModel):
+    """Published on ``/raspi/{id}/pin/{pin}`` — every poll tick and each
+    read/write echo."""
+    value: Optional[Union[int, float]] = Field(description="Digital 0/1, or PWM duty 0.0-1.0")
+
+
+class I2CScanPayload(BaseModel):
+    """Retained on ``/raspi/{id}/i2c/scan`` — the last scan's result."""
+    bus: int
+    addresses: List[str] = Field(description="Responding 7-bit addresses as '0x..' hex")
+
+
 class RaspiService(SubprocessService):
     """Bus-facing wrapper around gpiozero + smbus2."""
 
@@ -46,6 +65,8 @@ class RaspiService(SubprocessService):
     heartbeat_interval_s = 1.0
     config_class = RaspiConfig
     publishes = ["state", "i2c/scan"]
+    state_schema = RaspiState
+    topic_schemas = {"i2c/scan": I2CScanPayload, "pin/{pin}": PinPayload}
 
     def __init__(self, proxy_id: str, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -94,12 +115,13 @@ class RaspiService(SubprocessService):
         pins: Dict[str, Any] = {}
         for p, st in (self.backend.pins if self.backend else {}).items():
             pins[str(p)] = dict(st)
-        return {
-            "board": self.board,
-            "backend_mode": self.backend.mode if self.backend else "uninitialised",
-            "pins": pins,
-            "polling": dict(self.config.pin_polls or {}),
-        }
+        state = RaspiState(
+            board=self.board,
+            backend_mode=self.backend.mode if self.backend else "uninitialised",
+            pins=pins,
+            polling=dict(self.config.pin_polls or {}),
+        )
+        return state.model_dump()
 
     async def publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)
@@ -150,7 +172,7 @@ class RaspiService(SubprocessService):
             raise RuntimeError("backend not initialised")
         self.backend.digital_write(int(pin), int(value))
         v = 1 if int(value) else 0
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": v})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=v).model_dump())
         return {"pin": int(pin), "value": v}
 
     @service_method("digital_read")
@@ -158,7 +180,7 @@ class RaspiService(SubprocessService):
         if self.backend is None:
             raise RuntimeError("backend not initialised")
         v = self.backend.digital_read(int(pin))
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": v})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=v).model_dump())
         return {"pin": int(pin), "value": v}
 
     @service_method("pwm_write")
@@ -167,7 +189,7 @@ class RaspiService(SubprocessService):
             raise RuntimeError("backend not initialised")
         d = max(0.0, min(1.0, float(duty)))
         self.backend.pwm_write(int(pin), d)
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": d})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=d).model_dump())
         return {"pin": int(pin), "duty": d}
 
     # ─── continuous polling ──────────────────────────────────────────
@@ -225,7 +247,7 @@ class RaspiService(SubprocessService):
             while True:
                 try:
                     v = self.backend.digital_read(pin)
-                    await self.bus.publish(self.pin_topic(pin), {"value": v})
+                    await self.bus.publish(self.pin_topic(pin), PinPayload(value=v).model_dump())
                 except Exception:  # noqa: BLE001
                     logger.exception("raspi %s: poll(%d) read failed", self.proxy_id, pin)
                     return
@@ -239,7 +261,7 @@ class RaspiService(SubprocessService):
         if self.backend is None:
             raise RuntimeError("backend not initialised")
         addrs = self.backend.i2c_scan(int(bus))
-        payload = {"bus": int(bus), "addresses": [f"0x{a:02x}" for a in addrs]}
+        payload = I2CScanPayload(bus=int(bus), addresses=[f"0x{a:02x}" for a in addrs]).model_dump()
         await self.publish("i2c/scan", payload, retained=True)
         return payload
 

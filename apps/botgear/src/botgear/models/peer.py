@@ -14,6 +14,7 @@ class Peer(BaseModel):
     state: Optional[str] = Field(None, description="Connection state - identifying, connected, disconnected", json_schema_extra={"example":"connected"})
     upstream_subs: Optional[List[str]] = Field(None, description="Topic names this runtime subscribes to from the peer (bridged upstream)")
     collision: Optional[str] = Field(None, description="Set when the peer's runtime id collides with ours; human-readable detail")
+    auth: Optional[str] = Field(None, description="Credential type in use for this connection — 'api_key' (per-peer, revocable) or 'shared_secret' (JWT_SECRET_KEY). Never the secret itself.", json_schema_extra={"example":"api_key"})
 
 # managed
     @classmethod

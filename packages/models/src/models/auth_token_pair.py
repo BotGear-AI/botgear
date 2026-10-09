@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class AuthTokenPair(BaseModel):
     access_token: Optional[str] = Field(None, description="JWT access token", json_schema_extra={"example":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."})

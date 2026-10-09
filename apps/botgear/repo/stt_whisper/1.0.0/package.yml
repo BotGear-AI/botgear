@@ -1,0 +1,94 @@
+name: stt_whisper
+title: Speech-to-text (Whisper)
+description: |
+  Whisper-family speech-to-text, backed by ``faster-whisper``
+  (CTranslate2) — no cloud, models run entirely on-host. The second
+  ``transcription`` capability implementor alongside ``stt_local``: same
+  control interface (listen / start / stop / select_input / set_model /
+  list_models / mute / unmute), same ``/stt/{id}/state`` and
+  ``/stt/{id}/text`` topic shapes, so a consumer wired to a specific
+  instance id (the brain's conversation config, a custom robot) doesn't
+  care which engine backs it. Swap an ``stt_local`` instance for an
+  ``stt_whisper`` one (or vice versa) with no other change.
+
+  The tradeoff vs. ``stt_local``: Whisper is not a streaming recognizer —
+  it transcribes a whole utterance in one pass, not frame-by-frame. This
+  service buffers incoming audio and only runs the model once trailing
+  silence crosses the configured endpoint gap (or a 30s safety cap is
+  hit). **Consequence: this engine only emits FINAL transcripts — no live
+  partials** (``stt_local`` streams partials as you speak; this one goes
+  quiet until the utterance ends, then posts the whole thing). In
+  exchange, Whisper is meaningfully more accurate, multilingual, and
+  robust to accents/background noise than the small streaming Zipformer
+  ``stt_local`` uses.
+
+  Pick which microphone to transcribe with ``select_input`` /
+  ``input_kind: topic`` + ``input_ref: /microphone/{id}/audio`` — same as
+  ``stt_local``.
+
+  The first use of a model downloads it (Hugging Face Hub, size varies by
+  model — ~75 MB for the default ``base.en``, much larger for
+  ``large-v3``) into ``<data>/stt/models/``; subsequent runs are offline.
+
+  Backed by ``faster-whisper``, whose dependency chain (CTranslate2 + the
+  ``av`` package for audio decoding) ships prebuilt wheels for Linux
+  x86_64/aarch64 (64-bit Raspberry Pi OS), macOS, and Windows — no torch,
+  no system ffmpeg install. Unlike ``stt_local``'s sherpa-onnx, there are
+  no 32-bit ARM wheels, so this engine can't claim the same "runs
+  everywhere" guarantee on older 32-bit Raspberry Pi OS installs. See
+  this type's ``README.md`` for the full design writeup.
+
+  Subprocess service: inference runs in a child process, isolated from
+  the backend.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [audio, stt, asr, input, whisper]
+icon: icon.svg
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+implements: [transcription]
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/stt_whisper/1.0.0"
+
+entry:
+  argv: [python, -m, stt_whisper_service]
+
+wizard_config:
+  - id: defaults
+    title: Transcription settings
+    fields:
+      - id: input_ref
+        type: string
+        title: Microphone audio topic
+        description: "The mic audio topic to transcribe, e.g. /microphone/mic_local-1/audio. The view also sets this live."
+      - id: model
+        type: string
+        title: Model (optional)
+        description: "faster-whisper model id, e.g. base.en, small, large-v3. Blank = the default (base.en, downloaded on first use)."
+      - id: language
+        type: string
+        title: Language (optional)
+        description: "Force a language code (e.g. en, es, zh). Blank = auto-detect per utterance."
+      - id: sample_rate
+        type: integer
+        title: Source sample rate (Hz)
+        default: 16000
+      - id: continuous
+        type: boolean
+        title: Transcribe on start
+        default: false
+      - id: compute_type
+        type: string
+        title: Compute type (advanced)
+        description: "CTranslate2 compute type: int8 (default, CPU) | int8_float16 | float16 | float32."
+        default: int8

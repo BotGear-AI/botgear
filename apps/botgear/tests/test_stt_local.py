@@ -118,11 +118,27 @@ class FakeRecognizer:
         self.reset_called = True
 
 
+class FakeStream:
+    """Minimal stand-in for a real sherpa-onnx stream object. `_feed()`
+    calls `.accept_waveform(sample_rate, samples)` on it before handing
+    it to the recognizer — a bare `object()` doesn't have that method,
+    so these tests need this rather than the sentinel they'd been using
+    (that gap was masked by `pytest.importorskip("numpy")` skipping
+    both tests entirely whenever numpy wasn't installed in this venv;
+    numpy is now a real botgear dependency — see pyproject.toml — so
+    they actually run)."""
+    def __init__(self) -> None:
+        self.waveforms = []
+
+    def accept_waveform(self, sample_rate, samples):
+        self.waveforms.append((sample_rate, samples))
+
+
 def test_feed_translates_endpoint_to_final(tmp_path, monkeypatch):
     pytest.importorskip("numpy")
     svc = _svc(tmp_path, monkeypatch)
     reco = FakeRecognizer(endpoint=True)
-    handle = {"recognizer": reco, "stream": object(), "sample_rate": 16000}
+    handle = {"recognizer": reco, "stream": FakeStream(), "sample_rate": 16000}
     res = svc._feed(handle, array("h", [1000] * 320).tobytes())
     assert res == {"text": "hello world", "final": True}
     assert reco.reset_called is True
@@ -134,7 +150,7 @@ def test_feed_partial_branch_no_reset(tmp_path, monkeypatch):
     pytest.importorskip("numpy")
     svc = _svc(tmp_path, monkeypatch)
     reco = FakeRecognizer(endpoint=False)
-    handle = {"recognizer": reco, "stream": object(), "sample_rate": 16000}
+    handle = {"recognizer": reco, "stream": FakeStream(), "sample_rate": 16000}
     res = svc._feed(handle, array("h", [1000] * 320).tobytes())
     assert res == {"text": "hello world", "final": False}   # partial
     assert reco.reset_called is False                       # no reset mid-utterance

@@ -1,5 +1,6 @@
 # unmanaged
-"""Boot-from-config-set — stone 4 of the TODO_CONFIG_SETS spec.
+"""Boot-from-config-set — stone 4 of the config-sets design (see AGENTS.md's
+"Config sets" section).
 
 Glue between the file-based loader (``runtime/config_sets.py``) and the
 existing lifecycle that walks ``service_proxy`` rows. Three responsibilities:
@@ -186,6 +187,43 @@ def _row_to_config_instance(row: Dict[str, Any], manifest: PackageManifest, repo
         raise RuntimeError(f"{manifest.name} has no config_class")
     # service_config is a plain dict — go straight through Pydantic.
     return config_class(**(row.get("service_config") or {}))
+
+
+def resolve_config_class(type_id: str, repo_dir: Optional[Path] = None):
+    """Best-effort lookup of a service type's ``config_class``, by
+    ``service_meta_id`` (``"<name>@<version>"``). Returns ``None`` on any
+    failure — no manifest found, or ``_load_service_class`` couldn't
+    import the module (e.g. a subprocess service that imports its
+    third-party SDK at module scope, which isn't installed in the main
+    backend's venv).
+
+    Uses the same ``_load_service_class`` dynamic-file-load path
+    ``_row_to_config_instance`` does — it works for BOTH in-process and
+    subprocess service modules as long as importing the module doesn't
+    require a dependency only the per-type venv has. Subprocess service
+    authors: keep third-party SDK imports lazy (inside methods, not at
+    module top-level) if you want this to resolve your config_class —
+    that's what lets the backend introspect ``SecretStr`` fields for
+    masking (see ``discovery._mask_secret_fields``) without needing your
+    SDK installed in the main venv.
+    """
+    try:
+        from config import get_settings
+        from botgear.framework.adapters.in_process import _load_service_class
+        settings = get_settings()
+        manifest = {m.id: m for m in scan_repos(repo_roots(settings))}.get(type_id)
+        if manifest is None:
+            return None
+        module_name = manifest.entry.module or manifest.name
+        class_name = manifest.entry.class_name or (
+            "".join(p.capitalize() for p in manifest.name.split("_")) + "Service"
+        )
+        cls = _load_service_class(
+            root_of(manifest), manifest.name, manifest.version, module_name, class_name,
+        )
+        return getattr(cls, "config_class", None)
+    except Exception:  # noqa: BLE001 — best-effort; caller falls back
+        return None
 
 
 def _write_raw_yml(

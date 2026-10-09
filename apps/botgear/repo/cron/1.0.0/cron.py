@@ -6,12 +6,12 @@ Each cron service instance holds a list of jobs. A job is a triplet
 service runs a 1-second tick loop; whenever a job's next-fire time is
 reached the payload is published to the target topic.
 
-Wire contract
--------------
-
-  /cron/{id}/state    retained  — {jobs: [...]}, full snapshot
-  /cron/{id}/fired              — {job_id, topic, ts}, every time a job fires
-  /cron/{id}/control            — actions (see @service_method list)
+Wire shape is declared in code below (``CronState``, ``FiredPayload``,
+``state_schema``/``topic_schemas``) — introspected into this type's
+descriptor at ``/runtime/runtime/types/cron``. ``control`` actions are
+discoverable the same way, off their @service_method signatures. Each
+job's own publish goes to its user-configured ``topic`` with an
+arbitrary ``payload``, so it has no fixed schema.
 
 Schedule format is the standard 5-field cron expression
 ``minute hour day-of-month month day-of-week``, parsed by croniter. All
@@ -62,10 +62,33 @@ class CronConfig(ServiceConfig):
     jobs: List[CronJob] = Field(default_factory=list)
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class CronJobState(CronJob):
+    """One job as it appears in ``/state`` — the persisted ``CronJob``
+    plus the computed ``next_run``."""
+    next_run: Optional[float] = Field(None, description="Epoch seconds of next fire; None when disabled or schedule is invalid")
+
+
+class CronState(BaseModel):
+    """Retained on ``/cron/{id}/state`` — full job snapshot."""
+    jobs: List[CronJobState]
+
+
+class FiredPayload(BaseModel):
+    """Published on ``/cron/{id}/fired`` every time a job fires."""
+    job_id: str
+    name: str
+    topic: str = Field(description="Topic the job's payload was published to")
+    ts: float = Field(description="Epoch seconds of the fire")
+
+
 class CronService(Service):
     """Scheduled publisher. See module docstring for the wire contract."""
 
     config_class = CronConfig
+    state_schema = CronState
+    topic_schemas = {"fired": FiredPayload}
     publishes = ["state", "fired"]
 
     _tick_task: Optional[asyncio.Task] = None
@@ -235,12 +258,11 @@ class CronService(Service):
             return None
 
     def _snapshot(self) -> Dict[str, Any]:
-        jobs = []
-        for j in self.config.jobs:
-            d = j.model_dump()
-            d["next_run"] = self._next_run_for(j) if j.enabled else None
-            jobs.append(d)
-        return {"jobs": jobs}
+        state = CronState(jobs=[
+            CronJobState(**j.model_dump(), next_run=self._next_run_for(j) if j.enabled else None)
+            for j in self.config.jobs
+        ])
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         self.publish("state", self._snapshot(), retained=True)
@@ -258,8 +280,8 @@ class CronService(Service):
             self.publish(job.topic, job.payload, retained=job.retained)
             job.last_run = now
             job.last_error = None
-            self.publish("fired", {"job_id": job.id, "name": job.name,
-                                   "topic": job.topic, "ts": now})
+            fired = FiredPayload(job_id=job.id, name=job.name, topic=job.topic, ts=now)
+            self.publish("fired", fired.model_dump())
         except Exception as exc:  # noqa: BLE001
             logger.exception("cron %s: job %s fire failed", self.proxy_id, job.id)
             job.last_error = f"{type(exc).__name__}: {exc}"

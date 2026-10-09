@@ -3,18 +3,23 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "webxr modular UI (Option B). Two entries: View.tsx → ui.js (desktop control panel) and xr/View.tsx → xr.js (immersive in-headset client). react / react-dom / @rlx/ui are host-provided EXTERNALS — never list them here.",
+  "description": "webxr modular UI (Option B). Two entries: View.tsx → ui.js (desktop control panel — react/react-dom/@rlx/ui are host-provided EXTERNALS here, never bundled, same as every other service) and xr/View.tsx → xr.js (immersive in-headset client — `rlx.xrStandalone` below opts this ONE entry out of that: it bundles its own private react+react-dom instead of sharing the host's, because @react-three/fiber vendors its own react-reconciler build and sharing a singleton across that boundary repeatedly broke on React's unstable internals as the host's react-dom patch version and the vendored reconciler drifted apart — see build-service-ui.mjs's `standalone` doc comment). react/react-dom are still pinned under devDependencies (exactly matching botgear_ui's installed version) so npm's peer-dependency resolution — and, for xr.js specifically, the ACTUAL bundled version — line up with what react-reconciler declares it needs, rather than npm free-floating to whatever's newest.",
   "dependencies": {
-    "@react-three/drei": "^9.92.0",
-    "@react-three/fiber": "^8.15.0",
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
     "@react-three/xr": "^6.6.0",
     "html2canvas": "^1.4.1",
-    "lucide-react": "^0.344.0",
-    "three": "^0.160.0"
+    "lucide-react": "^1.26.0",
+    "three": "^0.186.0"
+  },
+  "devDependencies": {
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
   },
   "rlx": {
     "entry": "View.tsx",
     "sdk": "^1.0",
+    "xrStandalone": true,
     "aliases": {
       "iwer": "./xr/iwer-stub.ts",
       "@iwer/devui": "./xr/iwer-stub.ts",

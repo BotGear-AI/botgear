@@ -57,7 +57,7 @@ def migrate_table_to_flattened(sqlite_path, table_name, json_col='json', id_col=
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python convert_to_flattened.py <sqlite_path> <table_name> [json_col] [id_col]")
+        print("Usage: python -m database.convert_to_flattened <sqlite_path> <table_name> [json_col] [id_col]")
         sys.exit(1)
     sqlite_path = sys.argv[1]
     table_name = sys.argv[2]

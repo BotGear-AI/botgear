@@ -5,22 +5,26 @@ services in its repo *and* the framework + builtins it's running — through
 a transparent wizard that shows what can be upgraded and lets the operator
 choose. Updating a live robot is genuinely hard; this doc is the
 **maintained, extensible** plan of record. Keep it in sync as the code
-lands (mirror `TODO_REPO_PLAN.md`'s "verified against the code" discipline).
+lands (mirror the same "verified against the code" discipline the old
+`TODO_REPO_PLAN.md` used, before it was folded into `repo/README.md`).
 
 Status legend: ✅ done · 🔜 next · ⬜ planned · ⚠️ risk/decision open
 
 Status date: 2026-06-27 (design; nothing in this doc is built yet except
 the primitives in §2).
 
-Companion docs it **extends, never forks**: `TODO_REPO_PLAN.md`
-(registry `type@version` + `install_phase` + multi-registry),
-`TODO_INSTALL_WIZARD.md` / `TODO_UNINSTALL.md` (the install/uninstall
-engine + `/service_request` progress), `TODO_CONFIG_SETS.md` ("file is
-truth" + graceful restart), `TODO_WORKSPACES_AND_RESTART.md` (re-exec +
-reconcile), `TODO_SERVICE_UI_BUNDLES.md` (per-version `ui.js`),
-`../TODO_PUBLIC_REPO.md` (D6: the deployed runtime only **consumes**
-Releases — it downloads/verifies/swaps/restarts and ships **no**
-build/publish/deploy tooling).
+Prior art it **extends, never forks** — now-closed TODO docs whose
+durable content was migrated into `repo/README.md` / `AGENTS.md` (see
+each file's own "Reference" trail for where to look): registry
+`type@version` + `install_phase` + multi-registry (was
+`TODO_REPO_PLAN.md`), the install/uninstall engine + `/service_request`
+progress (was `TODO_INSTALL_WIZARD.md` / `TODO_UNINSTALL.md`), "file is
+truth" + graceful restart (was `TODO_CONFIG_SETS.md`), re-exec +
+reconcile (was `TODO_WORKSPACES_AND_RESTART.md`), per-version `ui.js`
+(was `TODO_SERVICE_UI_BUNDLES.md`). `../TODO_CROSS_PLATFORM_RELEASE.md` (the
+deployed runtime only **consumes** Releases — it downloads/verifies/
+swaps/restarts and ships **no** build/publish/deploy tooling) — lives
+outside `apps/botgear/docs/`, not audited as part of this grooming pass.
 
 ---
 
@@ -52,14 +56,14 @@ machinery (A/B layout, backup/rollback, migrations, version surfacing).
 |---|---|---|
 | Registry load (ABSENT→LOADED): download, **sha256 verify**, traversal-guarded extract into writable `var/repo/<name>/<ver>/` | ✅ | `runtime/registry.py:180-215` (`fetch_merged_catalog`), `:259-330` (`_download`/`_extract_archive`), `repo.py:290-294` (`writable_repo_dir`) |
 | Registry install (LOADED→INSTALLED): per-type `.venv` on a daemon thread, `/registry/install/{name}@{ver}/progress` bus stream, serialized under `_REGISTRY_INSTALL_LOCK` | ✅ | `api/registry_api.py:182`, `runtime/registry.py` |
-| Install / uninstall wizard + `/service_request` progress channel + `InstallProgress.tsx` step UI | ✅ | `TODO_INSTALL_WIZARD.md`, `TODO_UNINSTALL.md` |
+| Install / uninstall wizard + `/service_request` progress channel + `InstallProgress.tsx` step UI | ✅ | `AGENTS.md` ("Service install / config wizard", "Service type install / uninstall") |
 | Graceful restart + re-exec: `set_draining` → `save_all_service_config` (snapshot desired_state) → `drain_services` → `os.execv`; recorded launch command replayed | ✅ tested | `runtime/system.py` (`graceful_restart`, `record_start_command`), `api/system_api.py:106-117` |
 | Boot reconcile: `boot_from_config_set` → `reconcile_running_proxies` revives exact prior running state | ✅ | `runtime/workspaces.py`, `event_handlers.py` |
-| Config sets ("file is truth"): `runtime.yml` + `<proxy_id>.yml` + `active_set.txt` + `.migrated` marker; secrets as `Encrypted--` leaves via `security` singleton | ✅ | `runtime/config_sets.py:150-224`, `TODO_CONFIG_SETS.md` |
+| Config sets ("file is truth"): `runtime.yml` + `<proxy_id>.yml` + `active_set.txt` + `.migrated` marker; secrets as `Encrypted--` leaves via `security` singleton | ✅ | `runtime/config_sets.py:150-224`, `AGENTS.md` ("Config sets") |
 | Data isolation: `entry.py` points `DATA_DIR`, `REPO_DIR`, and cwd all into `var/`; the frozen bundle holds **no** user state | ✅ | `packaging/entry.py:55-93` |
 | Version surfacing: `version.json` → `/v1/version`, OpenAPI, mDNS announce, `/runtime/info` federation payload | ✅ (binary side) | `build.sh:271`, `entry.py:63-68`, `server.py:50,523-525`, `event_handlers.py:328-336` |
 | Per-version UI bundle serving: `/repo/<name>/<ver>/ui.js` (no-cache + ETag) | ✅ | `runtime/script_routes.py:106-127` |
-| Public Releases as the runtime + registry source | ✅ | `../TODO_PUBLIC_REPO.md` Phase 3, `tools/publish_services.py` |
+| Public Releases as the runtime + registry source | ⚠️ | runtime releases ✅; the public service catalog is gone — `../TODO_CROSS_PLATFORM_RELEASE.md` Phase 1, `tools/publish_services.py` |
 
 ### Gaps this feature closes
 - ⬜ No "what can be upgraded?" detector (installed-vs-latest, framework or service).

@@ -1,264 +1,164 @@
 # unmanaged
-"""Pydantic-driven JSON Schema introspection for service classes.
+"""Type-descriptor schema introspection — thin botgear-side wrappers.
 
-Builds the schema halves of the type descriptor consumed by the runtime
-types-index publisher (``runtime/types_index.py``):
+The actual JSON-Schema logic (config/state/topic schemas + method arg
+schemas) lives in ``rlx_bus.introspect`` — shared with every subprocess
+type's own venv, since ``rlx_bus`` is the one package guaranteed
+installed there (see ``installer.py:_rlx_bus_local_path``). This file
+used to duplicate that logic locally; it now just imports it, so the
+in-process and subprocess introspection paths can never drift apart.
 
-  * ``config_class_schema`` — JSON Schema of the service's ``ServiceConfig``
-    subclass. Pydantic v2 emits this for free via ``model_json_schema()``.
-  * ``method_args_schema`` — JSON Schema for the arguments of a single
-    ``@service_method``-decorated callable. Uses ``inspect.signature`` +
-    ``pydantic.TypeAdapter`` per parameter so untyped, primitive, and
-    Pydantic-typed args all surface a consistent schema.
-  * ``class_state_schema`` — JSON Schema of an optional ``state_schema``
-    Pydantic model declared on the Service class. Services that haven't
-    yet declared one return ``None``; the runtime descriptor just omits
-    the field for them.
-
-The repeated ``TypeAdapter`` calls are cheap (Pydantic caches the schema)
-but we cache here too because the types index is built lazily per
-service-type on first publish + republished only on hot-reload.
+This module additionally owns the one thing that's genuinely specific
+to the SUBPROCESS path: running ``rlx_bus.introspect.describe_class``
+inside a type's own venv via a one-shot subprocess, because the
+backend process can't import that venv's Service class directly.
 """
 from __future__ import annotations
 
-import functools
-import inspect
+import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Type
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, TypeAdapter
+from rlx_bus.introspect import (
+    args_schema_for as method_args_schema,
+    config_schema as config_class_schema,
+    describe_class,
+    state_schema as class_state_schema,
+    topic_schemas as class_topic_schemas,
+    subscribes_schemas as class_subscribes_schemas,
+    methods as introspect_methods,
+)
 
+__all__ = [
+    "config_class_schema",
+    "method_args_schema",
+    "class_state_schema",
+    "class_topic_schemas",
+    "class_subscribes_schemas",
+    "introspect_methods",
+    "subprocess_module_class",
+    "subprocess_introspect",
+]
 
 logger = logging.getLogger(__name__)
 
 
-# ─── config ──────────────────────────────────────────────────────────
+# ─── subprocess introspection (venv one-shot script) ────────────────
+#
+# Subprocess service types (oakd, video, arduino, discord, ...) declare
+# their Service class in a per-type venv the backend process can't
+# import directly (that's the whole point of isolating them — their
+# third-party SDKs are large/version-coupled-to-hardware). But nothing
+# stops us from asking THAT venv's own interpreter to import the class
+# and hand back rlx_bus.introspect.describe_class(cls) as plain JSON on
+# stdout — no live subprocess service needs to be running, this is a
+# one-shot script run via the venv's python, same pattern
+# ``installer.py`` already uses to pip-install into a type's venv.
+
+# Every existing subprocess service follows one convention (see
+# ``entry.argv: [python, -m, <package>]`` in package.yml):
+#   module   = "<package>.service"
+#   class    = "".join(capitalize(part) for part in <type_name>.split("_")) + "Service"
+# e.g. type "arduino_telemetrix" -> package "arduino_telemetrix_service"
+# -> module "arduino_telemetrix_service.service", class
+# "ArduinoTelemetrixService". Same class-name formula
+# ``boot.resolve_config_class``/``discovery._row_to_config_instance``
+# already use for in-process entries.
+_SUBPROCESS_INTROSPECT_SCRIPT = (
+    "import importlib, json, sys\n"
+    "from rlx_bus.introspect import describe_class\n"
+    "module_name, class_name = sys.argv[1], sys.argv[2]\n"
+    "try:\n"
+    "    mod = importlib.import_module(module_name)\n"
+    "    cls = getattr(mod, class_name, None)\n"
+    "    if cls is None:\n"
+    "        # Case-mismatch fallback for names like 'WebXRService' vs the\n"
+    "        # guessed 'WebxrService' -- match case-insensitively.\n"
+    "        for attr_name in dir(mod):\n"
+    "            if attr_name.lower() == class_name.lower():\n"
+    "                cls = getattr(mod, attr_name)\n"
+    "                break\n"
+    "    if cls is None:\n"
+    "        raise AttributeError(f'no {class_name!r} (case-insensitive) in {module_name}')\n"
+    "    print(json.dumps(describe_class(cls)))\n"
+    "except Exception as exc:\n"
+    "    print(json.dumps({'__error__': repr(exc)}))\n"
+)
+
+_SUBPROCESS_INTROSPECT_TIMEOUT_SECONDS = 15.0
 
 
-def config_class_schema(config_class: Optional[Type[BaseModel]]) -> Optional[Dict[str, Any]]:
-    """Return ``config_class.model_json_schema()`` or None on failure /
-    when the input is the bare ``ServiceConfig`` base (which has no
-    user-relevant fields).
-
-    Pydantic v2 always emits a JSON-Schema-2020-12-compatible object;
-    we pass it through unchanged so consumers can use any standard
-    validator (ajv, jsonschema, etc.).
+def subprocess_module_class(type_name: str, argv: List[str]) -> Optional[Tuple[str, str]]:
+    """Best-effort ``(module, class_name)`` for a subprocess type's
+    Service subclass, derived from its ``entry.argv``. Returns None when
+    argv doesn't match the ``[..., "-m", "<package>", ...]`` shape every
+    stock subprocess service uses.
     """
-    if config_class is None:
+    if not argv or "-m" not in argv:
+        return None
+    idx = argv.index("-m")
+    if idx + 1 >= len(argv):
+        return None
+    package = argv[idx + 1]
+    module = f"{package}.service"
+    class_name = "".join(p.capitalize() for p in type_name.split("_")) + "Service"
+    return module, class_name
+
+
+def subprocess_introspect(
+    venv_python: Path,
+    type_name: str,
+    argv: List[str],
+    *,
+    timeout: float = _SUBPROCESS_INTROSPECT_TIMEOUT_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Introspect a subprocess type's config/state/topic schemas +
+    methods by running a one-shot script inside the type's OWN venv
+    (the only place its Service class — and the third-party deps it
+    may import at module scope — can be imported).
+
+    Returns ``rlx_bus.introspect.describe_class``'s output —
+    ``{"config_schema": ..., "state_schema": ..., "topic_schemas": {...},
+    "methods": [...]}`` — or None on any failure: no venv yet (type
+    never installed), argv doesn't match the ``-m <package>``
+    convention, or the module/class can't be found. An empty/null-valued
+    result dict is a valid SUCCESS (the class just declares none of
+    these) — distinct from None (introspection itself couldn't run).
+    Never raises — this feeds a best-effort descriptor, not a hard
+    dependency.
+    """
+    if not venv_python.is_file():
+        return None
+    resolved = subprocess_module_class(type_name, argv)
+    if resolved is None:
+        return None
+    module_name, class_name = resolved
+    try:
+        proc = subprocess.run(
+            [str(venv_python), "-c", _SUBPROCESS_INTROSPECT_SCRIPT, module_name, class_name],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("subprocess_introspect: %s introspection failed to run: %s", type_name, exc)
+        return None
+    if proc.returncode != 0:
+        logger.info("subprocess_introspect: %s exited %d: %s",
+                     type_name, proc.returncode, (proc.stderr or "").strip()[-500:])
+        return None
+    raw = (proc.stdout or "").strip()
+    if not raw:
         return None
     try:
-        schema = config_class.model_json_schema()
-    except Exception:  # noqa: BLE001
-        logger.exception("config_class_schema: %s.model_json_schema failed",
-                         config_class.__name__)
+        result = json.loads(raw)
+    except ValueError:
+        logger.info("subprocess_introspect: %s produced non-JSON output", type_name)
         return None
-    return schema
-
-
-# ─── methods ─────────────────────────────────────────────────────────
-
-
-# Parameters never relevant to wire callers — they're dispatcher
-# internals (the bound instance) or framework conveniences.
-_SKIP_PARAMS = frozenset({"self", "cls"})
-
-
-def method_args_schema(fn: Any) -> Dict[str, Any]:
-    """Build a JSON Schema object describing the arguments accepted by
-    ``fn`` (a ``@service_method``-decorated callable).
-
-    Returns a JSON Schema of shape::
-
-        {"type": "object",
-         "properties": {arg_name: <schema>, ...},
-         "required": [...required arg names...],
-         "additionalProperties": false}
-
-    For each parameter:
-      * If it has a type annotation, Pydantic's ``TypeAdapter`` builds
-        the schema for that type (handles ``Optional``, ``List[int]``,
-        ``BaseModel`` subclasses, etc. uniformly).
-      * If untyped, the schema is ``{}`` — accepts anything.
-      * If a default value is present, the parameter is non-required and
-        ``default`` is set in the schema.
-
-    ``*args``/``**kwargs``/``VAR_POSITIONAL``/``VAR_KEYWORD`` are
-    skipped — wire dispatch goes through a dict so positional/varargs
-    don't appear in payloads.
-    """
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return {"type": "object", "properties": {}, "additionalProperties": True}
-
-    properties: Dict[str, Any] = {}
-    required: List[str] = []
-
-    for name, param in sig.parameters.items():
-        if name in _SKIP_PARAMS:
-            continue
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL,
-                          inspect.Parameter.VAR_KEYWORD):
-            continue
-        properties[name] = _param_schema(param)
-        if param.default is inspect.Parameter.empty:
-            required.append(name)
-
-    out: Dict[str, Any] = {
-        "type": "object",
-        "properties": properties,
-        "additionalProperties": False,
-    }
-    if required:
-        out["required"] = required
-    return out
-
-
-def _param_schema(param: inspect.Parameter) -> Dict[str, Any]:
-    """JSON Schema for one parameter. Falls back to a permissive {}
-    schema when the annotation can't be analysed (e.g. a forward-ref
-    that didn't get resolved at import time)."""
-    ann = param.annotation
-    schema: Dict[str, Any]
-    if ann is inspect.Parameter.empty:
-        schema = {}
-    else:
-        try:
-            schema = _adapt_schema(ann)
-        except Exception:  # noqa: BLE001 — TypeAdapter can raise for exotic types
-            logger.debug("method_args_schema: TypeAdapter failed for %r", ann)
-            schema = {}
-    if param.default is not inspect.Parameter.empty:
-        # Pydantic adapter doesn't know about the function's default;
-        # surface it directly so client tooling can pre-fill forms.
-        try:
-            # JSON-serialise sanity check (drops if non-serialisable).
-            import json as _json
-            _json.dumps(param.default)
-            schema["default"] = param.default
-        except (TypeError, ValueError):
-            pass
-    return schema
-
-
-@functools.lru_cache(maxsize=512)
-def _adapt_schema(ann: Any) -> Dict[str, Any]:
-    """Cached ``TypeAdapter(ann).json_schema()`` so the same annotation
-    used across many methods doesn't re-run Pydantic's schema builder."""
-    adapter = TypeAdapter(ann)
-    return adapter.json_schema()
-
-
-# ─── state schema ────────────────────────────────────────────────────
-
-
-def class_state_schema(cls: Type) -> Optional[Dict[str, Any]]:
-    """Return JSON Schema for ``cls.state_schema`` if the service
-    declares one, else None.
-
-    Convention: a Service subclass declares::
-
-        class StateSchema(BaseModel):
-            status: Literal["running", "starting", "error", "stopped"]
-            ...
-        state_schema = StateSchema
-
-    Phase F (a future migration) wires the schema as the single source
-    of truth for the /state payload; for now this just adds the
-    self-describing JSON Schema to the type descriptor when present.
-    """
-    schema_cls = getattr(cls, "state_schema", None)
-    if schema_cls is None:
+    if not isinstance(result, dict):
         return None
-    if not isinstance(schema_cls, type) or not issubclass(schema_cls, BaseModel):
+    if "__error__" in result:
+        logger.info("subprocess_introspect: %s introspection error: %s",
+                     type_name, result["__error__"])
         return None
-    try:
-        return schema_cls.model_json_schema()
-    except Exception:  # noqa: BLE001
-        logger.exception("class_state_schema: %s.model_json_schema failed",
-                         schema_cls.__name__)
-        return None
-
-
-# ─── topic schemas ───────────────────────────────────────────────────
-
-
-def class_topic_schemas(cls: Type) -> Dict[str, Dict[str, Any]]:
-    """Return a ``{topic_role: JSON Schema}`` map built from
-    ``cls.topic_schemas`` if declared.
-
-    Convention::
-
-        class VideoService(SubprocessService):
-            topic_schemas = {
-                "snapshot": SnapshotPayload,        # Pydantic model
-                "latest_snapshot": SnapshotPayload, # same
-            }
-
-    Each value is a Pydantic BaseModel subclass (preferred) — or a
-    pre-built JSON Schema dict (passes through unchanged). Anything
-    else is dropped + logged.
-    """
-    raw = getattr(cls, "topic_schemas", None) or {}
-    if not isinstance(raw, dict):
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    for k, v in raw.items():
-        if isinstance(v, dict):
-            out[k] = v
-            continue
-        if isinstance(v, type) and issubclass(v, BaseModel):
-            try:
-                out[k] = v.model_json_schema()
-            except Exception:  # noqa: BLE001
-                logger.exception("class_topic_schemas: %s.model_json_schema failed",
-                                 v.__name__)
-            continue
-        logger.debug("class_topic_schemas: ignored unsupported entry %r=%r", k, v)
-    return out
-
-
-# ─── method-list builder ─────────────────────────────────────────────
-
-
-def introspect_methods(cls: Type) -> List[Dict[str, Any]]:
-    """Walk the class (NOT an instance — classes also expose the
-    decorator tag via ``dir`` + ``getattr``) and return a list of
-    method descriptors enriched with arg schemas.
-
-    Output shape per method::
-
-        {"name": "add_filter",
-         "doc": "Append (or insert) a filter into the pipeline.",
-         "args_schema": <JSON Schema>,
-         "publishes": ["filters", "filter/<id>"],
-         "publish_return": null | "last" | "event"}
-
-    Sorted by wire name for deterministic descriptors (so diffs in the
-    UI's type viewer line up across reboots).
-    """
-    from rlx_bus.methods import MethodInfo  # local: avoid bus import on schema-only paths
-
-    found: List[Tuple[str, Dict[str, Any]]] = []
-    seen: set = set()
-    for attr in dir(cls):
-        if attr.startswith("_"):
-            continue
-        try:
-            value = getattr(cls, attr)
-        except Exception:  # noqa: BLE001
-            continue
-        info: Optional[MethodInfo] = getattr(value, "_rlx_service_method", None)
-        if info is None or info.name in seen:
-            continue
-        seen.add(info.name)
-        args_schema = method_args_schema(value)
-        found.append((info.name, {
-            "name": info.name,
-            "doc": (info.doc or "").strip() or None,
-            "args_schema": args_schema,
-            "publishes": list(info.publishes or []),
-            "publish_return": info.publish_return,
-        }))
-    found.sort(key=lambda kv: kv[0])
-    return [d for _, d in found]
+    return result

@@ -60,7 +60,7 @@ def create_api_client(item: ApiClient, user: dict, request: Request):
 
 
 def get_all_api_client(user: dict, request: Request):
-    logger.info("===============get_all_api_client called==============")
+    logger.debug("===============get_all_api_client called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("api_client")
@@ -68,7 +68,7 @@ def get_all_api_client(user: dict, request: Request):
 
 
 def get_api_client(id: str, user: dict, request: Request):
-    logger.info("===============get_api_client called for id=%s==============", id)
+    logger.debug("===============get_api_client called for id=%s==============", id)
     db = get_database_client()
     if db:
         return db.get_item("api_client", id)

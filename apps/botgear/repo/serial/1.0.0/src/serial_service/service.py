@@ -6,34 +6,10 @@ consume loop, graceful shutdown) lives in the framework. This module
 defines only what's serial-specific: the @service_method actions,
 the state publish, and the read-poll loop in ``port_io``.
 
-Wire contract
--------------
-Topics published:
-
-  /serial/{id}/state    retained — connection + port + stats snapshot
-  /serial/{id}/control  incoming actions (see below)
-  /serial/{id}/rx       non-retained — bytes from the port (base64)
-  /serial/{id}/tx       non-retained — bytes written to the port (loopback)
-  /serial/{id}/heartbeat 1Hz (auto, base class)
-  /serial/{id}/meta     retained — service-type meta (auto)
-
-Actions accepted on /control:
-
-  {"action":"list_ports"}
-  {"action":"connect",   "port":"/dev/ttyACM0", "baudrate":115200,
-                         "bytesize":8, "parity":"N", "stopbits":1}
-  {"action":"disconnect"}
-  {"action":"write_bytes", "data":"<base64>"}                       # OR
-  {"action":"write_bytes", "text":"hello\\n", "eol":"\\n"}          # OR
-  {"action":"write_bytes", "hex":"DE AD BE EF"}                     # accepts spaces/colons
-  {"action":"send_file",   "data":"<base64-of-file>", "chunk_bytes":4096}
-  {"action":"set_options", ...partial config...}
-  {"action":"clear_counters"}
-
-RX / TX payload shape::
-
-    {"data": "<base64>", "len": 64, "ts": 1234567890.123,
-     "source": "write_bytes"}   # only on /tx
+Wire shape is declared in code below (``SerialState``, ``RxPayload``,
+``TxPayload`` via ``state_schema``/``topic_schemas``) and introspected
+into ``/runtime/runtime/types/serial``; ``control`` actions are
+discoverable the same way, off their @service_method signatures.
 """
 from __future__ import annotations
 
@@ -46,7 +22,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from pydantic import Field
+from pydantic import BaseModel, Field
 from rlx_bus import (
     ServiceConfig,
     SubprocessService,
@@ -111,6 +87,42 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class SerialState(BaseModel):
+    """Retained on ``/serial/{id}/state`` — connection + port + stats.
+    Line settings are the live port's when connected, else config's."""
+    connected: bool
+    port: Optional[str]
+    baudrate: int
+    bytesize: int
+    parity: str
+    stopbits: float
+    rx_bytes: int
+    tx_bytes: int
+    errors: int
+    last_error: Optional[str]
+    ports: List[Dict[str, Any]] = Field(description="rlx_bus.list_serial_ports(): {device, description, hwid, holders, available}")
+    last_port: Optional[str]
+    last_baud: int
+    autoreconnect: bool
+    connected_at: Optional[str] = Field(description="ISO-8601 UTC, None when disconnected")
+
+
+class RxPayload(BaseModel):
+    """Published (non-retained) on ``/serial/{id}/rx`` — one coalesced
+    chunk of bytes read from the port."""
+    data: str = Field(description="base64-encoded bytes")
+    len: int
+    ts: float
+
+
+class TxPayload(RxPayload):
+    """Published (non-retained) on ``/serial/{id}/tx`` — loopback of
+    bytes written to the port."""
+    source: str = Field(description="Action that wrote them: 'write_bytes' | 'send_file'")
+
+
 class SerialService(SubprocessService):
     """Diagnostic serial-port service. See module docstring for the
     full wire contract."""
@@ -118,6 +130,8 @@ class SerialService(SubprocessService):
     type_name = "serial"
     heartbeat_interval_s = 1.0
     config_class = SerialConfig
+    state_schema = SerialState
+    topic_schemas = {"rx": RxPayload, "tx": TxPayload}
     # Class-level publishes — the framework's introspection uses this
     # to know what topics this service-type emits even on a stopped
     # instance. ``rx`` and ``tx`` are non-retained streams; ``state``
@@ -431,13 +445,11 @@ class SerialService(SubprocessService):
         if not raw:
             return
         self._rx_bytes += len(raw)
-        payload = {
-            "data": base64.b64encode(raw).decode("ascii"),
-            "len": len(raw),
-            "ts": time.time(),
-        }
+        payload = RxPayload(
+            data=base64.b64encode(raw).decode("ascii"), len=len(raw), ts=time.time(),
+        )
         try:
-            await self.publish("rx", payload, retained=False)
+            await self.publish("rx", payload.model_dump(), retained=False)
         except Exception:  # noqa: BLE001
             logger.exception("serial %s: rx publish failed", self.proxy_id)
 
@@ -463,36 +475,34 @@ class SerialService(SubprocessService):
         plus a ``source`` field naming the action that emitted it."""
         if not raw:
             return
-        payload = {
-            "data": base64.b64encode(raw).decode("ascii"),
-            "len": len(raw),
-            "ts": time.time(),
-            "source": source,
-        }
+        payload = TxPayload(
+            data=base64.b64encode(raw).decode("ascii"), len=len(raw), ts=time.time(), source=source,
+        )
         try:
-            await self.publish("tx", payload, retained=False)
+            await self.publish("tx", payload.model_dump(), retained=False)
         except Exception:  # noqa: BLE001
             logger.exception("serial %s: tx publish failed", self.proxy_id)
 
     def _snapshot(self) -> Dict[str, Any]:
         connected = self._reader is not None
-        return {
-            "connected": connected,
-            "port": self._reader.port if connected else None,
-            "baudrate": (self._reader.baudrate if connected else self.config.last_baud),
-            "bytesize": (self._reader.bytesize if connected else self.config.bytesize),
-            "parity": (self._reader.parity if connected else self.config.parity),
-            "stopbits": (self._reader.stopbits if connected else self.config.stopbits),
-            "rx_bytes": self._rx_bytes,
-            "tx_bytes": self._tx_bytes,
-            "errors": self._errors,
-            "last_error": self._last_error,
-            "ports": list_serial_ports(),
-            "last_port": self.config.last_port,
-            "last_baud": self.config.last_baud,
-            "autoreconnect": self.config.autoreconnect,
-            "connected_at": self._connected_at,
-        }
+        state = SerialState(
+            connected=connected,
+            port=self._reader.port if connected else None,
+            baudrate=(self._reader.baudrate if connected else self.config.last_baud),
+            bytesize=(self._reader.bytesize if connected else self.config.bytesize),
+            parity=(self._reader.parity if connected else self.config.parity),
+            stopbits=(self._reader.stopbits if connected else self.config.stopbits),
+            rx_bytes=self._rx_bytes,
+            tx_bytes=self._tx_bytes,
+            errors=self._errors,
+            last_error=self._last_error,
+            ports=list_serial_ports(),
+            last_port=self.config.last_port,
+            last_baud=self.config.last_baud,
+            autoreconnect=self.config.autoreconnect,
+            connected_at=self._connected_at,
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

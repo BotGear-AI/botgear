@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────
 // master_template — reference modular service UI (Option B).
-// See apps/botgear/docs/TODO_SERVICE_UI_BUNDLES.md.
+// See apps/botgear/repo/README.md's "Adding a UI" section.
 //
 // A service ships its own frontend here: repo/<name>/<version>/ui/View.tsx,
 // compiled to ui/dist/ui.js and dynamically loaded by the host. You write

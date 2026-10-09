@@ -29,8 +29,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from pydantic import BaseModel, Field
 from rlx_bus import (
     ServiceConfig,
     SubprocessService,
@@ -61,17 +62,49 @@ class ArduinoTelemetrixConfig(ServiceConfig):
 logger = logging.getLogger(__name__)
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class PixelState(BaseModel):
+    pin: Optional[int]
+    count: int
+    width: int = Field(description="Matrix columns; 0 = 1-D strip")
+    height: int
+    serpentine: bool
+    brightness: int = Field(description="Software scale 0..255")
+
+
+class ArduinoTelemetrixState(BaseModel):
+    """Retained on ``/arduino_telemetrix/{id}/state`` — connection + pin
+    + pixel snapshot."""
+    connected: bool
+    port: Optional[str]
+    ports: List[Dict[str, Any]] = Field(description="rlx_bus.list_serial_ports(): {device, description, hwid, holders, available}")
+    firmata_version: Optional[str]
+    firmware_name: Optional[str]
+    firmware_version: Optional[str]
+    pins: Dict[int, Dict[str, Any]] = Field(description="Pin number -> {mode, value, ...} as last seen")
+    pixel: PixelState
+    last_port: Optional[str]
+    last_baud: int
+    autoreconnect: bool
+    connect_error: Optional[str]
+
+
+class PinPayload(BaseModel):
+    """Published on ``/arduino_telemetrix/{id}/pin/{pin}`` after every
+    read/write."""
+    value: Optional[Union[int, float]] = Field(description="Digital 0/1, analog counts, PWM 0..255, or servo angle")
+
+
+class SonarPayload(BaseModel):
+    """Published on ``/arduino_telemetrix/{id}/sonar/{trigger_pin}`` after a read."""
+    distance_cm: Optional[float]
+
+
 class ArduinoTelemetrixService(SubprocessService):
-    """Bus-facing wrapper around a Telemetrix board.
-
-    Topic layout (``type_name='arduino_telemetrix'``):
-
-        /arduino_telemetrix/{id}/state        retained — connection + pin + pixel snapshot
-        /arduino_telemetrix/{id}/heartbeat    1Hz, automatic via base class
-        /arduino_telemetrix/{id}/control      incoming actions
-        /arduino_telemetrix/{id}/pin/{N}      per-pin value updates
-        /arduino_telemetrix/{id}/sonar/{N}    sonar distance updates
-    """
+    """Bus-facing wrapper around a Telemetrix board. Wire shape is
+    declared by the models above (``state_schema``/``topic_schemas``);
+    per-pin and sonar topics are templated suffixes."""
 
     type_name = "arduino_telemetrix"
     heartbeat_interval_s = 1.0
@@ -80,6 +113,9 @@ class ArduinoTelemetrixService(SubprocessService):
     # enumeration miss; ~2-3s to flip the UI red on a real unplug).
     _MISSING_LIMIT = 2
     config_class = ArduinoTelemetrixConfig
+    publishes = ["state"]
+    state_schema = ArduinoTelemetrixState
+    topic_schemas = {"pin/{pin}": PinPayload, "sonar/{trigger_pin}": SonarPayload}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -176,28 +212,29 @@ class ArduinoTelemetrixService(SubprocessService):
 
     # ─── state ───────────────────────────────────────────────────────
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "connected": self.board.connected,
-            "port": self.board.port if self.board.connected else None,
-            "ports": list_serial_ports(),
-            "firmata_version": self._info.get("firmata_version"),
-            "firmware_name": self._info.get("firmware_name"),
-            "firmware_version": self._info.get("firmware_version"),
-            "pins": dict(self.board.pins),
+        state = ArduinoTelemetrixState(
+            connected=self.board.connected,
+            port=self.board.port if self.board.connected else None,
+            ports=list_serial_ports(),
+            firmata_version=self._info.get("firmata_version"),
+            firmware_name=self._info.get("firmware_name"),
+            firmware_version=self._info.get("firmware_version"),
+            pins=dict(self.board.pins),
             # pixel_strip snapshot for the UI's LED panel.
-            "pixel": {
-                "pin": self.board.pixel_pin,
-                "count": self.board.pixel_count,
-                "width": self.board.pixel_width,
-                "height": self.board.pixel_height,
-                "serpentine": self.board.pixel_serpentine,
-                "brightness": self.board.pixel_brightness,
-            },
-            "last_port": self.config.last_port,
-            "last_baud": self.config.last_baud,
-            "autoreconnect": self.config.autoreconnect,
-            "connect_error": self._connect_error,
-        }
+            pixel=PixelState(
+                pin=self.board.pixel_pin,
+                count=self.board.pixel_count,
+                width=self.board.pixel_width,
+                height=self.board.pixel_height,
+                serpentine=self.board.pixel_serpentine,
+                brightness=self.board.pixel_brightness,
+            ),
+            last_port=self.config.last_port,
+            last_baud=self.config.last_baud,
+            autoreconnect=self.config.autoreconnect,
+            connect_error=self._connect_error,
+        )
+        return state.model_dump()
 
     async def publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)
@@ -267,26 +304,26 @@ class ArduinoTelemetrixService(SubprocessService):
     @service_method("digital_write")
     async def m_digital_write(self, pin: int, value: int) -> Dict[str, Any]:
         await self.board.digital_write(int(pin), int(value))
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": int(bool(value))})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=int(bool(value))).model_dump())
         return {"pin": int(pin), "value": int(bool(value))}
 
     @service_method("digital_read")
     async def m_digital_read(self, pin: int) -> Dict[str, Any]:
         v = await self.board.digital_read(int(pin))
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": v})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=v).model_dump())
         return {"pin": int(pin), "value": v}
 
     @service_method("analog_read")
     async def m_analog_read(self, pin: int) -> Dict[str, Any]:
         v = await self.board.analog_read(int(pin))
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": v})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=v).model_dump())
         return {"pin": int(pin), "value": v}
 
     @service_method("analog_write")
     async def m_analog_write(self, pin: int, value: int) -> Dict[str, Any]:
         v = max(0, min(255, int(value)))
         await self.board.analog_write(int(pin), v)
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": v})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=v).model_dump())
         return {"pin": int(pin), "value": v}
 
     @service_method("i2c_setup")
@@ -320,7 +357,7 @@ class ArduinoTelemetrixService(SubprocessService):
     async def m_servo_write(self, pin: int, angle: int, servo_id: Optional[str] = None) -> Dict[str, Any]:
         angle = max(0, min(180, int(angle)))
         await self.board.servo_write(int(pin), angle)
-        await self.bus.publish(self.pin_topic(int(pin)), {"value": angle})
+        await self.bus.publish(self.pin_topic(int(pin)), PinPayload(value=angle).model_dump())
         return {"pin": int(pin), "angle": angle}
 
     @service_method("servo_detach")
@@ -399,5 +436,5 @@ class ArduinoTelemetrixService(SubprocessService):
     @service_method("sonar_read")
     async def m_sonar_read(self, trigger_pin: int) -> Dict[str, Any]:
         d = await self.board.sonar_read(int(trigger_pin))
-        await self.bus.publish(self.sonar_topic(int(trigger_pin)), {"distance_cm": d})
+        await self.bus.publish(self.sonar_topic(int(trigger_pin)), SonarPayload(distance_cm=d).model_dump())
         return {"trigger": int(trigger_pin), "distance_cm": d}

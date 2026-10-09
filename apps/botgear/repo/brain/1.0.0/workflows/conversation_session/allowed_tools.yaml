@@ -1,10 +1,15 @@
 allowed:
-  # Conversation I/O. Three service families can provide it; whichever is
-  # running gets used (the tool catalog only surfaces actions on live
+  # Conversation I/O. Several service families can provide it; whichever
+  # is running gets used (the tool catalog only surfaces actions on live
   # services):
   #   chat        — text-only stand-in (speak + listen), ships in repo/chat/
   #   speech_local — audio OUTPUT (speak) via Piper TTS, topic root /speech/
   #   stt_local    — audio INPUT (listen) via sherpa-onnx STT, topic root /stt/
+  #   discord/slack/google_chat — the `messaging` capability (see
+  #     docs/TODO_MESSAGING.md), same listen/speak contract as chat.
+  #     google_chat is speak-only in v1 (no listen action to grant, but
+  #     listing it here is harmless — a not-running/not-applicable action
+  #     just never appears in the live tool catalog).
   # The audio loop is mic -> stt_local.listen -> brain -> speech_local.speak
   # -> speaker. Each root needs its own rule: single-segment '*' matches
   # /speech/spk-1/control but never crosses into /stt/.
@@ -14,11 +19,29 @@ allowed:
     actions: [listen]
   - topic: /chat/*/control
     actions: [speak, listen]
+  - topic: /discord/*/control
+    actions: [speak, listen]
+  - topic: /slack/*/control
+    actions: [speak, listen]
+  - topic: /google_chat/*/control
+    actions: [speak, listen]
   # Head servo only — used to face the speaker when a bearing is reported.
   - topic: /servo/*/control
     actions: [move]
   - topic: /brain/*/control
     actions: [read_memory, write_memory]
+  # Named power switches only (see docs/TODO_BRAIN_GAP_FIXES.md Gap 2) —
+  # exact per-device topics, not /tasmota/*/control, so a new Tasmota
+  # device doesn't silently become chat-controllable just by existing.
+  # pulse/connect/disconnect deliberately excluded: different risk
+  # shape (momentary actuator / device reconfiguration), not needed for
+  # "turn the X on/off". office-cord and sonoff-office-light proxies
+  # were removed (operator, to reduce system complexity while testing)
+  # — re-add their rules here if/when those proxies come back.
+  - topic: /tasmota/sonoff-cord/control
+    actions: [power_set, power_toggle, list_relays]
+  - topic: /tasmota/switch-1/control      # cerebellum's switch
+    actions: [power_set, power_toggle, list_relays]
 
 blocked:
   - topic: /movement/*/control

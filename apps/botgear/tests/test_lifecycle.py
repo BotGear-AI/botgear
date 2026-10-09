@@ -119,6 +119,27 @@ def test_install_creates_proxy(db):
     assert proxy["service_meta_id"] == "stub@1.0.0"
 
 
+@pytest.mark.parametrize("name", [
+    "sabertooth-1", "network_scanner-1", "a", "cam-front_2", "a" * 63,
+])
+def test_install_accepts_valid_names(db, name):
+    out = lifecycle.handle(_req("install", service_meta_id="stub@1.0.0", proxy_name=name))
+    assert out["status"] == "completed"
+    assert db.get_item("service_proxy", name) is not None
+
+
+@pytest.mark.parametrize("name", [
+    "a/b", "../x", "a\\b", "cam+1", "cam#", "foo@bar", "my service",
+    "workE", "Cam-1", "1cam", "-cam", "_cam", ".hidden", "a.b", "a?b", "a%20b",
+    "a" * 64,
+])
+def test_install_rejects_invalid_names(db, name):
+    out = lifecycle.handle(_req("install", service_meta_id="stub@1.0.0", proxy_name=name))
+    assert out["status"] == "failed"
+    assert "invalid service name" in out["result"]
+    assert db.get_item("service_proxy", name) is None
+
+
 def test_install_placeholder_skips_install(db):
     # M1 decouple: dropping a service creates a placeholder — no venv, no
     # pip, no "installed" transition — until the user presses Start.
@@ -441,6 +462,56 @@ def test_uninstall_alias_normalizes_to_release_service(db):
     assert db.get_item("service_proxy", "r2") is None
 
 
+@pytest.fixture
+def config_set(monkeypatch, tmp_path):
+    """Point the lifecycle's config-set IO at a real tmp_path dir, so
+    release_service's registry write actually happens (it's wrapped in a
+    swallow-all try/except in production, so a test using the bare ``db``
+    fixture alone would silently no-op this part). Pins the active set
+    name explicitly via monkeypatch — ``config_sets._BOOTED_SET`` is a
+    process-global some OTHER test module sets directly via
+    ``pin_booted_set()`` (not through monkeypatch), so without this the
+    active set here depends on test run order."""
+    from botgear.runtime import config_sets
+    data_dir = tmp_path / "data"
+    (data_dir / "config_sets" / "test-set").mkdir(parents=True)
+    monkeypatch.setattr(lifecycle, "_resolve_data_dir", lambda: data_dir)
+    monkeypatch.setattr(lifecycle, "_resolve_repo_dir", lambda: tmp_path)
+    monkeypatch.setattr(config_sets, "_BOOTED_SET", "test-set")
+    return data_dir
+
+
+def test_release_preserves_proxy_yml(db, config_set):
+    # Config (not a destructive release target) should survive: it took
+    # real work to get a service's config "valid" and release must not
+    # throw that away just because the operator removed it from the
+    # canvas — see docs/README_SERVICE_LIFECYCLE.md §5.
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="r3"))
+    lifecycle.save_proxy_config("r3", {"api_key": "shh", "region": "us-east"})
+    yml_path = config_set / "config_sets" / "test-set" / "r3.yml"
+    assert yml_path.is_file()
+
+    out = lifecycle.handle(_req("release_service", service_proxy_id="r3"))
+    assert out["status"] == "completed"
+    assert db.get_item("service_proxy", "r3") is None
+    # The row is gone but the yml — and its config — is untouched.
+    assert yml_path.is_file()
+    assert lifecycle.proxy_config("r3") == {"api_key": "shh", "region": "us-east"}
+
+
+def test_release_then_recreate_same_name_reuses_preserved_config(db, config_set):
+    # This is the swap-by-name workflow: releasing "r4" and later creating
+    # a brand NEW instance (possibly a different type entirely) under the
+    # same name should transparently pick up whatever yml is sitting at
+    # that name — config is keyed by proxy_id, not by DB-row identity.
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="r4"))
+    lifecycle.save_proxy_config("r4", {"voice": "amy"})
+    lifecycle.handle(_req("release_service", service_proxy_id="r4"))
+
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="r4"))
+    assert lifecycle.proxy_config("r4") == {"voice": "amy"}
+
+
 def test_start_stop_service_canonical_verbs(db):
     lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="ss"))
 
@@ -561,3 +632,140 @@ def test_start_self_heals_missing_install(db, pip_meta):
     lifecycle.handle(_req("start", service_proxy_id="h1"))
     assert db.get_item("service_proxy", "h1")["status"] == "running"
     assert pip_meta["install"] == before + 1
+
+
+# ─── rename_service ───────────────────────────────────────────────────
+
+
+def _set_dir(data_dir):
+    return data_dir / "config_sets" / "test-set"
+
+
+def test_rename_rekeys_row_yml_registry_and_config(db, config_set):
+    from botgear.runtime.config_sets import load_runtime_yml
+
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="cam"))
+    lifecycle.save_proxy_config("cam", {"fps": 30})
+
+    report = lifecycle.rename_service("cam", "cam-front")
+
+    assert db.get_item("service_proxy", "cam") is None
+    row = db.get_item("service_proxy", "cam-front")
+    assert row["id"] == "cam-front" and row["name"] == "cam-front"
+    assert row["service_meta_id"] == "stub@1.0.0"
+    assert not (_set_dir(config_set) / "cam.yml").exists()
+    assert (_set_dir(config_set) / "cam-front.yml").is_file()
+    assert "cam" not in load_runtime_yml(_set_dir(config_set)).registry
+    assert "cam-front" in load_runtime_yml(_set_dir(config_set)).registry
+    assert lifecycle.proxy_config("cam-front") == {"fps": 30}
+    assert report["yml_renamed"] and report["registry_updated"]
+
+
+def test_rename_preserves_registry_order(db, config_set):
+    from botgear.runtime.config_sets import load_runtime_yml, write_runtime_registry
+
+    for name in ("a1", "b1", "c1"):
+        lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name=name))
+        lifecycle.save_proxy_config(name, {"x": 1})
+    write_runtime_registry(_set_dir(config_set), ["a1", "b1", "c1"])
+
+    lifecycle.rename_service("b1", "bee")
+
+    assert load_runtime_yml(_set_dir(config_set)).registry == ["a1", "bee", "c1"]
+
+
+def test_rename_rewrites_references_in_other_configs(db, config_set):
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="arduino-1"))
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="servo-1"))
+    lifecycle.save_proxy_config("arduino-1", {"port": "/dev/ttyACM0"})
+    lifecycle.save_proxy_config("servo-1", {
+        "controller_id": "arduino-1",
+        "name": "arduino-1",                      # self-identity key: never a reference
+        "input": {"topic": "/arduino/arduino-1/state"},
+        "input_ref": "/arduino/arduino-10/state",  # a different proxy — untouched
+        "controllers": ["arduino-1", "other"],
+    })
+
+    report = lifecycle.rename_service("arduino-1", "uno")
+
+    cfg = lifecycle.proxy_config("servo-1")
+    assert cfg["controller_id"] == "uno"
+    assert cfg["name"] == "arduino-1"
+    assert cfg["input"]["topic"] == "/arduino/uno/state"
+    assert cfg["input_ref"] == "/arduino/arduino-10/state"
+    assert cfg["controllers"] == ["uno", "other"]
+    assert report["references"] == {"servo-1": 3}
+
+
+def test_rename_rekeys_workspace_refs(db, config_set):
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="m1"))
+    db.insert_item("workspace", "w", {
+        "id": "w", "kind": "user",
+        "service_proxy_ids": ["m1", "other"],
+        "node_positions": {"m1": {"x": 1, "y": 2}, "other": {"x": 0, "y": 0}},
+        "node_view_types": {"m1": "view_full"},
+        "edges": [{"id": "e1", "source": "m1", "target": "other"}],
+    })
+    db.insert_item("workspace", "untouched", {"id": "untouched", "kind": "user", "service_proxy_ids": ["other"]})
+
+    report = lifecycle.rename_service("m1", "motor")
+
+    ws = db.get_item("workspace", "w")
+    assert ws["service_proxy_ids"] == ["motor", "other"]
+    assert ws["node_positions"] == {"motor": {"x": 1, "y": 2}, "other": {"x": 0, "y": 0}}
+    assert ws["node_view_types"] == {"motor": "view_full"}
+    assert ws["edges"][0]["source"] == "motor"
+    assert report["workspaces"] == ["w"]
+
+
+def test_rename_moves_brain_workspace_dir(db, config_set):
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="brain-1"))
+    (config_set / "brain" / "brain-1" / "workflows").mkdir(parents=True)
+
+    lifecycle.rename_service("brain-1", "cortex")
+
+    assert not (config_set / "brain" / "brain-1").exists()
+    assert (config_set / "brain" / "cortex" / "workflows").is_dir()
+
+
+def test_rename_refused_while_running(db, config_set):
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="live"))
+    lifecycle.handle(_req("start_service", service_proxy_id="live"))
+
+    with pytest.raises(ValueError, match="stop it first"):
+        lifecycle.rename_service("live", "dead")
+    assert db.get_item("service_proxy", "live") is not None
+    assert db.get_item("service_proxy", "dead") is None
+
+
+@pytest.mark.parametrize("new", ["Cam", "a/b", "1x", ""])
+def test_rename_rejects_invalid_names(db, config_set, new):
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="ok"))
+    with pytest.raises(ValueError, match="invalid service name"):
+        lifecycle.rename_service("ok", new)
+
+
+def test_rename_refuses_taken_name_and_parked_yml(db, config_set):
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="x1"))
+    lifecycle.handle(_req("create_service", service_meta_id="stub@1.0.0", proxy_name="x2"))
+    with pytest.raises(ValueError, match="already exists"):
+        lifecycle.rename_service("x1", "x2")
+
+    (_set_dir(config_set) / "parked.yml").write_text("type: stub@1.0.0\n")
+    with pytest.raises(ValueError, match="parked config"):
+        lifecycle.rename_service("x1", "parked")
+    assert db.get_item("service_proxy", "x1") is not None
+
+
+def test_rename_refuses_singleton(db, config_set):
+    db.insert_item("service_meta", "runtime@1.0.0",
+                   {"id": "runtime@1.0.0", "name": "runtime", "tags": ["singleton"]})
+    db.insert_item("service_proxy", "runtime",
+                   {"id": "runtime", "name": "runtime", "service_meta_id": "runtime@1.0.0", "status": "running"})
+    with pytest.raises(ValueError, match="singleton"):
+        lifecycle.rename_service("runtime", "rt")
+
+
+def test_rename_unknown_raises_not_found(db, config_set):
+    with pytest.raises(ValueError, match="not found"):
+        lifecycle.rename_service("ghost", "spirit")

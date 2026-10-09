@@ -41,7 +41,7 @@ def create_config(item: Config, user: dict, request: Request):
 
 # read - get all items
 def get_all_config(user: dict, request: Request):
-    logger.info("===============get_all_config called==============")
+    logger.debug("===============get_all_config called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("config")
@@ -49,18 +49,20 @@ def get_all_config(user: dict, request: Request):
 
 # read - get an item
 def get_config(id: str, user: dict, request: Request):
-    logger.info("===============get_config called==============")
-    logger.info(f"Received request to retrieve config with id: {id}")
+    logger.debug("===============get_config called==============")
+    logger.debug(f"Received request to retrieve config with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("config", id)
     return item
 
 # read - get_path an item
 def get_path_config(path: str, user: dict, request: Request):
-    logger.info("===============get_config called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_config called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("config", path)
     return item
@@ -90,6 +92,7 @@ def delete_config(id: str, user: dict, request: Request):
     logger.info("===============delete_config called==============")
     logger.info(f"Received request to delete config with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("config", id)
         if not item:

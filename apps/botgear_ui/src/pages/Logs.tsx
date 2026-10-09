@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Banner from '../components/Banner'
 import { useApiFetch } from '../contexts/ActiveRuntimeContext'
 import { wsClient, type InboundFrame } from '../runtime/wsClient'
+import type { ServiceProxy } from '../models/ServiceProxy'
 
 /**
  * Centralized log viewer.
@@ -100,6 +101,20 @@ function mapRuntime(d: RuntimeLog): LogEntry {
   }
 }
 
+// Self-referential noise: this page polls GET /v1/logs every 2s (see the
+// backfill effect below) to backfill the runtime ring buffer, and the
+// backend's HTTP access log records every request — including that one —
+// into the SAME ring buffer. Left unfiltered, viewing the log becomes an
+// infinite loop of the log viewer logging that it viewed the log. Scoped to
+// serviceId==='runtime' (where the HTTP access log lands) + the /v1/logs
+// path specifically, so a service that happens to print "/v1/logs" as
+// meaningful output elsewhere isn't silently dropped.
+const SELF_LOG_RE = /\/v1\/logs(?:[?/]|\s|$)/
+
+function isSelfReferential(e: LogEntry): boolean {
+  return e.serviceId === 'runtime' && SELF_LOG_RE.test(e.line)
+}
+
 const keyOf = (e: LogEntry) => `${e.ts}|${e.serviceId}|${e.line}`
 
 function mergeEntries(prev: LogEntry[], incoming: LogEntry[]): LogEntry[] {
@@ -119,6 +134,9 @@ export default function Logs() {
   const [minLevel, setMinLevel] = useState<LogLevel>('debug') // show all by default
   const [textFilter, setTextFilter] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
+  // Default ON — the self-referential /v1/logs polling noise is almost
+  // never what anyone opened this page to look at.
+  const [hideSelfLogs, setHideSelfLogs] = useState(true)
 
   // Refs so the WS handler closure sees the latest values without
   // re-subscribing on every keystroke.
@@ -149,10 +167,35 @@ export default function Logs() {
     return off
   }, [])
 
+  const apiFetch = useApiFetch()
+
+  // Known proxy ids, independent of whether they've logged anything yet.
+  // The dropdown used to be built solely from `entries` (below) — a service
+  // only appeared once it happened to emit a line while this page was
+  // open, so a quiet-but-running service (most subprocess services, most
+  // of the time) never showed up. Polling the actual proxy list is the
+  // same source of truth Proxies.tsx/Topology.tsx use, so every running
+  // service is selectable immediately.
+  const [knownServiceIds, setKnownServiceIds] = useState<string[]>([])
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const rows = await apiFetch<ServiceProxy[]>('/v1/service-proxy-list')
+        if (cancelled) return
+        setKnownServiceIds((rows ?? []).map((r) => r.id).filter((id): id is string => !!id))
+      } catch {
+        /* transient — next tick retries */
+      }
+    }
+    load()
+    const id = window.setInterval(load, 5000)
+    return () => { cancelled = true; window.clearInterval(id) }
+  }, [apiFetch])
+
   // Backfill + poll the runtime log ring buffer (GET /v1/logs) so the page
   // shows backend activity immediately, with history — merged/deduped with
   // the live per-service stream above.
-  const apiFetch = useApiFetch()
   const clearedBeforeRef = useRef(0)
   useEffect(() => {
     let cancelled = false
@@ -180,22 +223,27 @@ export default function Logs() {
     listRef.current.scrollTop = listRef.current.scrollHeight
   }, [entries, autoScroll])
 
-  // Collect the set of services we've actually seen, for the dropdown.
+  // Dropdown options: every currently-known proxy (from /v1/service-proxy-list)
+  // plus 'runtime' plus anything we've observed on the wire but that has
+  // since been released — so a service is selectable the instant it's
+  // running, and stays selectable if you're mid-filter when it stops.
   const services = useMemo(() => {
-    const s = new Set<string>()
+    const s = new Set<string>(knownServiceIds)
+    s.add('runtime')
     for (const e of entries) s.add(e.serviceId)
     return Array.from(s).sort()
-  }, [entries])
+  }, [knownServiceIds, entries])
 
   const filtered = useMemo(() => {
     const q = textFilter.trim().toLowerCase()
     return entries.filter((e) => {
+      if (hideSelfLogs && isSelfReferential(e)) return false
       if (serviceFilter && e.serviceId !== serviceFilter) return false
       if (LEVEL_ORDER[e.level] > LEVEL_ORDER[minLevel]) return false
       if (q && !e.line.toLowerCase().includes(q)) return false
       return true
     })
-  }, [entries, serviceFilter, minLevel, textFilter])
+  }, [entries, serviceFilter, minLevel, textFilter, hideSelfLogs])
 
   const onClear = useCallback(() => {
     // Suppress re-backfilling the runtime rows we just cleared.
@@ -236,6 +284,17 @@ export default function Logs() {
           />
           Auto-scroll
         </label>
+        <label
+          className="flex items-center gap-1 text-slate-400"
+          title="Hide this page's own GET /v1/logs polling — otherwise the log viewer logs that it's viewing the log, forever."
+        >
+          <input
+            type="checkbox"
+            checked={hideSelfLogs}
+            onChange={(e) => setHideSelfLogs(e.target.checked)}
+          />
+          Hide /v1/logs noise
+        </label>
 
         <span className="mx-1 text-slate-700">|</span>
 
@@ -274,7 +333,7 @@ export default function Logs() {
         />
         <span className="text-slate-500">
           {filtered.length}
-          {(serviceFilter || minLevel !== 'debug' || textFilter) ? ` / ${entries.length}` : ''}
+          {(serviceFilter || minLevel !== 'debug' || textFilter || hideSelfLogs) ? ` / ${entries.length}` : ''}
         </span>
       </div>
 

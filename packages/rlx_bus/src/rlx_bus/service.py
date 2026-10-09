@@ -41,6 +41,7 @@ from typing import Any, Awaitable, Callable, ClassVar, Dict, List, Optional, Typ
 
 from .client import BusClient, from_env
 from .config import ServiceConfig
+from .halt import HALT_TOPIC, RESUME_TOPIC
 from .methods import MethodInfo, collect_methods
 from .streams import Stream, from_env as stream_from_env
 
@@ -116,6 +117,29 @@ class SubprocessService:
 
     async def on_stop(self) -> None:
         """Release resources held by on_start."""
+
+    async def on_halt(self, event: Dict[str, Any]) -> None:
+        """Runtime-wide HALT (see ``rlx_bus.halt``). Stop what you're doing
+        NOW — silence output, drop queued work, stop motion — but stay
+        running and ready. Default no-op; ``event['level']`` is ``stop``
+        or ``emergency``."""
+
+    async def on_resume(self, event: Dict[str, Any]) -> None:
+        """The operator lifted a HALT. Default no-op."""
+
+    async def _on_halt_msg(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            payload = {}
+        try:
+            await self.on_halt(payload)
+        except Exception:  # noqa: BLE001 — one service's halt bug must not stop the others
+            logger.exception("%s: on_halt raised", self.proxy_id)
+
+    async def _on_resume_msg(self, payload: Any) -> None:
+        try:
+            await self.on_resume(payload if isinstance(payload, dict) else {})
+        except Exception:  # noqa: BLE001
+            logger.exception("%s: on_resume raised", self.proxy_id)
 
     # ─── messaging sugar ──────────────────────────────────────────────
     def topic(self, suffix: str) -> str:
@@ -276,13 +300,33 @@ class SubprocessService:
 
     def _methods_payload(self) -> List[Dict[str, Any]]:
         """The @service_method infos as flat JSON dicts — the shape the
-        backend reconstructs into MethodInfo for the topology view."""
+        backend reconstructs into MethodInfo for the topology view and the
+        agent tool catalog (brain, the MCP gateway).
+
+        ``args_schema``: a hand-written ``@service_method(args_schema=...)``
+        wins; otherwise it's derived from the method's signature
+        (``introspect.args_schema_for``) — the backend can't import a
+        subprocess service's class, so this manifest is the ONLY place its
+        argument schemas come from."""
         return [
             {"name": m.name, "doc": (m.doc or "").strip() or None,
              "publishes": list(m.publishes or []),
-             "publish_return": m.publish_return}
+             "publish_return": m.publish_return,
+             "args_schema": m.args_schema if m.args_schema is not None
+             else self._derived_args_schema(m)}
             for m in self.methods()
         ]
+
+    def _derived_args_schema(self, m: MethodInfo) -> Optional[Dict[str, Any]]:
+        """Signature-derived schema for one method; None if it can't be
+        built (a broken annotation must never stop the manifest)."""
+        try:
+            from .introspect import args_schema_for
+            fn = getattr(self, m.attr or m.name, None)
+            return args_schema_for(fn) if fn is not None else None
+        except Exception:  # noqa: BLE001
+            logger.exception("%s: args_schema for %s failed", self.proxy_id, m.name)
+            return None
 
     def _build_methods_manifest(self) -> Dict[str, Any]:
         """Retained announcement published on
@@ -514,6 +558,12 @@ class SubprocessService:
             svc.request_stop()
 
         await bus.subscribe(shutdown_topic, _on_shutdown)
+
+        # Runtime-wide HALT / RESUME broadcast (rlx_bus.halt). Its own
+        # subscription so a stop never queues behind this service's data
+        # traffic; the client runs each handler as its own task.
+        await bus.subscribe(HALT_TOPIC, svc._on_halt_msg)
+        await bus.subscribe(RESUME_TOPIC, svc._on_resume_msg)
 
         loop = asyncio.get_running_loop()
 

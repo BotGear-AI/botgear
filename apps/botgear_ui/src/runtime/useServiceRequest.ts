@@ -76,6 +76,13 @@ export interface UseServiceRequestResult<T> {
    *  while a previous request is in flight — the prior attempt is
    *  abandoned (its reply is discarded if it ever arrives). */
   request: (action: string, args?: Record<string, unknown>) => Promise<T | null>
+  /** Clear a stale ``error`` without firing a new request. For a
+   *  client-side failure (e.g. a timeout) that isn't reflected in the
+   *  service's own retained state, nothing else resets it — a caller
+   *  that later observes success some other way (a ``/state`` update,
+   *  a sibling action) should call this so the old message doesn't
+   *  linger on screen. */
+  clearError: () => void
 }
 
 
@@ -203,5 +210,7 @@ export function useServiceRequest<T = unknown>(
     [controlTopic, wsClient, errorField, replyPrefix, timeoutMs],
   )
 
-  return { inFlight, error, reply, request }
+  const clearError = useCallback(() => setError(null), [])
+
+  return { inFlight, error, reply, request, clearError }
 }

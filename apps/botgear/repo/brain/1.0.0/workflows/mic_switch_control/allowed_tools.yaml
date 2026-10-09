@@ -1,0 +1,31 @@
+allowed:
+  # Mic input — continuous transcription on the `ear` stt_local proxy.
+  - topic: /stt/*/control
+    actions: [listen]
+  # Spoken confirmation.
+  - topic: /speech/*/control
+    actions: [speak]
+  # The one device this workflow is allowed to touch. Exact topic, not
+  # /tasmota/*/control — a new Tasmota device must not become
+  # voice-controllable just by existing (same reasoning as
+  # conversation_session's Gap 2, see docs/TODO_BRAIN_GAP_FIXES.md).
+  # pulse/connect/disconnect deliberately excluded: different risk
+  # shape, not needed for "turn switch-1 on/off".
+  - topic: /tasmota/switch-1/control
+    actions: [power_set, power_toggle, list_relays]
+  # Self-logging only.
+  - topic: /brain/*/control
+    actions: [write_memory]
+
+blocked:
+  - topic: /movement/*/control
+    actions: ["*"]
+  - topic: /arm/*/control
+    actions: ["*"]
+  - topic: /system/*/control
+    actions: ["*"]
+  - topic: /video/*/control
+    actions: ["*"]
+  # Federation suffix — never address peer runtimes from this workflow.
+  - topic: /*/@**
+    actions: ["*"]

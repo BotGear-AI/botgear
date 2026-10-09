@@ -1,6 +1,6 @@
 # unmanaged
 """Integration tests for the remote service registry — Phase 2/3/4 of
-docs/TODO_REPO.md.
+the registry design (see repo/README.md's "Lifecycle states" section).
 
 The headline test (``test_load_then_install``) drives the full
 ABSENT → LOADED → INSTALLED flow against a fresh local mirror that

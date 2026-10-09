@@ -26,12 +26,11 @@ rationale.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from brain.adapters.base import ModelAdapter
+from brain.adapters.base import ModelAdapter, resolve_tool_names
 from brain.schemas import (
     ChatMessage,
     ModelResponse,
@@ -215,36 +214,25 @@ def _split_system(
     return ("\n\n".join(system_parts).strip(), body)
 
 
-_VALID_TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
-
-
 def _encode_tools(
     tools: List[ToolDescriptor],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, ToolDescriptor]]:
     """Brain tools → Anthropic tool definitions + reverse map.
 
-    Tool names go on the wire as the action name itself when it
-    matches Anthropic's regex + is unique within this tool list
-    (matches what operators write in workflow prompts: "call
-    write_memory"). Falls back to ``tool_NNN`` indexed names on
-    collision or invalid action characters.
-
-    Also returns a forward map (action_name → on-wire name) so the
-    engine's assistant-message reconstruction
-    (``_split_system`` tool_use block) can look up the right
-    encoded name when threading the conversation back to Anthropic.
+    Tool names come from ``adapters.base.resolve_tool_names`` (see
+    docs/TODO_BRAIN_GAP_FIXES.md Gap 1). Also returns a forward map
+    (on-wire name → ToolDescriptor) so the engine's assistant-message
+    reconstruction (``_split_system`` tool_use block) can look up the
+    right encoded name when threading the conversation back to
+    Anthropic.
     """
+    names = resolve_tool_names(tools)
     encoded: List[Dict[str, Any]] = []
     decode: Dict[str, ToolDescriptor] = {}
-    used: set = set()
-    for i, t in enumerate(tools):
-        candidate = t.action if _VALID_TOOL_NAME_RE.match(t.action or "") else ""
-        if not candidate or candidate in used:
-            candidate = f"tool_{i:03d}"
-        used.add(candidate)
-        decode[candidate] = t
+    for name, t in zip(names, tools):
+        decode[name] = t
         encoded.append({
-            "name": candidate,
+            "name": name,
             "description": (t.description or "").strip()[:1024]
                             + f"\n[topic: {t.topic}, action: {t.action}]",
             "input_schema": t.parameters or {"type": "object", "properties": {}},
@@ -258,9 +246,14 @@ def _parse_response(
 ) -> ModelResponse:
     """Anthropic Messages response → ModelResponse.
 
-    The ``content`` array can be a mix of text + tool_use blocks. We
-    walk in order — first ``tool_use`` wins; if there's none, the
-    concatenated text becomes the terminal ``done`` rationale.
+    The ``content`` array can be a mix of text + tool_use blocks, and
+    Anthropic can return SEVERAL tool_use blocks in one response (a
+    model acting and confirming in the same turn — see
+    docs/TODO_BRAIN_GAP_FIXES.md Gap 5). Every tool_use block becomes
+    its own ``ProposedAction``, in order, each keeping its own ``id``
+    so the engine's follow-up ``tool_result`` threads back to the right
+    one. If there's no tool_use at all, the concatenated text becomes
+    the terminal ``done`` rationale.
     """
     content = body.get("content") or []
     usage_obj = body.get("usage") or {}
@@ -270,6 +263,8 @@ def _parse_response(
     )
 
     text_parts: List[str] = []
+    actions: List[ProposedAction] = []
+    unknown_names: List[str] = []
     for block in content:
         btype = block.get("type")
         if btype == "tool_use":
@@ -277,32 +272,36 @@ def _parse_response(
             args = block.get("input") or {}
             descriptor = decode.get(flat_name)
             if descriptor is None:
-                return ModelResponse(
-                    action=ProposedAction(
-                        kind="done",
-                        rationale=f"model called unknown tool {flat_name!r}",
-                    ),
-                    raw=body,
-                    usage=usage,
-                )
-            return ModelResponse(
-                action=ProposedAction(
-                    kind="tool",
-                    topic=descriptor.topic,
-                    action=descriptor.action,
-                    args=args if isinstance(args, dict) else {},
-                    rationale="\n".join(text_parts).strip(),
-                    tool_call_id=block.get("id"),
-                ),
-                raw=body,
-                usage=usage,
-            )
-        if btype == "text":
+                # Drop just this one call — other blocks may be valid.
+                unknown_names.append(flat_name)
+                continue
+            actions.append(ProposedAction(
+                kind="tool",
+                topic=descriptor.topic,
+                action=descriptor.action,
+                args=args if isinstance(args, dict) else {},
+                rationale="\n".join(text_parts).strip(),
+                tool_call_id=block.get("id"),
+            ))
+        elif btype == "text":
             t = block.get("text") or ""
             if t:
                 text_parts.append(t)
 
-    # No tool_use block — terminal done with whatever the model said.
+    if actions:
+        return ModelResponse(action=actions[0], actions=actions, raw=body, usage=usage)
+
+    if unknown_names:
+        return ModelResponse(
+            action=ProposedAction(
+                kind="done",
+                rationale=f"model called unknown tool(s) {unknown_names!r}",
+            ),
+            raw=body,
+            usage=usage,
+        )
+
+    # No tool_use block at all — terminal done with whatever the model said.
     return ModelResponse(
         action=ProposedAction(
             kind="done",

@@ -7,12 +7,11 @@ consumer — can be exercised without hardware. Implements the
 topics so consumers (e.g. the oscope service's channel picker) can
 discover them.
 
-Bus topics
-----------
-  /siggen/{id}/state         retained — running + sample rate + wave bank
-  /siggen/{id}/control       incoming @service_method actions
-  /siggen/{id}/heartbeat     1Hz (base-class)
-  /siggen/{id}/ch/{waveId}   per-wave sample stream — {value: float, ts: float}
+Wire shape is declared in code below (``SiggenState``,
+``SamplePayload`` via ``state_schema``/``topic_schemas``) and
+introspected into ``/runtime/runtime/types/siggen``, as are the
+``control`` actions. Samples stream on one topic per wave,
+``ch/{wave_id}``.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ import random
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel
 from rlx_bus import SubprocessService, service_method
 
 from .model import SiggenConfig, Wave
@@ -50,6 +50,22 @@ def wave_value(w: Wave, t: float) -> float:
     return w.offset                          # "dc"
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class SiggenState(BaseModel):
+    """Retained on ``/siggen/{id}/state`` — running + rate + wave bank."""
+    running: bool
+    sample_hz: float
+    waves: List[Wave]
+
+
+class SamplePayload(BaseModel):
+    """Published on ``/siggen/{id}/ch/{wave_id}`` at ``sample_hz`` per
+    enabled wave."""
+    value: float
+    ts: float
+
+
 class SiggenService(SubprocessService):
     """Function generator on the bus. One task ticks the whole wave bank."""
 
@@ -57,6 +73,9 @@ class SiggenService(SubprocessService):
     heartbeat_interval_s = 1.0
     config_class = SiggenConfig
     publishes = ["state"]
+    state_schema = SiggenState
+    # Per-wave stream — the suffix is templated, one topic per wave id.
+    topic_schemas = {"ch/{wave_id}": SamplePayload}
 
     def __init__(self, proxy_id: str, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -104,7 +123,7 @@ class SiggenService(SubprocessService):
                         except Exception:  # noqa: BLE001 — never let one wave kill the loop
                             logger.exception("siggen %s: wave %s eval failed", self.proxy_id, w.id)
                             continue
-                        await self.bus.publish(self.ch_topic(w.id), {"value": v, "ts": now})
+                        await self.bus.publish(self.ch_topic(w.id), SamplePayload(value=v, ts=now).model_dump())
                 await asyncio.sleep(max(0.002, period))
         except asyncio.CancelledError:
             return
@@ -136,11 +155,12 @@ class SiggenService(SubprocessService):
         await self.update_config(patch)
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "running": self.config.running,
-            "sample_hz": self.config.sample_hz,
-            "waves": [w.model_dump() for w in self.config.waves],
-        }
+        state = SiggenState(
+            running=self.config.running,
+            sample_hz=self.config.sample_hz,
+            waves=list(self.config.waves),
+        )
+        return state.model_dump()
 
     async def publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

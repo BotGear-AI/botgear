@@ -27,10 +27,10 @@ import logging
 import time
 from typing import Any, ClassVar, Dict, List, Optional
 
-from pydantic import Field
-from rlx_bus import ServiceConfig, SubprocessService, service_method
+from pydantic import BaseModel, Field
+from rlx_bus import HALT_TOPIC, ServiceConfig, SubprocessService, halt_event, service_method
 
-from .events import binding_matches, event_token, normalize_event
+from .events import KeyEvent, binding_matches, event_token, normalize_event
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,21 @@ class KeyboardConfig(ServiceConfig):
     bindings: List[Dict[str, Any]] = Field(
         default_factory=list,
         description="Keymap: list of {id, combo, topic, on_down, on_up}. On a matching key event the bound message (on_down/on_up) is published to `topic`.")
+    halt_combo: Optional[str] = Field(
+        "ctrl+alt+KeyH",
+        description="Hotkey that broadcasts a runtime-wide HALT (stop speech, brain runs, playback) while capturing. Checked before every other binding. Empty = off.")
+
+
+class KeyboardState(BaseModel):
+    """Retained on ``/keyboard/{id}/state``."""
+    capturing: bool
+    scope: str
+    suppress: bool
+    bindings: List[Dict[str, Any]] = Field(description="Keymap: {id, combo, topic, on_down, on_up}")
+    pressed: List[str] = Field(description="Currently-held key tokens (code, else key), lowercased")
+    last_event: Optional[KeyEvent]
+    source: str = Field(description="'local' host capture vs 'browser'")
+    last_error: Optional[str]
 
 
 class KeyboardServiceBase(SubprocessService):
@@ -54,6 +69,8 @@ class KeyboardServiceBase(SubprocessService):
 
     config_class: ClassVar = KeyboardConfig
     publishes: ClassVar[List[str]] = ["state", "event"]
+    state_schema: ClassVar = KeyboardState
+    topic_schemas: ClassVar[Dict[str, Any]] = {"event": KeyEvent}
     type_name: ClassVar[str] = "keyboard"
     source: ClassVar[str] = "local"   # "local" host capture vs "browser"
 
@@ -230,8 +247,17 @@ class KeyboardServiceBase(SubprocessService):
 
     async def _dispatch(self, ev: Dict[str, Any]) -> None:
         """Publish bound messages for every binding matching ``ev``. Auto-
-        repeat is ignored so a held key fires the action once on press."""
+        repeat is ignored so a held key fires the action once on press.
+        The HALT hotkey is checked first and short-circuits the keymap."""
         if ev.get("repeat"):
+            return
+        combo = (self.config.halt_combo or "").strip()
+        if combo and ev["type"] == "down" and binding_matches(ev, {"combo": combo}):
+            try:
+                await self.bus.publish(HALT_TOPIC, halt_event(
+                    "stop", f"keyboard:{self.proxy_id}", f"hotkey {combo}"))
+            except Exception:  # noqa: BLE001
+                logger.exception("%s: halt hotkey publish failed", self.proxy_id)
             return
         for b in self.config.bindings:
             if not binding_matches(ev, b):
@@ -243,6 +269,13 @@ class KeyboardServiceBase(SubprocessService):
                     await self.bus.publish(topic, payload)
                 except Exception:  # noqa: BLE001
                     logger.exception("%s: keymap publish to %s failed", self.proxy_id, topic)
+
+    async def on_halt(self, event: Dict[str, Any]) -> None:
+        """HALT: fire every binding's on_up — nothing a held key started
+        (teleop driving) keeps going. Capture stays on so the hotkey works
+        again."""
+        await self._release_all()
+        await self._publish_state()
 
     async def _release_all(self) -> None:
         """All-stop: publish every binding's on_up so nothing keeps running
@@ -259,16 +292,17 @@ class KeyboardServiceBase(SubprocessService):
 
     # ─── state ────────────────────────────────────────────────────────
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "capturing": self._capturing,
-            "scope": self.config.scope,
-            "suppress": self.config.suppress,
-            "bindings": list(self.config.bindings),
-            "pressed": sorted(self._pressed),
-            "last_event": self._last_event,
-            "source": type(self).source,
-            "last_error": self._last_error,
-        }
+        state = KeyboardState(
+            capturing=self._capturing,
+            scope=self.config.scope,
+            suppress=self.config.suppress,
+            bindings=list(self.config.bindings),
+            pressed=sorted(self._pressed),
+            last_event=self._last_event,
+            source=type(self).source,
+            last_error=self._last_error,
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

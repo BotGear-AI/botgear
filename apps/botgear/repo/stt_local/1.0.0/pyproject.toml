@@ -12,8 +12,17 @@ dependencies = [
     # onnxruntime + the endpoint detector and ships for Linux/macOS/Windows +
     # Raspberry Pi (aarch64/armv7l) — no torch, no ffmpeg, no system audio
     # libraries. Models download on first use into the service's data cache.
-    # (numpy comes in transitively.)
     "sherpa-onnx>=1.13,<2.0",
+    # Tokenizes the configured stop words into the keyword-spotter model's
+    # BPE pieces (see _create_kws).
+    "sentencepiece>=0.2",
+    # _feed() converts PCM to float32 via numpy directly — NOT a transitive
+    # sherpa-onnx dep (confirmed absent from a real venv's install; every
+    # feed silently raised ModuleNotFoundError, swallowed by
+    # _recognizer_loop's broad except, so the service reported
+    # ready/listening with a healthy level meter while transcribing nothing
+    # at all). Declare it explicitly.
+    "numpy",
 ]
 
 [project.scripts]

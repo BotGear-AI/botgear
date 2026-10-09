@@ -14,7 +14,7 @@ description: |
   returns angles; the requirement is documentational so the catalog
   filter shows "needs a servo controller to send results to".
 
-  See ``docs/TODO_IK_SOLVER.md`` for the full PRD + design notes.
+  See this type's ``README.md`` for the full PRD + design notes.
 
 language: python
 status: development
@@ -22,7 +22,7 @@ author: CloudSeeder
 tags: [kinematics, robotics, math]
 icon: icon.svg
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md).
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section).
 ui:
   entry: ui/dist/ui.js
   sdk: "^1.0"

@@ -1,16 +1,10 @@
 """RosService — ROS/ROS2 bridge + robot-description toolbox.
 
 Subprocess service. v1 exposes the URDF/xacro → ik_solver chain export
-only; it holds no live ROS connection. Bus topics:
-
-  /ros/{id}/state      retained — package map + last export summary
-  /ros/{id}/control    incoming @service_method actions
-  /ros/{id}/heartbeat  1Hz (base class)
-
-Actions:
-  scan_packages   (re)scan package_root for package.xml → {pkg: dir}
-  list_chain      list links + actuated joints of a description (pick base/tip)
-  convert         URDF/xacro + base/tip → ik_solver model + rich chain JSON
+only; it holds no live ROS connection. Wire shape (``RosState`` via
+``state_schema``) and the ``control`` actions (scan_packages,
+list_chain, convert, ...) are introspected into
+``/runtime/runtime/types/ros`` off the code below.
 """
 from __future__ import annotations
 
@@ -19,6 +13,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig, SubprocessService, service_method
 
 from .pkg_resolver import build_package_map
@@ -38,11 +33,20 @@ class RosConfig(ServiceConfig):
     output_dir: str = ""     # where expanded URDF / chain JSON is written ("" = bus only)
 
 
+class RosState(BaseModel):
+    """Retained on ``/ros/{id}/state`` — package map + last export."""
+    package_root: Optional[str]
+    output_dir: Optional[str]
+    packages: Dict[str, str] = Field(description="ROS package name -> directory")
+    last_export: Optional[Dict[str, Any]] = Field(description="Summary of the last convert/glb export; shape varies by exporter")
+
+
 class RosService(SubprocessService):
     type_name = "ros"
     heartbeat_interval_s = 1.0
     config_class = RosConfig
     publishes = ["state"]
+    state_schema = RosState
 
     def __init__(self, proxy_id: str, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -62,12 +66,13 @@ class RosService(SubprocessService):
             logger.warning("ros %s: no package.xml found under %r", self.proxy_id, root)
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "package_root": self.config.package_root or None,
-            "output_dir": self.config.output_dir or None,
-            "packages": dict(sorted(self._pkgmap.items())),
-            "last_export": self._last_export,
-        }
+        state = RosState(
+            package_root=self.config.package_root or None,
+            output_dir=self.config.output_dir or None,
+            packages=dict(sorted(self._pkgmap.items())),
+            last_export=self._last_export,
+        )
+        return state.model_dump()
 
     async def publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

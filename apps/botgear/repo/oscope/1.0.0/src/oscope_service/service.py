@@ -17,13 +17,10 @@ Design notes
 * Frames carry only NEW samples since the last frame (delta streaming),
   so a fast source can't flood the bus with redundant windows.
 
-Bus topics
-----------
-  /oscope/{id}/state      retained — channels + timebase + trigger + last trigger
-  /oscope/{id}/control    incoming @service_method actions
-  /oscope/{id}/heartbeat  1Hz (base-class)
-  /oscope/{id}/frame      ~frame_hz — {t, seq, running, ch:{id:[[t,v]…]}, trig}
-  /oscope/{id}/trigger    trigger events — {channel_id, t, value, edge, direction, seq}
+Wire shape is declared in ``model.py`` (``OscopeState``,
+``FramePayload``, ``TriggerEvent``) and wired up via ``state_schema``/
+``topic_schemas`` below — introspected into
+``/runtime/runtime/types/oscope``, as are the ``control`` actions.
 """
 from __future__ import annotations
 
@@ -36,7 +33,7 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from rlx_bus import SubprocessService, service_method
 
-from .model import Channel, OscopeConfig, Trigger
+from .model import Channel, FramePayload, OscopeConfig, OscopeState, Trigger, TriggerEvent
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +78,8 @@ class OscopeService(SubprocessService):
     heartbeat_interval_s = 1.0
     config_class = OscopeConfig
     publishes = ["state", "frame", "trigger"]
+    state_schema = OscopeState
+    topic_schemas = {"frame": FramePayload, "trigger": TriggerEvent}
 
     def __init__(self, proxy_id: str, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -188,9 +187,9 @@ class OscopeService(SubprocessService):
             return
         self._last_trig_t = t
         self._trig_seq += 1
-        ev = {"channel_id": trig.channel_id, "t": t, "value": v,
-              "edge": trig.edge, "direction": "rising" if rising else "falling",
-              "seq": self._trig_seq}
+        ev = TriggerEvent(channel_id=trig.channel_id, t=t, value=v,
+                          edge=trig.edge, direction="rising" if rising else "falling",
+                          seq=self._trig_seq).model_dump()
         self._last_trigger = ev
         self._frame_trig = ev
         if trig.publish:
@@ -212,10 +211,10 @@ class OscopeService(SubprocessService):
                         ch[cid] = samples
                         self._new[cid] = []
                 self._frame_seq += 1
-                frame = {"t": now, "seq": self._frame_seq, "running": self.config.running,
-                         "ch": ch, "trig": self._frame_trig}
+                frame = FramePayload(t=now, seq=self._frame_seq, running=self.config.running,
+                                     ch=ch, trig=self._frame_trig)
                 self._frame_trig = None
-                await self.publish("frame", frame)
+                await self.publish("frame", frame.model_dump())
                 if self._single_stop_at is not None and now >= self._single_stop_at:
                     self._single_stop_at = None
                     await self._persist(running=False)
@@ -250,17 +249,18 @@ class OscopeService(SubprocessService):
     def _snapshot(self) -> Dict[str, Any]:
         trig = self.config.trigger
         mode = trig.mode if trig.channel_id else "roll"
-        return {
-            "running": self.config.running,
-            "mode": mode,
-            "timebase_ms": self.config.timebase_ms,
-            "frame_hz": self.config.frame_hz,
-            "buffer_s": self.config.buffer_s,
-            "channels": [c.model_dump() for c in self.config.channels],
-            "trigger": trig.model_dump(),
-            "last_trigger": self._last_trigger,
-            "t_now": time.time(),
-        }
+        state = OscopeState(
+            running=self.config.running,
+            mode=mode,
+            timebase_ms=self.config.timebase_ms,
+            frame_hz=self.config.frame_hz,
+            buffer_s=self.config.buffer_s,
+            channels=list(self.config.channels),
+            trigger=trig,
+            last_trigger=self._last_trigger,
+            t_now=time.time(),
+        )
+        return state.model_dump()
 
     async def publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

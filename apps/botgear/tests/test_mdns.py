@@ -62,6 +62,59 @@ def _fake_browser_factory(callback_holder):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# _all_lan_addresses — interface filtering
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _FakeIp:
+    def __init__(self, ip: str) -> None:
+        self.ip = ip
+        self.is_IPv4 = True
+
+
+class _FakeAdapter:
+    def __init__(self, name: str, ips):
+        self.name = name
+        self.ips = [_FakeIp(ip) for ip in ips]
+
+
+def test_all_lan_addresses_excludes_loopback_and_virtual_bridges(monkeypatch):
+    """Reproduces the field bug: a Docker host announced docker0's
+    172.17.0.1 alongside its real LAN IP, and a remote peer's mDNS
+    resolver returned the Docker address for our SRV hostname — a
+    machine that isn't us, that can never route to it, hangs in a
+    silent TCP-connect timeout. Only the real, routable LAN address
+    should survive."""
+    import socket as socket_mod
+    fake_adapters = [
+        _FakeAdapter("lo", ["127.0.0.1"]),
+        _FakeAdapter("docker0", ["172.17.0.1"]),
+        _FakeAdapter("br-89ab00112233", ["172.20.0.1"]),
+        _FakeAdapter("veth3f2a1b9", ["169.254.1.2"]),
+        _FakeAdapter("virbr0", ["192.168.122.1"]),
+        _FakeAdapter("wlo1", ["192.168.0.157"]),
+    ]
+    monkeypatch.setattr(
+        "botgear.runtime.mdns.ifaddr.get_adapters", lambda: fake_adapters,
+    )
+    addrs = mdns._all_lan_addresses()
+    assert addrs == [socket_mod.inet_aton("192.168.0.157")]
+
+
+def test_all_lan_addresses_falls_back_to_loopback_when_nothing_else(monkeypatch):
+    """No real interface up at all (e.g. mdns.start() racing DHCP at
+    boot) — better to announce loopback than crash zeroconf with an
+    empty address list."""
+    import socket as socket_mod
+    monkeypatch.setattr(
+        "botgear.runtime.mdns.ifaddr.get_adapters",
+        lambda: [_FakeAdapter("lo", ["127.0.0.1"])],
+    )
+    addrs = mdns._all_lan_addresses()
+    assert addrs == [socket_mod.inet_aton("127.0.0.1")]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # start / stop
 # ─────────────────────────────────────────────────────────────────────
 
@@ -96,6 +149,56 @@ def test_start_is_idempotent(monkeypatch):
     )
     # register_service still called only once
     assert fake_zc.register_service.call_count == 1
+
+
+def test_rescan_noop_when_never_started():
+    """Nothing to rebuild if start() was never called."""
+    assert mdns.rescan() is False
+
+
+def test_rescan_rebuilds_with_same_identity(monkeypatch):
+    """The fix for the boot race (Wi-Fi comes up after mdns.start()
+    already snapshotted zero usable interfaces): rescan() tears down
+    the stale zeroconf instance and builds a fresh one with the same
+    runtime_id/port, so a freshly-constructed Zeroconf() gets a chance
+    to re-enumerate interfaces. Unlike start(), rescan() doesn't take
+    zc_factory/browser_factory (those are test-only on start()) — it
+    always goes through the real ``from zeroconf import ...`` names, so
+    this test stubs those directly on the fake module instead."""
+    zc_instances: List[MagicMock] = []
+
+    def _zc_factory():
+        m = MagicMock()
+        m.get_service_info = MagicMock(return_value=None)
+        zc_instances.append(m)
+        return m
+
+    browsers: List[MagicMock] = []
+
+    def _service_browser(zc, service_type, handlers):
+        b = MagicMock()
+        browsers.append(b)
+        return b
+
+    fake_module = type("_FakeZeroconfModule", (), {
+        "ServiceStateChange": _FakeStateChange,
+        "ServiceInfo": MagicMock(),
+        "Zeroconf": _zc_factory,
+        "ServiceBrowser": _service_browser,
+    })
+    monkeypatch.setitem(__import__("sys").modules, "zeroconf", fake_module)
+
+    mdns.start(runtime_id="witty-gizmo", port=8998)
+    assert len(zc_instances) == 1
+    first_zc = zc_instances[0]
+
+    assert mdns.rescan() is True
+
+    first_zc.unregister_all_services.assert_called_once()
+    first_zc.close.assert_called_once()
+    assert len(zc_instances) == 2
+    assert len(browsers) == 2
+    assert mdns.is_started()
 
 
 def test_stop_unregisters_and_closes(monkeypatch):

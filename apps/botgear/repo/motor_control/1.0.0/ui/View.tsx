@@ -24,7 +24,8 @@ import {
 import type { ServiceProxy } from '@rlx/ui'
 import type { ServiceMeta } from '@rlx/ui'
 import type { InboundFrame } from '@rlx/ui'
-import { useWsClient, useApiFetch } from '@rlx/ui'
+import type { RuntimeConnection } from '@rlx/ui'
+import { useWsClient, useApiFetch, useActiveRuntime, useRuntimeConnections } from '@rlx/ui'
 
 
 // The interface this service consumes — the attach dropdown is filtered
@@ -65,6 +66,20 @@ interface ChannelState {
 interface JoystickCandidate {
   id: string
   name: string
+  // Federation id of the runtime this joystick actually lives on, e.g.
+  // "sturdy-byte" — null once resolved to mean "same runtime as this
+  // motor_control instance" (kept null rather than duplicating our own
+  // id so a straight `runtimeId !== myRuntimeId` check can't misfire
+  // while our own id is still resolving). See runtimeId resolution in
+  // refreshJoysticks below.
+  runtimeId: string | null
+}
+
+// One entry from GET /v1/peers (see botgear/services/peer_service.py) —
+// only the fields this view actually reads.
+interface PeerRecord {
+  remote_id?: string | null
+  state?: string
 }
 
 interface MotorControlState {
@@ -92,6 +107,19 @@ interface ControllerLiveState {
 export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy }) {
   const wsClient = useWsClient()
   const apiFetch = useApiFetch()
+  // Every known runtime connection (this one included) — the joystick
+  // picker below scans ALL of them, not just the one hosting this
+  // motor_control instance, so a channel can be driven by a joystick on
+  // a peered runtime.
+  const { connections } = useRuntimeConnections()
+  const { connection: activeConnection } = useActiveRuntime()
+  // Our OWN runtime's federation id, once learned — used to decide
+  // whether a discovered joystick is "local" (bare topic) or "remote"
+  // (needs the `@<runtime-id>` federation suffix). Left null until
+  // /runtime/info arrives; see JoystickCandidate.runtimeId above for why
+  // a stale/unresolved id is treated as "assume remote" rather than
+  // guessed.
+  const myRuntimeId = activeConnection?.meta.runtime_id ?? null
   const proxyId = proxy.id ?? proxy.name ?? ''
   const stateTopic = `/motor_control/${proxyId}/state`
   const controlTopic = `/motor_control/${proxyId}/control`
@@ -99,6 +127,14 @@ export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy })
   const [state, setState] = useState<MotorControlState>({})
   const [candidates, setCandidates] = useState<ControllerCandidate[]>([])
   const [joysticks, setJoysticks] = useState<JoystickCandidate[]>([])
+  // Federation ids this runtime currently has a live (state=connected)
+  // peer bridge to, from GET /v1/peers on the ACTIVE connection. A
+  // joystick candidate on a runtime NOT in this set would bind fine
+  // (set_input doesn't validate reachability) but sit silently idle
+  // until a bridge exists — surfaced as a warning rather than blocked,
+  // since the peer link can come up moments later on its own (mDNS
+  // auto-connect) with no action needed here.
+  const [peerLinks, setPeerLinks] = useState<Set<string>>(new Set())
   const [candidatesError, setCandidatesError] = useState<string | null>(null)
   // Per-controller live state keyed by `${type}/${id}`.
   const [controllerStates, setControllerStates] = useState<Record<string, ControllerLiveState>>({})
@@ -148,6 +184,9 @@ export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy })
   }, [boundControllers.map((c) => `${c.type}/${c.id}`).join('|'), wsClient])
 
   // ─── fetch motor_controller candidates (every 5s) ──────────────────
+  // motor_controller attach stays scoped to THIS runtime — a channel's
+  // hardware binding (controller_type/controller_id) has no federation
+  // suffix in the data model, unlike the input_source topic below.
   const refreshCandidates = useCallback(async () => {
     try {
       const [metas, proxies] = await Promise.all([
@@ -165,7 +204,6 @@ export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy })
         }
       }
       const found: ControllerCandidate[] = []
-      const sticks: JoystickCandidate[] = []
       for (const p of proxies) {
         const pid = p.id ?? p.name
         if (!pid) continue
@@ -176,12 +214,8 @@ export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy })
             status: p.status ?? 'unknown',
           })
         }
-        if ((p.service_meta_id ?? '').startsWith(JOYSTICK_META_PREFIX)) {
-          sticks.push({ id: pid, name: p.name ?? pid })
-        }
       }
       setCandidates(found)
-      setJoysticks(sticks)
       setCandidatesError(null)
     } catch (e) {
       setCandidatesError(e instanceof Error ? e.message : String(e))
@@ -193,6 +227,75 @@ export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy })
     const t = setInterval(refreshCandidates, 5000)
     return () => clearInterval(t)
   }, [refreshCandidates])
+
+  // ─── fetch joystick candidates ACROSS every connected runtime ──────
+  // Unlike motor_controller attach above, an input_source binding is
+  // just a bus topic string — the federation bridge (`@<runtime-id>`
+  // suffix) makes any joystick on any peered runtime reachable, so the
+  // picker scans every RuntimeConnection the UI knows about, not only
+  // the one hosting this motor_control instance. One dead/unreachable
+  // connection is skipped (try/catch per-connection) rather than
+  // failing the whole refresh.
+  const refreshJoysticks = useCallback(async () => {
+    const sticks: JoystickCandidate[] = []
+    await Promise.all(
+      connections.map(async (conn: RuntimeConnection) => {
+        // A connection whose federation id hasn't resolved yet can't be
+        // addressed with an `@<runtime-id>` suffix (and might BE us,
+        // pre-resolution) — skip it this tick; the 5s poll picks it up
+        // once /runtime/info arrives.
+        const runtimeId = conn.meta.runtime_id
+        if (!runtimeId) return
+        try {
+          const proxies = await conn.apiFetch<ServiceProxy[]>('/v1/service-proxy-list')
+          for (const p of proxies) {
+            if (!(p.service_meta_id ?? '').startsWith(JOYSTICK_META_PREFIX)) continue
+            const pid = p.id ?? p.name
+            if (!pid) continue
+            sticks.push({
+              id: pid,
+              name: p.name ?? pid,
+              runtimeId: runtimeId === myRuntimeId ? null : runtimeId,
+            })
+          }
+        } catch {
+          // Unreachable / unauthenticated connection — just omit its
+          // joysticks this tick, don't blow up the whole refresh.
+        }
+      }),
+    )
+    setJoysticks(sticks)
+  }, [connections, myRuntimeId])
+
+  useEffect(() => {
+    refreshJoysticks()
+    const t = setInterval(refreshJoysticks, 5000)
+    return () => clearInterval(t)
+  }, [refreshJoysticks])
+
+  // ─── fetch this runtime's live federation peer links ───────────────
+  // Informs the "peer not connected" warning in InputSourceRow — a
+  // binding to an unlinked runtime still gets SAVED (set_input doesn't
+  // validate reachability), it just sits idle until a bridge exists.
+  const refreshPeerLinks = useCallback(async () => {
+    try {
+      const peers = await apiFetch<PeerRecord[]>('/v1/peers')
+      const linked = new Set<string>()
+      for (const p of peers) {
+        if (p.remote_id && p.state === 'connected') linked.add(p.remote_id)
+      }
+      setPeerLinks(linked)
+    } catch {
+      // Peers endpoint is Admin-only — a non-admin viewer simply sees no
+      // warnings rather than an error.
+    }
+  }, [apiFetch])
+
+  useEffect(() => {
+    refreshPeerLinks()
+    const t = setInterval(refreshPeerLinks, 5000)
+    return () => clearInterval(t)
+  }, [refreshPeerLinks])
 
   // ─── emergency stop ────────────────────────────────────────────────
   const estopped = !!state.estopped
@@ -270,6 +373,8 @@ export default function MotorControlFullView({ proxy }: { proxy: ServiceProxy })
             ch={ch}
             estopped={estopped}
             joysticks={joysticks}
+            myRuntimeId={myRuntimeId}
+            peerLinks={peerLinks}
             controllerState={
               ch.controller_type && ch.controller_id
                 ? controllerStates[`${ch.controller_type}/${ch.controller_id}`]
@@ -393,11 +498,13 @@ function AddChannel({
 // ─────────────────────────────────────────────────────────────────────
 
 function ChannelCard({
-  ch, estopped, joysticks, controllerState, onSet, onStop, onRemove, onSetLimits, onUpdate, onSetInput, onClearInput,
+  ch, estopped, joysticks, myRuntimeId, peerLinks, controllerState, onSet, onStop, onRemove, onSetLimits, onUpdate, onSetInput, onClearInput,
 }: {
   ch: ChannelState
   estopped: boolean
   joysticks: JoystickCandidate[]
+  myRuntimeId: string | null
+  peerLinks: Set<string>
   controllerState?: ControllerLiveState
   onSet: (v: number) => void
   onStop: () => void
@@ -434,6 +541,14 @@ function ChannelCard({
   // operator can't drag past a configured safety bound.
   const sliderMin = ch.min_output
   const sliderMax = ch.max_output
+  const draftPct = Math.round(draft * 100)
+  // Step from the displayed percent, not draft*100 + delta/100, so
+  // repeated clicks can't drift off-integer from float accumulation.
+  const step = (delta: number) => {
+    const v = Math.max(sliderMin, Math.min(sliderMax, (draftPct + delta) / 100))
+    setDraft(v)
+    onSet(v)
+  }
 
   return (
     <section className={`rounded border p-3 ${ch.enabled ? 'border-slate-800 bg-slate-900/40' : 'border-slate-800 bg-slate-950/60 opacity-70'}`}>
@@ -475,6 +590,13 @@ function ChannelCard({
       {/* speed slider */}
       <div className="flex items-center gap-3">
         <span className="w-10 text-right font-mono text-[10px] text-slate-500">{Math.round(sliderMin * 100)}%</span>
+        <button
+          type="button" onClick={() => step(-1)}
+          onPointerDown={(e) => e.stopPropagation()}
+          disabled={disabled || draftPct <= Math.round(sliderMin * 100)}
+          aria-label={`${ch.id} decrease 1%`}
+          className="nodrag nopan rounded border border-slate-700 p-0.5 text-slate-400 hover:border-emerald-500 hover:text-emerald-300 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-slate-700 disabled:hover:text-slate-400"
+        >&lt;</button>
         <input
           type="range" min={sliderMin} max={sliderMax} step={0.01} value={draft}
           disabled={disabled}
@@ -483,6 +605,13 @@ function ChannelCard({
           onPointerUp={() => setDragging(false)}
           onChange={(e) => { const v = Number(e.target.value); setDraft(v); onSet(v) }}
         />
+        <button
+          type="button" onClick={() => step(1)}
+          onPointerDown={(e) => e.stopPropagation()}
+          disabled={disabled || draftPct >= Math.round(sliderMax * 100)}
+          aria-label={`${ch.id} increase 1%`}
+          className="nodrag nopan rounded border border-slate-700 p-0.5 text-slate-400 hover:border-emerald-500 hover:text-emerald-300 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-slate-700 disabled:hover:text-slate-400"
+        >&gt;</button>
         <span className="w-10 font-mono text-[10px] text-slate-500">{Math.round(sliderMax * 100)}%</span>
         <button
           type="button" onClick={() => { setDraft(0); onStop() }}
@@ -525,6 +654,8 @@ function ChannelCard({
       <InputSourceRow
         ch={ch}
         joysticks={joysticks}
+        myRuntimeId={myRuntimeId}
+        peerLinks={peerLinks}
         onSetInput={onSetInput}
         onClearInput={onClearInput}
       />
@@ -537,11 +668,30 @@ function ChannelCard({
 // Per-channel input-source row — bind a live joystick axis to the target
 // ─────────────────────────────────────────────────────────────────────
 
+// Composite key for the stick <select> — a bare proxy id (e.g.
+// "joystick-1") isn't unique across runtimes, so candidates are keyed
+// by "<runtimeId>::<id>" (local candidates use "" for runtimeId).
+function stickKey(j: Pick<JoystickCandidate, 'id' | 'runtimeId'>): string {
+  return `${j.runtimeId ?? ''}::${j.id}`
+}
+
+// Pull the `@<runtime-id>` federation suffix off an already-bound
+// topic, if any, so the bound-state display can flag an unlinked peer
+// the same way the picker does. Mirrors bus.py's parse_id_suffix.
+function peerSuffixOf(topic: string): string | null {
+  const at = topic.lastIndexOf('@')
+  if (at < 0) return null
+  const suffix = topic.slice(at + 1)
+  return /^[a-z][a-z0-9-]{1,62}$/.test(suffix) ? suffix : null
+}
+
 function InputSourceRow({
-  ch, joysticks, onSetInput, onClearInput,
+  ch, joysticks, myRuntimeId, peerLinks, onSetInput, onClearInput,
 }: {
   ch: ChannelState
   joysticks: JoystickCandidate[]
+  myRuntimeId: string | null
+  peerLinks: Set<string>
   onSetInput: (src: { topic: string; field: string; index: number; scale: number; offset: number; deadzone: number }) => void
   onClearInput: () => void
 }) {
@@ -553,10 +703,21 @@ function InputSourceRow({
   const [deadzone, setDeadzone] = useState('0.05')
 
   useEffect(() => {
-    if (!stick && joysticks.length > 0) setStick(joysticks[0].id)
+    if (!stick && joysticks.length > 0) setStick(stickKey(joysticks[0]))
   }, [joysticks, stick])
 
+  const picked = useMemo(
+    () => joysticks.find((j) => stickKey(j) === stick),
+    [joysticks, stick],
+  )
+  // A candidate is "remote" when it's tagged with a runtime id that
+  // isn't ours — null means "same runtime as this motor_control
+  // instance" (see JoystickCandidate.runtimeId).
+  const pickedUnlinked = !!(picked?.runtimeId && !peerLinks.has(picked.runtimeId))
+
   if (src) {
+    const boundPeer = peerSuffixOf(src.topic)
+    const boundUnlinked = !!(boundPeer && boundPeer !== myRuntimeId && !peerLinks.has(boundPeer))
     return (
       <div className="mt-2 flex items-center gap-2 border-t border-slate-800 pt-2 font-mono text-[10px]">
         <span className="inline-block h-2 w-2 rounded-full bg-sky-400 shadow-[0_0_5px_1px] shadow-sky-500/60" title="input stream bound" />
@@ -566,6 +727,11 @@ function InputSourceRow({
           {src.offset ? ` ${src.offset >= 0 ? '+' : ''}${src.offset}` : ''}
           {src.deadzone ? ` · dz ${src.deadzone}` : ''}
         </span>
+        {boundUnlinked && (
+          <span className="text-amber-400" title={`No live federation link to '${boundPeer}' — this binding is idle until one connects.`}>
+            ⚠ peer not connected
+          </span>
+        )}
         <button
           type="button" onClick={onClearInput} onPointerDown={(e) => e.stopPropagation()}
           title="Unbind input — return to manual slider control"
@@ -575,11 +741,12 @@ function InputSourceRow({
     )
   }
 
-  const valid = !!stick
+  const valid = !!picked
   const submit = () => {
-    if (!valid) return
+    if (!picked) return
+    const suffix = picked.runtimeId && picked.runtimeId !== myRuntimeId ? `@${picked.runtimeId}` : ''
     onSetInput({
-      topic: `/joystick/${stick}/input`,
+      topic: `/joystick/${picked.id}/input${suffix}`,
       field,
       index: Number.parseInt(index, 10) || 0,
       scale: Number(scale) || 1,
@@ -589,36 +756,46 @@ function InputSourceRow({
   }
 
   return (
-    <div className="mt-2 flex flex-wrap items-end gap-2 border-t border-slate-800 pt-2">
-      <span className="text-[10px] uppercase tracking-wider text-slate-500">input source</span>
-      <select
-        value={stick} onChange={(e) => setStick(e.target.value)}
-        disabled={joysticks.length === 0}
-        onPointerDown={(e) => e.stopPropagation()}
-        className="nodrag nopan w-40 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-200 focus:border-slate-500 focus:outline-none disabled:opacity-50"
-      >
-        {joysticks.length === 0 && <option value="">(no joystick running)</option>}
-        {joysticks.map((j) => (
-          <option key={j.id} value={j.id}>{j.id}{j.name && j.name !== j.id ? ` — ${j.name}` : ''}</option>
-        ))}
-      </select>
-      <select
-        value={field} onChange={(e) => setField(e.target.value)}
-        onPointerDown={(e) => e.stopPropagation()}
-        className="nodrag nopan rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-200 focus:border-slate-500 focus:outline-none"
-      >
-        <option value="axes">axis</option>
-        <option value="buttons">button</option>
-        <option value="hats">hat</option>
-      </select>
-      <SmallNum label="index" value={index} onChange={setIndex} min={0} step={1} width="w-14" />
-      <SmallNum label="scale" value={scale} onChange={setScale} step={0.1} width="w-16" />
-      <SmallNum label="deadzone" value={deadzone} onChange={setDeadzone} min={0} step={0.01} width="w-16" />
-      <button
-        type="button" disabled={!valid} onClick={submit}
-        onPointerDown={(e) => e.stopPropagation()}
-        className="nodrag nopan rounded bg-sky-600 px-2 py-1 text-[10px] font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-40"
-      >Bind input</button>
+    <div className="mt-2 flex flex-col gap-2 border-t border-slate-800 pt-2">
+      <div className="flex flex-wrap items-end gap-2">
+        <span className="text-[10px] uppercase tracking-wider text-slate-500">input source</span>
+        <select
+          value={stick} onChange={(e) => setStick(e.target.value)}
+          disabled={joysticks.length === 0}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="nodrag nopan w-52 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-200 focus:border-slate-500 focus:outline-none disabled:opacity-50"
+        >
+          {joysticks.length === 0 && <option value="">(no joystick running)</option>}
+          {joysticks.map((j) => (
+            <option key={stickKey(j)} value={stickKey(j)}>
+              {j.id}{j.name && j.name !== j.id ? ` — ${j.name}` : ''}
+              {j.runtimeId ? ` @${j.runtimeId}${peerLinks.has(j.runtimeId) ? '' : ' (peer not connected)'}` : ''}
+            </option>
+          ))}
+        </select>
+        <select
+          value={field} onChange={(e) => setField(e.target.value)}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="nodrag nopan rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px] text-slate-200 focus:border-slate-500 focus:outline-none"
+        >
+          <option value="axes">axis</option>
+          <option value="buttons">button</option>
+          <option value="hats">hat</option>
+        </select>
+        <SmallNum label="index" value={index} onChange={setIndex} min={0} step={1} width="w-14" />
+        <SmallNum label="scale" value={scale} onChange={setScale} step={0.1} width="w-16" />
+        <SmallNum label="deadzone" value={deadzone} onChange={setDeadzone} min={0} step={0.01} width="w-16" />
+        <button
+          type="button" disabled={!valid} onClick={submit}
+          onPointerDown={(e) => e.stopPropagation()}
+          className="nodrag nopan rounded bg-sky-600 px-2 py-1 text-[10px] font-medium text-white hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-40"
+        >Bind input</button>
+      </div>
+      {pickedUnlinked && (
+        <span className="font-mono text-[10px] text-amber-400">
+          ⚠ no live federation link from this runtime to '{picked?.runtimeId}' yet — binding will save but sit idle until one connects (mDNS auto-connect usually brings it up on its own within a few seconds).
+        </span>
+      )}
     </div>
   )
 }

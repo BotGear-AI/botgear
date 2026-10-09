@@ -1,5 +1,6 @@
 # unmanaged
-"""Tests for the config-set loader (stone 2 of TODO_CONFIG_SETS).
+"""Tests for the config-set loader (stone 2 of the config-sets design;
+see AGENTS.md's "Config sets" section).
 
 These tests build mini config-set directories on tmp_path and drive the
 loader end-to-end. Real registry manifests come from a one-time scan

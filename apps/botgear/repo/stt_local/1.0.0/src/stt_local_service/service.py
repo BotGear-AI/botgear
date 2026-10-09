@@ -9,6 +9,8 @@ utterance queue that bridges it to ``listen()`` are inherited from
   _create_recognizer(model_dir, sr)  build a sherpa-onnx OnlineRecognizer + stream
   _feed(handle, pcm)                 accept one frame → partial / final result
   _list_models()                     curated models + whatever's on disk
+  _create_kws / _kws_feed            the always-on stop-word spotter (sherpa-onnx
+                                     KeywordSpotter, its own small model)
 
 sherpa-onnx ships a streaming Zipformer transducer with built-in endpoint
 detection, so an utterance finalizes on trailing silence with no external VAD.
@@ -50,6 +52,15 @@ _MODELS: Dict[str, Dict[str, str]] = {
     },
 }
 _DOWNLOAD_TIMEOUT_S = 600
+
+# Stop-word spotter model (~17 MB, English, GigaSpeech-trained). Keywords are
+# given as the model's BPE tokens — produced here with its bpe.model via
+# sentencepiece (sherpa_onnx.text2token would also need pypinyin).
+_KWS_MODEL = {
+    "dir": "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/"
+           "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+}
 
 
 class SttLocalService(SttServiceBase):
@@ -173,6 +184,66 @@ class SttLocalService(SttServiceBase):
             recognizer.reset(stream)
             return {"text": text, "final": True}
         return {"text": text, "final": False}
+
+    # ─── stop-word spotter ────────────────────────────────────────────
+    def _ensure_kws_model(self) -> Path:
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        model_dir = self.models_dir / _KWS_MODEL["dir"]
+        if (model_dir / "bpe.model").is_file():
+            return model_dir
+        with self._dl_lock:
+            if not (model_dir / "bpe.model").is_file():
+                self._download_and_extract(_KWS_MODEL["url"])
+        if not (model_dir / "bpe.model").is_file():
+            raise RuntimeError(f"stop-word model missing bpe.model after download ({model_dir})")
+        return model_dir
+
+    def _create_kws(self, phrases: Dict[str, str], sample_rate: int) -> Dict[str, Any]:
+        import sentencepiece as spm  # noqa: PLC0415
+        import sherpa_onnx  # noqa: PLC0415
+        model_dir = self._ensure_kws_model()
+        sp = spm.SentencePieceProcessor(model_file=str(model_dir / "bpe.model"))
+        vocab = {line.split()[0] for line in (model_dir / "tokens.txt").read_text(encoding="utf-8").splitlines() if line.strip()}
+        lines = []
+        for label, phrase in phrases.items():
+            tokens = sp.encode(phrase.upper(), out_type=str)
+            if not tokens or any(t not in vocab for t in tokens):
+                logger.warning("stt_local %s: skipping stop word %r (not representable by the spotter model)",
+                               self.proxy_id, phrase)
+                continue
+            lines.append(" ".join(tokens) + f" @{label}")
+        if not lines:
+            raise RuntimeError("none of the configured stop words can be spotted")
+        keywords_file = model_dir / f"keywords-{self.proxy_id}.txt"
+        keywords_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        spotter = sherpa_onnx.KeywordSpotter(
+            tokens=str(model_dir / "tokens.txt"),
+            encoder=self._pick(model_dir, "encoder"),
+            decoder=self._pick(model_dir, "decoder"),
+            joiner=self._pick(model_dir, "joiner"),
+            keywords_file=str(keywords_file),
+            num_threads=1,
+            sample_rate=sample_rate,
+            keywords_threshold=float(self.config.stop_words_threshold),
+            provider="cpu",
+        )
+        return {"spotter": spotter, "stream": spotter.create_stream(), "sample_rate": sample_rate}
+
+    def _kws_feed(self, handle: Dict[str, Any], pcm: bytes) -> Optional[str]:
+        import numpy as np  # noqa: PLC0415
+        spotter, stream = handle["spotter"], handle["stream"]
+        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        if samples.size == 0:
+            return None
+        stream.accept_waveform(handle["sample_rate"], samples)
+        hit: Optional[str] = None
+        while spotter.is_ready(stream):
+            spotter.decode_stream(stream)
+            result = spotter.get_result(stream)
+            if result:
+                hit = result
+                spotter.reset_stream(stream)   # required after a detection
+        return hit
 
     def _reset_recognizer(self, handle: Dict[str, Any]) -> None:
         """Drop any partial decode state by starting a fresh stream, so a new

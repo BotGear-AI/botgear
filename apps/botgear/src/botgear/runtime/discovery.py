@@ -143,13 +143,61 @@ def _handle_config_patch(topic: str, payload: Any) -> None:
     merged = {**current, **payload}
     lifecycle.save_proxy_config(proxy_id, merged)
     # Re-broadcast retained so any other consumer (UI panels, future
-    # services) sees the new truth without polling.
+    # services) sees the new truth without polling. ``merged`` is the
+    # DECRYPTED config — mask any SecretStr field before it goes out on
+    # the bus, since any WS-connected browser can subscribe to this
+    # retained topic. See discovery._mask_secret_fields.
     get_bus().publish_sync(
         f"/service_proxy/{proxy_id}/config_state",
-        merged,
+        _mask_secret_fields(row.get("service_meta_id"), merged),
         retained=True,
     )
     logger.info("discovery: config_patch applied for %s: %s", proxy_id, list(payload.keys()))
+
+
+def _mask_secret_fields(type_id: Optional[str], config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact any field whose Pydantic type is ``SecretStr`` on the
+    type's ``config_class`` before a config dict leaves the backend on a
+    retained bus topic (``config_state`` is readable by any WS-connected
+    browser, unlike the encrypted-at-rest yml). A set-but-masked value
+    reads as ``"••••••••"``; unset stays whatever falsy value it was.
+
+    Falls back to a small naming-convention denylist (``token``,
+    ``secret``, ``password``, ``webhook_url``, ``api_key`` substrings)
+    when the config_class can't be resolved — e.g. a subprocess service
+    whose module imports its third-party SDK eagerly (arduino/pymata4,
+    for instance). This is a best-effort net, not a type-driven
+    guarantee, for those cases — see docs/TODO_MESSAGING.md's "known
+    limitations" note. discord/slack/google_chat keep their SDK imports
+    lazy specifically so the type-driven path resolves for them.
+    """
+    if not isinstance(config_dict, dict) or not config_dict or not type_id:
+        return config_dict
+    from botgear.runtime.boot import resolve_config_class
+    secret_keys: set = set()
+    config_class = resolve_config_class(type_id)
+    if config_class is not None:
+        try:
+            from pydantic import SecretStr
+            import typing
+            for name, field in config_class.model_fields.items():
+                ann = field.annotation
+                if ann is SecretStr or SecretStr in typing.get_args(ann):
+                    secret_keys.add(name)
+        except Exception:  # noqa: BLE001
+            secret_keys = set()
+    if not secret_keys:
+        secret_keys = {
+            k for k in config_dict
+            if any(tok in k.lower() for tok in ("token", "secret", "password", "webhook_url", "api_key"))
+        }
+    if not secret_keys:
+        return config_dict
+    masked = dict(config_dict)
+    for k in secret_keys:
+        if masked.get(k):
+            masked[k] = "••••••••"
+    return masked
 
 
 def _handle_methods_manifest(topic: str, payload: Any) -> None:

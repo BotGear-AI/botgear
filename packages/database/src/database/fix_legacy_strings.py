@@ -1,8 +1,8 @@
 import sqlite3
 import json
 import sys
-from record_transformer import RecordTransformer
-from sqlite_database import SqliteDatabase
+from .record_transformer import RecordTransformer
+from .sqlite_database import SqliteDatabase
 
 def infer_type(val):
     # Try to convert to int, float, bool, None, or JSON
@@ -80,7 +80,7 @@ def fix_legacy_table(sqlite_path, table_name, id_col='id'):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python fix_legacy_strings.py <sqlite_path> <table_name> [id_col]")
+        print("Usage: python -m database.fix_legacy_strings <sqlite_path> <table_name> [id_col]")
         sys.exit(1)
     sqlite_path = sys.argv[1]
     table_name = sys.argv[2]

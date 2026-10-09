@@ -1,5 +1,6 @@
 # unmanaged
-"""Brain workspace file API — stone A of TODO_BRAIN_VIEWER.md.
+"""Brain workspace file API — stone A (see repo/brain/1.0.0/README.md's
+"Workspace file browser (UI)" section).
 
 Endpoints:
   GET  /v1/service-proxy/{proxy_id}/files          → tree

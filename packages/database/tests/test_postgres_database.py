@@ -1,6 +1,7 @@
 import os
 import pytest
 from unittest.mock import patch, MagicMock
+from psycopg2 import OperationalError
 from database.postgres_database import PostgresDatabase
 from models.database_postgres_config import DatabasePostgresConfig
 
@@ -49,6 +50,46 @@ def test_insert_and_get_item(postgres_db):
     result = postgres_db.get_item("test", "1")
     assert result["id"] == "1"
     assert result["value"] == "foo"
+
+
+def test_successful_transaction_executes_statements_in_order_and_commits(postgres_db):
+    with postgres_db.transaction() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("FIRST STATEMENT")
+            cursor.execute("SECOND STATEMENT")
+
+    executed = [
+        call.args[0]
+        for call in postgres_db._mock_cursor.execute.call_args_list
+        if call.args[0] != "SELECT 1"
+    ]
+    assert executed == ["FIRST STATEMENT", "SECOND STATEMENT"]
+    postgres_db._mock_conn.commit.assert_called_once()
+    postgres_db._mock_conn.rollback.assert_not_called()
+
+
+def test_failed_transaction_rolls_back_after_second_statement(postgres_db):
+    def execute_side_effect(statement, *args, **kwargs):
+        if statement == "SECOND STATEMENT":
+            raise OperationalError("statement failed")
+
+    postgres_db._mock_cursor.execute.side_effect = execute_side_effect
+
+    with pytest.raises(OperationalError, match="statement failed"):
+        with postgres_db.transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("FIRST STATEMENT")
+                cursor.execute("SECOND STATEMENT")
+
+    executed = [
+        call.args[0]
+        for call in postgres_db._mock_cursor.execute.call_args_list
+        if call.args[0] != "SELECT 1"
+    ]
+    assert executed == ["FIRST STATEMENT", "SECOND STATEMENT"]
+    postgres_db._mock_conn.commit.assert_not_called()
+    postgres_db._mock_conn.rollback.assert_called_once()
+
 
 def test_insert_and_get_item_with_json_fields(postgres_db):
     # Arrays and dicts should be stored as JSONB
@@ -179,7 +220,9 @@ def test_ensure_table_with_datetime_model(postgres_db):
     postgres_db.ensure_table(EventModel, "event_model")
 
     assert captured_sql, "No SQL was executed"
-    ddl = captured_sql[0]
+    # _get_cursor validates a pooled connection with a plain "SELECT 1" before
+    # yielding it (see _acquire_validated_connection) — skip that, not the DDL.
+    ddl = next(s for s in captured_sql if s != "SELECT 1")
 
     # DDL is a psycopg2.sql.Composed; flatten Identifier+SQL children into a
     # single string so we can assert on the structure without needing a live
@@ -259,3 +302,170 @@ def test_query_logs_rendered_sql_when_debug_enabled(postgres_db):
         call.args == ("SQL: %s", 'SELECT * FROM "test" WHERE id = \'1\'')
         for call in mock_debug.call_args_list
     )
+
+
+# --- query_readonly ------------------------------------------------------------
+# Ad-hoc admin/debug query path — must never touch the app's normal
+# read/write pool since it forces the connection into a read-only session
+# and a custom statement_timeout that must persist beyond a single
+# cursor.execute() (autocommit=True on every pooled connection means those
+# settings need to be session-level, not transaction-scoped).
+
+def test_query_readonly_sets_session_readonly_and_timeout(postgres_db):
+    postgres_db.query_readonly('SELECT 1', timeout_ms=5000)
+
+    postgres_db._mock_conn.set_session.assert_called_once_with(readonly=True)
+    executed = [c.args[0] for c in postgres_db._mock_cursor.execute.call_args_list]
+    assert any("SET statement_timeout = 5000" in stmt for stmt in executed)
+
+
+def test_query_readonly_discards_connection_never_returns_to_pool(postgres_db):
+    postgres_db.query_readonly('SELECT 1')
+
+    postgres_db._mock_pool.putconn.assert_called_once_with(postgres_db._mock_conn, close=True)
+
+
+def test_query_readonly_discards_connection_even_on_query_error(postgres_db):
+    postgres_db._mock_cursor.execute.side_effect = [None, Exception("boom")]
+
+    with pytest.raises(Exception, match="boom"):
+        postgres_db.query_readonly('SELECT 1')
+
+    postgres_db._mock_pool.putconn.assert_called_once_with(postgres_db._mock_conn, close=True)
+
+
+def test_query_readonly_truncates_at_row_limit(postgres_db):
+    postgres_db._mock_cursor.fetchmany.return_value = [{"id": str(i)} for i in range(3)]
+
+    rows, truncated = postgres_db.query_readonly('SELECT 1', row_limit=2)
+
+    assert len(rows) == 2
+    assert truncated is True
+    postgres_db._mock_cursor.fetchmany.assert_called_once_with(3)  # row_limit + 1
+
+
+def test_query_readonly_not_truncated_when_under_limit(postgres_db):
+    postgres_db._mock_cursor.fetchmany.return_value = [{"id": "1"}]
+
+    rows, truncated = postgres_db.query_readonly('SELECT 1', row_limit=500)
+
+    assert len(rows) == 1
+    assert truncated is False
+
+
+def test_query_readonly_rejects_empty_sql(postgres_db):
+    with pytest.raises(ValueError):
+        postgres_db.query_readonly("   ")
+
+    postgres_db._mock_cursor.execute.assert_not_called()
+
+
+# --- _get_cursor retry behavior -----------------------------------------------
+# Regression tests for the "generator didn't stop after throw()" bug: the old
+# implementation retried the *entire* yield-body (including the caller's own
+# query) inside the same @contextmanager generator, which Python disallows —
+# a caller-side failure crashed with that RuntimeError instead of surfacing
+# the real error. The fix scopes retry to connection *acquisition* only
+# (_acquire_validated_connection, pinged with SELECT 1 before being handed to
+# the caller); a failure inside the caller's own `with` block always
+# propagates directly, on the first and only attempt.
+
+def _make_conn():
+    conn = MagicMock()
+    conn.autocommit = True
+    return conn
+
+
+def test_get_cursor_retries_a_stale_pooled_connection(postgres_db):
+    """A connection that fails its pre-flight SELECT 1 ping (the classic
+    "went stale while idle in the pool" symptom) is discarded and a fresh one
+    is acquired — transparently, before the caller ever sees it."""
+    stale_conn = _make_conn()
+    stale_ping_cursor = MagicMock()
+    stale_ping_cursor.execute.side_effect = OperationalError("SSL connection has been closed unexpectedly")
+    stale_conn.cursor.return_value.__enter__.return_value = stale_ping_cursor
+
+    fresh_conn = _make_conn()
+    fresh_cursor = MagicMock()
+    fresh_conn.cursor.return_value.__enter__.return_value = fresh_cursor
+
+    postgres_db._mock_pool.getconn.side_effect = [stale_conn, fresh_conn]
+
+    with patch("database.postgres_database.time.sleep"):
+        with postgres_db._get_cursor() as cursor:
+            assert cursor is fresh_cursor
+
+    postgres_db._mock_pool.putconn.assert_any_call(stale_conn, close=True)
+    postgres_db._mock_pool.putconn.assert_any_call(fresh_conn)
+
+
+def test_get_cursor_propagates_caller_query_error_without_retry(postgres_db):
+    """A failure inside the caller's own query (i.e. after the cursor was
+    already handed over) must not be retried — only the real error is
+    surfaced, never the generator RuntimeError, and getconn is called
+    exactly once (no re-acquisition, no re-running the caller's code)."""
+    # The fixture's mock_conn.cursor() returns the same mock_cursor for both
+    # the pre-flight ping and the caller's own use, so let the ping (the
+    # first execute call) succeed and only fail the caller's own query.
+    calls = {"n": 0}
+
+    def execute_side_effect(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OperationalError("SSL connection has been closed unexpectedly")
+
+    postgres_db._mock_cursor.execute.side_effect = execute_side_effect
+
+    with pytest.raises(OperationalError, match="SSL connection has been closed unexpectedly"):
+        with postgres_db._get_cursor() as cursor:
+            cursor.execute("SELECT * FROM real_query")
+
+    assert postgres_db._mock_pool.getconn.call_count == 1
+    postgres_db._mock_pool.putconn.assert_called_once_with(postgres_db._mock_conn, close=True)
+
+
+def test_get_cursor_raises_real_error_after_exhausting_acquisition_retries(postgres_db):
+    """If every pooled connection is stale, the real OperationalError is
+    raised after 3 attempts — not swallowed, not turned into a RuntimeError."""
+    bad_conn = _make_conn()
+    bad_ping_cursor = MagicMock()
+    bad_ping_cursor.execute.side_effect = OperationalError("SSL connection has been closed unexpectedly")
+    bad_conn.cursor.return_value.__enter__.return_value = bad_ping_cursor
+    postgres_db._mock_pool.getconn.return_value = bad_conn
+
+    with patch("database.postgres_database.time.sleep"):
+        with pytest.raises(OperationalError, match="SSL connection has been closed unexpectedly"):
+            with postgres_db._get_cursor():
+                pass  # pragma: no cover - never reached
+
+    assert postgres_db._mock_pool.getconn.call_count == 3
+
+
+def test_discard_connection_closes_conn_when_putconn_itself_fails(postgres_db):
+    """If putconn(close=True) raises (e.g. the pool is already being torn
+    down), the bad connection must still be closed directly — mirroring
+    _return_connection's own fallback — so the socket/DB session isn't
+    leaked while the pool is rebuilt."""
+    bad_conn = MagicMock()
+    postgres_db._mock_pool.putconn.side_effect = Exception("pool is closed")
+
+    with patch("database.postgres_database.ThreadedConnectionPool"):
+        postgres_db._discard_connection(bad_conn)
+
+    bad_conn.close.assert_called_once()
+
+
+def test_acquire_validated_connection_does_not_leak_on_non_retriable_ping_error(postgres_db):
+    """A connection successfully checked out via getconn() must always be
+    returned to the pool, even when the SELECT 1 ping fails with something
+    outside the retried (OperationalError/InterfaceError/PoolError) set —
+    e.g. a plain ValueError, or a psycopg2.Error subtype like DataError that
+    isn't one of those three. Not retried (not known to be transient), but
+    the checkout slot must not leak."""
+    postgres_db._mock_conn.cursor.return_value.__enter__.return_value.execute.side_effect = ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        postgres_db._acquire_validated_connection()
+
+    postgres_db._mock_pool.getconn.assert_called_once()
+    postgres_db._mock_pool.putconn.assert_called_once_with(postgres_db._mock_conn, close=True)

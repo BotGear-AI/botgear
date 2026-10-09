@@ -1,0 +1,103 @@
+name: slam
+title: SLAM (2D mapping)
+description: |
+  Cheap 2D occupancy-grid mapping for worke — see docs/TODO_SLAM.md.
+  Fuses an ``oakd`` depth camera's decimated ``depth_sample`` topic (a
+  2D "virtual laser scan" derived via known camera mount geometry + a
+  flat-floor assumption) with open-loop dead-reckoning odometry from
+  ``motor_control``'s commanded output.
+
+  NOT full SLAM: no loop closure, no scan-matching drift correction in
+  this version — the map WILL drift on long/complex traversals. A
+  pluggable mapping-backend interface keeps a future drift-correcting
+  backend (e.g. BreezySLAM, spiked and documented but deliberately not
+  used yet — see docs/TODO_SLAM.md §5.2a) a swap-in rather than a
+  rewrite, once that's independently verified as viable on this robot's
+  actual (possibly ARM) hardware.
+
+  No wheel encoders exist on this robot today (confirmed against the
+  actual motor_control/sabertooth implementations) — odometry accuracy
+  is bounded by how well ``wheel_speed_calibration_m_per_s`` is
+  physically tuned and will drift with wheel slip. This is a named,
+  accepted limitation, not a bug.
+
+  Deliberately dependency-light: numpy only, no OpenCV/depthai — never
+  touches a camera or depth device directly, only consumes
+  already-decimated bus data from ``oakd``. Designed to stay cheap
+  enough to never compete with the robot's safety watchdog for host CPU.
+
+  REQUIRES both an ``oakd`` proxy (with ``publish_depth_samples``
+  enabled) and a ``motor_control`` proxy (with your drive channels
+  configured) before this produces anything useful. Set
+  ``oakd_proxy_id``, ``motor_control_proxy_id``, and
+  ``left_channel``/``right_channel`` to match your setup, and
+  physically measure ``wheel_speed_calibration_m_per_s`` (drive a known
+  distance at a known commanded output, divide) — the software cannot
+  infer this without additional sensing.
+
+language: python
+status: development
+author: CloudSeeder
+tags: [slam, mapping, localization, navigation, oakd]
+icon: icon.svg
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/slam/1.0.0"
+
+entry:
+  argv: [python, -m, slam_service]
+
+wizard_config:
+  - id: sources
+    title: Input sources
+    fields:
+      - id: oakd_proxy_id
+        type: string
+        title: oakd proxy id
+        description: Which oakd instance to consume depth_sample from. That proxy must have publish_depth_samples enabled.
+        default: ""
+      - id: motor_control_proxy_id
+        type: string
+        title: motor_control proxy id
+        description: Which motor_control instance provides drive-wheel odometry.
+        default: ""
+      - id: left_channel
+        type: string
+        title: Left wheel channel id
+        default: left
+      - id: right_channel
+        type: string
+        title: Right wheel channel id
+        default: right
+  - id: geometry
+    title: Robot + camera geometry
+    fields:
+      - id: camera_height_m
+        type: string
+        title: Camera mount height (m)
+        default: "0.2"
+      - id: camera_tilt_deg
+        type: string
+        title: Camera tilt (deg, positive = tilted down)
+        default: "0.0"
+      - id: footprint_radius_m
+        type: string
+        title: Robot footprint radius (m)
+        default: "0.25"
+      - id: track_width_m
+        type: string
+        title: Wheel track width (m)
+        default: "0.3"
+      - id: wheel_speed_calibration_m_per_s
+        type: string
+        title: Wheel speed calibration (m/s at output=1.0)
+        description: MUST be physically measured — drive a known distance at a known commanded output, divide. See docs/TODO_SLAM.md.
+        default: "0.5"

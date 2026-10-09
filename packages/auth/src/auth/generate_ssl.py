@@ -1,11 +1,20 @@
 import os
+import tempfile
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from datetime import datetime, timedelta, timezone
 
-def generate_self_signed_cert(cert_file="ssl/cert.pem", key_file="ssl/key.pem"):
+DEFAULT_SSL_DIR = os.path.join(tempfile.gettempdir(), "hyrule-api-ssl")
+DEFAULT_CERT_FILE = os.path.join(DEFAULT_SSL_DIR, "cert.pem")
+DEFAULT_KEY_FILE = os.path.join(DEFAULT_SSL_DIR, "key.pem")
+
+
+def generate_self_signed_cert(
+    cert_file=DEFAULT_CERT_FILE,
+    key_file=DEFAULT_KEY_FILE,
+):
     """Generate a self-signed SSL certificate and private key if they do not exist."""
     
     # Check if the certificate and key already exist
@@ -67,6 +76,3 @@ def generate_self_signed_cert(cert_file="ssl/cert.pem", key_file="ssl/key.pem"):
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
     print(f"Self-signed certificate and key generated: {cert_file}, {key_file}")
-
-# Run the function to generate certs if they don't exist
-generate_self_signed_cert()

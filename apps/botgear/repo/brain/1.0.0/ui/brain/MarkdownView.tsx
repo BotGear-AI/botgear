@@ -1,5 +1,5 @@
-// Markdown renderer for the brain file viewer (stone A → B of
-// docs/TODO_BRAIN_VIEWER.md).
+// Markdown renderer for the brain file viewer (stone A → B; see
+// README.md's "Workspace file browser (UI)" section).
 //
 // react-markdown + remark-gfm: GitHub-flavored tables, task lists,
 // strikethrough, autolinks. No dangerouslySetInnerHTML — react-markdown

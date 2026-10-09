@@ -7,25 +7,11 @@ consume loop, graceful shutdown) lives in the framework. This
 module defines only what's IK-specific: the @service_method
 actions, the state publish, and the model/FK/IK integration.
 
-Wire contract
--------------
-Topics published:
-
-  /ik_solver/{id}/state           retained — model + last solution snapshot
-  /ik_solver/{id}/control         incoming actions (see below)
-  /ik_solver/{id}/solution        non-retained — every solve() emits one event here
-  /ik_solver/{id}/heartbeat       1Hz auto (base class)
-  /ik_solver/{id}/meta            retained — service-type meta (auto)
-
-Actions accepted on /control:
-
-  {"action":"solve",         "target": {"x":..., "y":..., "z":...}}
-  {"action":"fk",            "joint_angles": {"base":..., "shoulder":..., "elbow":...}}
-  {"action":"set_model",     "joints":[...], "links":[...]}
-  {"action":"set_calibration","joint":"shoulder", "zero_offset_deg":0, "direction":1, "servo_proxy_id":"servo-1"}
-  {"action":"link_servo",    "joint":"shoulder", "proxy_id":"servo-1"}
-  {"action":"unlink_servo",  "joint":"shoulder"}
-  {"action":"send_to_servos","joint_angles":{...}?}    # optional — defaults to last solution
+Wire shape is declared in code below (``IKSolverState``,
+``SolutionPayload`` via ``state_schema``/``topic_schemas``) and
+introspected into ``/runtime/runtime/types/ik_solver``; ``control``
+actions are discoverable the same way, off their @service_method
+signatures.
 """
 from __future__ import annotations
 
@@ -33,6 +19,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, Field
 from rlx_bus import ServiceConfig, SubprocessService, service_method
 
 from . import models_lib
@@ -53,6 +40,57 @@ from .models_lib import Pose, RobotModel, SCHEMA_VERSION
 logger = logging.getLogger(__name__)
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class XYZ(BaseModel):
+    x: float
+    y: float
+    z: float
+
+
+class CalibratedAngle(BaseModel):
+    """One joint's solved angle — see ``calibration.calibrate_all``."""
+    math: float = Field(description="Kinematic-model degrees")
+    servo: float = Field(description="Calibrated servo degrees (what to send the servo)")
+
+
+class IKWarning(BaseModel):
+    kind: str = Field(description="Reason code, e.g. below_floor / servo_out_of_range")
+    detail: str
+
+
+class SolutionPayload(BaseModel):
+    """Published (non-retained) on ``/ik_solver/{id}/solution`` by every
+    ``solve()`` — also its RPC return and ``state.last_solution``.
+    Unreachable targets carry ``reason``/``detail`` instead of angles."""
+    target: XYZ
+    ts: float
+    reachable: bool
+    joint_angles: Optional[Dict[str, CalibratedAngle]] = Field(None, description="Reachable only")
+    position_error_mm: Optional[float] = Field(None, description="FK-check residual, reachable only")
+    warnings: Optional[List[IKWarning]] = Field(None, description="Soft-limit warnings, reachable only")
+    reason: Optional[str] = Field(None, description="Unreachable only — machine code")
+    detail: Optional[str] = Field(None, description="Unreachable only — human text")
+
+
+class IKSolverState(BaseModel):
+    """Retained on ``/ik_solver/{id}/state`` — model + last solution."""
+    joints: List[JointSpec]
+    links: List[LinkSpec]
+    calibration: List[JointCalibration]
+    max_reach_mm: float
+    min_reach_mm: float
+    last_target: Optional[XYZ]
+    last_solution: Optional[SolutionPayload]
+    position_tolerance_mm: float
+    model_id: Optional[str]
+    model_title: Optional[str]
+    model_source: Optional[str]
+    poses: List[Pose]
+    current_angles: Dict[str, float] = Field(description="Live configuration, math degrees")
+    ts: str = Field(description="ISO-8601 UTC")
+
+
 def _iso_now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
@@ -65,6 +103,8 @@ class IKSolverService(SubprocessService):
     heartbeat_interval_s = 1.0
     config_class = IKSolverConfig
     publishes = ["state", "solution"]
+    state_schema = IKSolverState
+    topic_schemas = {"solution": SolutionPayload}
 
     def __init__(self, proxy_id, bus) -> None:
         super().__init__(proxy_id, bus)
@@ -132,15 +172,14 @@ class IKSolverService(SubprocessService):
         result = inverse_kinematics(
             self.config, (x, y, z), current_angles=clean_current,
         )
-        envelope: Dict[str, Any] = {
-            "target": {"x": x, "y": y, "z": z},
-            "ts": time.time(),
-            **result,
-        }
-        if envelope.get("reachable"):
+        if result.get("reachable"):
             # Enrich with calibrated servo angles so consumers
             # don't have to compute them.
-            envelope["joint_angles"] = calibrate_all(self.config, envelope["joint_angles"])  # type: ignore[arg-type]
+            result = {**result, "joint_angles": calibrate_all(self.config, result["joint_angles"])}  # type: ignore[arg-type]
+        envelope = SolutionPayload(
+            target=XYZ(x=x, y=y, z=z), ts=time.time(), **result,
+        ).model_dump(exclude_none=True)
+        if envelope.get("reachable"):
             # Track the solved pose as the live configuration (math degrees).
             self._current_angles = {
                 name: float(entry["math"]) if isinstance(entry, dict) else float(entry)
@@ -573,23 +612,24 @@ class IKSolverService(SubprocessService):
     # ─── internals ──────────────────────────────────────────────────
 
     def _snapshot(self) -> Dict[str, Any]:
-        return {
-            "joints": [j.model_dump() for j in self.config.joints],
-            "links": [l.model_dump() for l in self.config.links],
-            "calibration": [c.model_dump() for c in self.config.calibration],
-            "max_reach_mm": max_reach_mm(self.config),
-            "min_reach_mm": min_reach_mm(self.config),
-            "last_target": self._last_target,
-            "last_solution": self._last_solution,
-            "position_tolerance_mm": self.config.position_tolerance_mm,
+        state = IKSolverState(
+            joints=list(self.config.joints),
+            links=list(self.config.links),
+            calibration=list(self.config.calibration),
+            max_reach_mm=max_reach_mm(self.config),
+            min_reach_mm=min_reach_mm(self.config),
+            last_target=self._last_target,
+            last_solution=self._last_solution,
+            position_tolerance_mm=self.config.position_tolerance_mm,
             # Model Library working state.
-            "model_id": self.config.model_id,
-            "model_title": self.config.model_title,
-            "model_source": self.config.model_source,
-            "poses": [p.model_dump() for p in self.config.poses],
-            "current_angles": dict(self._current_angles),
-            "ts": _iso_now(),
-        }
+            model_id=self.config.model_id,
+            model_title=self.config.model_title,
+            model_source=self.config.model_source,
+            poses=list(self.config.poses),
+            current_angles=dict(self._current_angles),
+            ts=_iso_now(),
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         await self.publish("state", self._snapshot(), retained=True)

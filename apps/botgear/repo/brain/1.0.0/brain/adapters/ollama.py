@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from brain.adapters.base import ModelAdapter
+from brain.adapters.base import ModelAdapter, resolve_tool_names
 from brain.schemas import (
     ChatMessage,
     ModelResponse,
@@ -56,12 +56,23 @@ class OllamaAdapter(ModelAdapter):
         base_url: str = "http://localhost:11434",
         model: str = "llama3.1",
         post: Optional[PostFn] = None,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
         num_ctx: int = 8192,
+        keep_alive: str = "30m",
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        # Ollama unloads an idle model after its keep_alive window (default
+        # 5m) and the NEXT request pays a full reload — measured ~18s just
+        # to load a 4.9GB model onto GPU for a trivial prompt, before any
+        # real prompt-eval/generation time. A conversational workflow has
+        # natural multi-minute gaps between turns, so the default 60s
+        # request timeout was tripping on cold-load + a real (tool-catalog
+        # + context-file) prompt even on a GPU host. 180s covers a cold
+        # load; keep_alive=30m keeps the model resident across a normal
+        # conversation's pauses so most turns never pay the reload cost.
         self.timeout = timeout
+        self.keep_alive = keep_alive
         # Ollama's DEFAULT context window is only 2048 tokens. A workflow
         # with a big prompt + many tool schemas (e.g. inmoov: a servo map
         # + ~30 servo tools) blows past that, so Ollama silently TRUNCATES
@@ -99,6 +110,7 @@ class OllamaAdapter(ModelAdapter):
             "messages": [_encode_message(m) for m in messages],
             "stream": False,
             "tools": encoded_tools,
+            "keep_alive": self.keep_alive,
         }
         # Always pin num_ctx — without it Ollama defaults to 2048 and
         # truncates large tool-heavy requests (see __init__).
@@ -361,37 +373,23 @@ def _encode_message(m: ChatMessage) -> Dict[str, Any]:
     return out
 
 
-_VALID_TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
-
-
 def _encode_tools(
     tools: List[ToolDescriptor],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, ToolDescriptor]]:
-    """Flatten the brain's ``<topic>::<action>`` names into provider-
-    safe identifiers + return the reverse map for response parsing.
-
-    Function-calling APIs (Ollama, OpenAI, Anthropic) constrain tool
-    names to ``^[a-zA-Z0-9_-]{1,64}$`` — slashes + ``::`` aren't
-    allowed. Strategy: use the bare action name when it's already
-    valid + unique among this tool list (matches what operators write
-    in workflow prompts: "call write_memory"). Fall back to indexed
-    ``tool_NNN`` for collisions or invalid names. The provider only
-    sees the encoded names; descriptions still carry the canonical
-    topic + action for the model to read.
-    """
+    """Flatten the brain's ``<topic>::<action>`` names into provider-safe
+    identifiers (see ``adapters.base.resolve_tool_names``) + return the
+    reverse map for response parsing. The provider only sees the encoded
+    names; descriptions still carry the canonical topic + action for the
+    model to read."""
+    names = resolve_tool_names(tools)
     encoded: List[Dict[str, Any]] = []
     decode: Dict[str, ToolDescriptor] = {}
-    used_names: set = set()
-    for i, t in enumerate(tools):
-        candidate = t.action if _VALID_TOOL_NAME_RE.match(t.action or "") else ""
-        if not candidate or candidate in used_names:
-            candidate = f"tool_{i:03d}"
-        used_names.add(candidate)
-        decode[candidate] = t
+    for name, t in zip(names, tools):
+        decode[name] = t
         encoded.append({
             "type": "function",
             "function": {
-                "name": candidate,
+                "name": name,
                 "description": (t.description or "").strip()[:1024]
                                 + f"\n[topic: {t.topic}, action: {t.action}]",
                 "parameters": t.parameters or {"type": "object", "properties": {}},
@@ -445,43 +443,50 @@ def _parse_response(
             usage=usage,
         )
 
-    # Take the first tool call. v1 is one tool call per step — chains
-    # via the model's subsequent turns. Multi-call-per-step is a
-    # future extension.
-    call = tool_calls[0]
-    fn = call.get("function") or {}
-    flat_name = fn.get("name") or ""
-    args = fn.get("arguments") or {}
-    if isinstance(args, str):
-        # Some Ollama builds (or future ones aligning with OpenAI) may
-        # pass arguments as a JSON-encoded string. Be defensive.
-        import json as _json
-        try:
-            args = _json.loads(args)
-        except Exception:
-            args = {}
+    # Every tool call the model made in this one response — see
+    # docs/TODO_BRAIN_GAP_FIXES.md Gap 5. A model that both acts and
+    # confirms in the same turn (e.g. power_set + speak) used to have
+    # the confirmation silently dropped; the engine now executes each
+    # of these in order.
+    rationale = (message.get("content") or "").strip()
+    actions: List[ProposedAction] = []
+    unknown_names: List[str] = []
+    for call in tool_calls:
+        fn = call.get("function") or {}
+        flat_name = fn.get("name") or ""
+        args = fn.get("arguments") or {}
+        if isinstance(args, str):
+            # Some Ollama builds (or future ones aligning with OpenAI) may
+            # pass arguments as a JSON-encoded string. Be defensive.
+            import json as _json
+            try:
+                args = _json.loads(args)
+            except Exception:
+                args = {}
+        descriptor = decode.get(flat_name)
+        if descriptor is None:
+            # Model hallucinated a name we didn't advertise — drop just
+            # this one call rather than the whole batch.
+            unknown_names.append(flat_name)
+            continue
+        actions.append(ProposedAction(
+            kind="tool",
+            topic=descriptor.topic,
+            action=descriptor.action,
+            args=args if isinstance(args, dict) else {},
+            rationale=rationale,
+        ))
 
-    descriptor = decode.get(flat_name)
-    if descriptor is None:
-        # Model hallucinated a name we didn't advertise. Treat as done
-        # so the brain doesn't try to dispatch to a non-existent tool.
+    if not actions:
+        # Every call in the batch was unknown. Treat as done so the
+        # brain doesn't try to dispatch to a non-existent tool.
         return ModelResponse(
             action=ProposedAction(
                 kind="done",
-                rationale=f"model called unknown tool {flat_name!r}",
+                rationale=f"model called unknown tool(s) {unknown_names!r}",
             ),
             raw=body,
             usage=usage,
         )
 
-    return ModelResponse(
-        action=ProposedAction(
-            kind="tool",
-            topic=descriptor.topic,
-            action=descriptor.action,
-            args=args if isinstance(args, dict) else {},
-            rationale=(message.get("content") or "").strip(),
-        ),
-        raw=body,
-        usage=usage,
-    )
+    return ModelResponse(action=actions[0], actions=actions, raw=body, usage=usage)

@@ -15,6 +15,7 @@ module here in the top-level test venv is fine — no port is ever opened.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -197,3 +198,89 @@ async def test_motor_stop_all_zeros_both_channels(saber):
 async def test_motor_set_rejects_unknown_channel(saber):
     with pytest.raises(ValueError):
         await saber.m_motor_set(motor=3, value=0.1)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# auto-connect — background retry loop
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_auto_connect_enable_starts_task_and_persists_config(saber):
+    assert saber.config.autoreconnect is False
+    await saber.m_set_auto_connect(enabled=True)
+    assert saber.config.autoreconnect is True
+    assert saber._auto_connect_task is not None
+    assert not saber._auto_connect_task.done()
+    # Cleanup: don't leak a running task past the test.
+    saber._stop_auto_connect_loop()
+
+
+@pytest.mark.asyncio
+async def test_late_config_state_rearms_auto_connect_loop(saber):
+    # on_start ran with DEFAULT config (autoreconnect off) -> no loop.
+    await saber.on_start()
+    assert saber._auto_connect_task is None
+    # The persisted config arrives late: the loop must be re-armed.
+    saber._apply_config_state({"autoreconnect": True, "last_port": "/dev/ttyUSB77"})
+    assert saber._auto_connect_task is not None
+    assert not saber._auto_connect_task.done()
+    saber._stop_auto_connect_loop()
+
+
+@pytest.mark.asyncio
+async def test_config_state_before_start_does_not_arm_loop(saber):
+    saber._apply_config_state({"autoreconnect": True, "last_port": "/dev/ttyUSB77"})
+    assert saber._auto_connect_task is None
+
+
+@pytest.mark.asyncio
+async def test_set_auto_connect_disable_stops_task(saber):
+    await saber.m_set_auto_connect(enabled=True)
+    await saber.m_set_auto_connect(enabled=False)
+    assert saber.config.autoreconnect is False
+    assert saber._auto_connect_task is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_stops_auto_connect_task(saber):
+    await saber.m_set_auto_connect(enabled=True)
+    await saber.m_disconnect()
+    assert saber.config.autoreconnect is False
+    assert saber._auto_connect_task is None
+
+
+@pytest.mark.asyncio
+async def test_handle_link_lost_clears_link_and_records_error(saber):
+    assert saber._link is not None
+    await saber._handle_link_lost("adapter unplugged")
+    assert saber._link is None
+    assert saber._last_error == "adapter unplugged"
+    assert saber._errors == 1
+    # A fresh snapshot reflects the drop.
+    snap = saber._snapshot()
+    assert snap["connected"] is False
+    assert snap["last_error"] == "adapter unplugged"
+
+
+@pytest.mark.asyncio
+async def test_keepalive_write_failure_tears_down_link(saber):
+    async def _failing_write(_data):
+        raise RuntimeError("device disconnected")
+
+    saber._link_fake.write = _failing_write  # type: ignore[method-assign]
+    saber.config = saber.config.merge_dict({"serial_timeout_ms": 100})
+    saber._restart_keepalive()
+    assert saber._keepalive_task is not None
+    await asyncio.wait_for(saber._keepalive_task, timeout=1.0)
+    assert saber._link is None
+    assert saber._last_error == "keepalive write failed"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reports_retrying_when_offline_with_autoreconnect(saber):
+    saber._link = None
+    saber.config = saber.config.merge_dict({"autoreconnect": True})
+    assert saber._snapshot()["retrying"] is True
+    saber.config = saber.config.merge_dict({"autoreconnect": False})
+    assert saber._snapshot()["retrying"] is False

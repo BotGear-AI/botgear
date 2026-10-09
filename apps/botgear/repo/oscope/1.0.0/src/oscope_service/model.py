@@ -1,7 +1,7 @@
-"""Typed config for the oscope (oscilloscope) service."""
+"""Typed config + wire schemas for the oscope (oscilloscope) service."""
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -58,3 +58,43 @@ class OscopeConfig(ServiceConfig):
     frame_hz: float = 30.0               # sample-frame publish rate to the UI
     running: bool = True                 # run vs stop (freeze)
     trigger: Trigger = Field(default_factory=Trigger)
+
+
+# ── wire schemas for what the service PUBLISHES ───────────────────────
+
+class TriggerEvent(BaseModel):
+    """Published on ``/oscope/{id}/trigger`` (when ``trigger.publish``)
+    on each qualifying crossing; also carried as ``frame.trig`` and
+    ``state.last_trigger``."""
+
+    channel_id: Optional[str]
+    t: float = Field(description="Sample time of the crossing (epoch s)")
+    value: float
+    edge: Literal["rising", "falling", "either"] = Field(description="Configured edge")
+    direction: Literal["rising", "falling"] = Field(description="Actual crossing direction")
+    seq: int
+
+
+class FramePayload(BaseModel):
+    """Published on ``/oscope/{id}/frame`` at ~``frame_hz`` — only the
+    samples that arrived since the previous frame (delta streaming)."""
+
+    t: float
+    seq: int
+    running: bool
+    ch: Dict[str, List[Tuple[float, float]]] = Field(description="channel_id -> [[t, value], ...] new samples")
+    trig: Optional[TriggerEvent] = Field(description="Trigger fired since the previous frame, if any")
+
+
+class OscopeState(BaseModel):
+    """Retained on ``/oscope/{id}/state`` — channels + timebase + trigger."""
+
+    running: bool
+    mode: str = Field(description="Trigger mode, or 'roll' when no trigger channel is set")
+    timebase_ms: float
+    frame_hz: float
+    buffer_s: float
+    channels: List[Channel]
+    trigger: Trigger
+    last_trigger: Optional[TriggerEvent]
+    t_now: float

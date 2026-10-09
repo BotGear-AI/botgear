@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "network_scanner_service"
+version = "1.0.0"
+description = "botgear network scanner service — LAN device discovery, persistent roster, and new/offline/online alerting. Runs as a subprocess since the scan loop shells out to ip/ping and runs many concurrent probes per cycle."
+requires-python = ">=3.10"
+dependencies = [
+    # Interface/subnet enumeration (same package apps/botgear's own
+    # mdns.py uses for peer discovery — the filtering logic is
+    # reimplemented here, not imported, since a subprocess service can't
+    # reach into the backend process).
+    "ifaddr>=0.2,<1.0",
+    # mDNS/zeroconf service-type browsing for free device names.
+    "zeroconf>=0.130,<1.0",
+    # rlx_bus (WebSocket bus client) is pre-installed into every venv by
+    # runtime/installer.py so it doesn't have to be listed here.
+]
+
+[project.scripts]
+network_scanner_service = "network_scanner_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

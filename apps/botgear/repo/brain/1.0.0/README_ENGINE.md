@@ -185,12 +185,52 @@ makes the engine safe for hours-long conversational workflows like
   `prompt.md` + injected memory stay anchored at the head so
   instructions never decay.
 
+Voice conversations added a second set, all deterministic engine code
+(field reference: README § Conversation reflexes):
+
+- **`speak_wait`** — `speak` on `/speech/*/control` gets `wait: true`
+  injected, so the call returns when the reply has finished playing and
+  the next `listen` can't hear it.
+- **`echo_filter`** — `_is_self_echo()` compares a `listen` result with
+  `_recent_spoken` (word-sequence containment); an echo rides E2's
+  re-dispatch path, so the model never sees it.
+- **`resume_on_done`** — on `exit_on_phrase` workflows, a `done` after the
+  first `listen` goes through `_resume_listening()`: speak the rationale if
+  it wasn't just spoken, then listen (silence/echo re-listened) and thread
+  the result in as if the model had called `listen`. Same run, same context.
+- **`loop_breaker`** — `_loop_breaker_trip()` is checked after every tool
+  call and inside the re-listen loops: too many `speak`s since the
+  operator was last heard, or too many echoes dropped, ends the run.
+- **Refusal hold-back** — `_premature_refusal()`: a `speak` matching
+  `_REFUSAL_RE` while `_hidden_capabilities()` is non-empty is answered with
+  an error to the model instead of being spoken (once per heard utterance).
+- **Silencing** — `_silence_speech()` in `run()`'s `finally:` sends `stop`
+  to every speech topic the run used, unless it ended in plain success.
+- **Live phase** — `_set_phase()` records `starting` / `thinking` /
+  `listening` / `speaking` / `calling` and calls `on_change`; BrainService
+  republishes `/brain/<id>/state` (coalesced) so the UI shows it.
+
 Step records carry the provider's raw reply in `response_raw` (for
 post-hoc debugging without re-running), `verdict` (allow/deny +
 reason + guard name), and `usage` (input/output token counts when
 the provider reports them — `max_tokens_per_run` enforcement reads
 this).
 
+
+## Session minds (`_session_loop`)
+
+An adapter with `is_session = True` (today only `claude_agent`) replaces
+everything in the previous section: `run()` calls `_session_loop`, which
+opens one session with the system prompt + `_SESSION_NOTE` + the context
+body, then alternates `_session_listen` (engine-side listen with the
+silence/echo re-listen and loop breaker) and `_session_turn` (one turn,
+accounted as `api_turns` steps plus tokens and `cost_usd`). The session's
+tool calls re-enter through `_session_tool`, which applies the same gate,
+approval, `speak_wait`, notes and logs as the step loop, under a lock.
+The closing text of a conversational turn is spoken by the engine; the
+session isn't offered `listen` or the reply channel's `speak`. One-shot
+workflows get one turn. See brain's
+README, "`claude_agent`: a rented session as the mind".
 
 ## Termination paths
 
@@ -203,7 +243,10 @@ this).
 | `failure` | `max_steps` / `max_tokens` / `timeout_seconds` exceeded | `status=failure`, `guard=…` recorded on the final step |
 | `failure` | safety gate denied a tool call and the run can't make progress | `status=failure`, `guard=topic_pattern` |
 | `failure` | adapter raised an exception | `status=failure`, `engine error: <ExcType>: <msg>` |
-| `cancelled` | `m_cancel(run_id)` → `_cancel_event.set()` + `task.cancel()` | `status=cancelled`, reason in `failure_reason` |
+| `failure` (loop breaker) | `_loop_breaker_trip()` returned a reason | `status=failure`, `failure_reason="loop breaker: …"` |
+| *(not terminal)* `done` on `exit_on_phrase` | after the first `listen` with `resume_on_done` — the run speaks + listens again instead of ending | — |
+| `cancelled` | `m_cancel(run_id)` → `_cancel_event.set()` + `task.cancel()`; also every run on a runtime HALT (`BrainService.on_halt`) | `status=cancelled`, reason in `failure_reason` (`halted by …` for a HALT) |
+| `interrupted` | backend stopped mid-run; set by `BrainService._close_interrupted_runs()` at the next start | `status=interrupted`, `failure_reason="backend stopped while the run was active"` |
 | `awaiting_approval` | mid-run park (intermediate, not terminal) | transitions to `running` on approve, `cancelled` on deny |
 
 
@@ -235,6 +278,10 @@ Pair `requests.jsonl` (what we sent) with `steps.jsonl::response_raw`
 | `/brain/<id>/runs/<run_id>/tool_calls` | no | `ToolCallRecord` stream |
 | `/brain/<id>/runs/<run_id>/result` | yes | `{status, body}` terminal |
 | `/brain/<id>/workflow_events` | no | `started` + `ended` engine bookends |
+| `/brain/<id>/state` | yes | `BrainState`; `active_runs[]` carry the live `phase`, `last_heard`, `silent_listens`, counts (republished on every phase change) |
+
+The `steps` / `tool_calls` streams are live-only; `get_run_log(run_id)`
+reads the run dir so a late subscriber (the panel's Follow) can backfill.
 
 
 ## Concurrency
@@ -271,3 +318,6 @@ next loop iteration. `CancelledError` propagates through the awaits
 | `topic_pattern` allow/deny | per tool call via `check_tool_call` against `allowed_tools.yaml` | `denied by blocked rule …` / `no allow rule matched …` |
 | `terminate_on` mismatch | when model emits `done` before required actions ran | `model emitted done but terminate_on actions were not satisfied: missing [...]` |
 | `requires_human_approval` | between each tool call when the workflow declares it | parks the run; not a guard failure on its own |
+| `loop_breaker` | after each tool call + inside re-listen loops | `loop breaker: spoke N times without hearing the operator …` / `… heard its own voice N times …` |
+| runtime HALT | `BrainService.on_halt` (framework hook on `/runtime/halt`); `start_workflow` refuses while halted | `halted by <source>: <reason>` |
+| refusal hold-back | before a `speak` tool call (lazy workflows) | not a failure: the model gets `NOT SPOKEN …` as the tool result |

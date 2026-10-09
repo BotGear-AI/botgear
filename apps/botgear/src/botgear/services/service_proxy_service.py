@@ -41,7 +41,7 @@ def create_service_proxy(item: ServiceProxy, user: dict, request: Request):
 
 # read - get all items
 def get_all_service_proxy(user: dict, request: Request):
-    logger.info("===============get_all_service_proxy called==============")
+    logger.debug("===============get_all_service_proxy called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("service_proxy")
@@ -49,18 +49,20 @@ def get_all_service_proxy(user: dict, request: Request):
 
 # read - get an item
 def get_service_proxy(id: str, user: dict, request: Request):
-    logger.info("===============get_service_proxy called==============")
-    logger.info(f"Received request to retrieve service_proxy with id: {id}")
+    logger.debug("===============get_service_proxy called==============")
+    logger.debug(f"Received request to retrieve service_proxy with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_proxy", id)
     return item
 
 # read - get_path an item
 def get_path_service_proxy(path: str, user: dict, request: Request):
-    logger.info("===============get_service_proxy called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_service_proxy called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_proxy", path)
     return item
@@ -90,6 +92,7 @@ def delete_service_proxy(id: str, user: dict, request: Request):
     logger.info("===============delete_service_proxy called==============")
     logger.info(f"Received request to delete service_proxy with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("service_proxy", id)
         if not item:

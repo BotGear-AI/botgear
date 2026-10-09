@@ -1,0 +1,53 @@
+name: network_scanner
+title: Network Scanner
+description: |
+  LAN device discovery, roster + presence alerting — know what's on your
+  own network, get notified when something new joins or a known device
+  drops off/comes back, and attach your own labels to what a scan can
+  only see as a bare IP/MAC (e.g. "this is the dishwasher").
+
+  Defensive home-network-hygiene tool, not a security/pentest tool:
+  enumerates this runtime's own attached subnets, primes the OS ARP
+  cache (bounded-concurrency TCP-connect attempts + a ping fallback,
+  no root/raw sockets needed), reads `ip neigh show` for reachability,
+  and passively enriches with a bundled offline MAC-vendor (OUI) table,
+  reverse DNS, and mDNS/zeroconf service browsing. Never touches WAN or
+  any range beyond the subnets this box is actually on. "Topology" here
+  means per-interface subnet + device roster + reachability — not real
+  L2 switch-port topology, which isn't achievable without managed-
+  switch/SNMP access this app doesn't have.
+
+  Subprocess service — the scan loop shells out to `ip neigh`/`ping`
+  and runs hundreds of concurrent probes per cycle, isolated from the
+  backend event loop like every other network/hardware service here.
+
+  One instance is meaningful per runtime (it scans "the network this
+  box is on" as a whole, not a specific piece of hardware) — the
+  Catalog UI should discourage creating a second instance of this type,
+  though nothing prevents it technically.
+
+  Implements the `device_directory` capability (see AGENTS.md's
+  "Promoted interfaces today" table) so other services can resolve a
+  friendly name/label to an IP — the same role mDNS already plays for
+  finding peer botgear runtimes.
+language: python
+status: development
+author: CloudSeeder
+tags: [network, discovery, security, inventory, presence, lan]
+
+implements: [device_directory]
+icon: icon.svg
+
+ui:
+  entry: ui/dist/ui.js
+  sdk: "^1.0"
+
+bundled: true
+publish: true
+
+install:
+  kind: pip
+  package_spec: "-e ${APP_ROOT}/repo/network_scanner/1.0.0"
+
+entry:
+  argv: [python, -m, network_scanner_service]

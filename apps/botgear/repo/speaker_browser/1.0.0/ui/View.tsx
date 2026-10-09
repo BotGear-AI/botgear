@@ -6,7 +6,7 @@
 //                play / pause / stop / seek (FF/rewind)
 // Everything routes through a gain (volume + mute) + analyser (meter).
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
-import { useWsClient, type InboundFrame, type ServiceProxy } from '@rlx/ui'
+import { useWsClient, MicrophoneSourcePicker, type InboundFrame, type ServiceProxy } from '@rlx/ui'
 
 interface Dev { id: string; label: string; default?: boolean }
 interface Track { kind: string; ref: string; name?: string }
@@ -310,9 +310,15 @@ export default function SpeakerBrowserView({ proxy }: { proxy: ServiceProxy }) {
               <input ref={fileInputRef} type="file" accept="audio/*" onChange={onPickFile} className="hidden" />
               <button type="button" onClick={() => fileInputRef.current?.click()} className="min-w-0 flex-1 truncate rounded border border-slate-700 px-2 py-1 text-left text-[11px] text-slate-300 hover:border-slate-500">{ref || 'choose file…'}</button>
             </>
+          ) : kind === 'topic' ? (
+            <MicrophoneSourcePicker
+              value={ref}
+              onChange={(topic) => { setRef(topic); inputDirty.current = true }}
+              className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-200"
+            />
           ) : kind !== '' ? (
             <input type="text" value={ref} onChange={(e) => { setRef(e.target.value); inputDirty.current = true }}
-              placeholder={kind === 'topic' ? '/microphone/mic-1/audio' : 'https://…/audio.mp3'}
+              placeholder="https://…/audio.mp3"
               className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-[11px]" />
           ) : <span className="flex-1 self-center text-[10px] text-slate-500">plays /speaker/{proxyId}/audio</span>}
           {kind !== 'file' && <button type="button" onClick={() => { sendAction('select_input', { kind: kind || null, ref: ref || null }); inputDirty.current = false }} className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:border-slate-500">Set</button>}

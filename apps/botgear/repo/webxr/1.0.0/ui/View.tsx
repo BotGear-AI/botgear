@@ -7,7 +7,7 @@
 // The immersive client is a SEPARATE bundle (xr.js) opened on the Quest
 // at /r/<runtime>/xr/<proxy>. This panel never enters XR itself.
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Crosshair, Eye, Gamepad2, Globe, Link2, Plus, Trash2, Video } from 'lucide-react'
+import { Crosshair, Eye, Gamepad2, Globe, Plus, Trash2, Video } from 'lucide-react'
 import { useWsClient, useServiceRequest } from '@rlx/ui'
 import type { ServiceProxy, InboundFrame } from '@rlx/ui'
 

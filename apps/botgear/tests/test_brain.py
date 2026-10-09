@@ -33,7 +33,7 @@ from brain.context_loader import list_workflow_dirs, load_workflow  # noqa: E402
 from brain.memory import read_memory  # noqa: E402
 from brain.safety_gate import _topic_matches, check_max_steps, check_tool_call  # noqa: E402
 from brain.schemas import (  # noqa: E402
-    AllowedTools, ProposedAction, RunConfiguration, ToolDescriptor,
+    AllowedTools, ModelResponse, ProposedAction, RunConfiguration, ToolDescriptor,
     ToolPattern, ToolResult, ToolTerminationCondition, Workflow,
 )
 from brain.workflow_engine import WorkflowEngine  # noqa: E402
@@ -168,11 +168,302 @@ def test_safety_gate_unknown_target_when_catalog_provided():
     assert verdict.guard == "unknown_target"
 
 
+# ─── default_policy: allow (inverted default) ────────────────────────
+
+
+def _inverted_wf(blocked: list = None) -> Workflow:
+    """A minimal Workflow with default_policy='allow' and no allowed
+    list — everything not blocked should be reachable."""
+    return Workflow(
+        name="inverted",
+        allowed_tools=AllowedTools(
+            allowed=[],
+            blocked=blocked or [],
+            default_policy="allow",
+        ),
+    )
+
+
+def test_safety_gate_default_allow_permits_unmatched():
+    """Nothing in allowed, nothing in blocked — under default_policy
+    'allow' this is reachable (the whole point of the inversion)."""
+    wf = _inverted_wf()
+    verdict = check_tool_call(
+        wf,
+        ProposedAction(kind="tool", topic="/speech/speech-1/control", action="list_voices"),
+    )
+    assert verdict.allowed, verdict.reason
+
+
+def test_safety_gate_default_allow_still_blocks_explicit():
+    """default_policy='allow' does not weaken an explicit block —
+    blocked always wins, regardless of the default."""
+    wf = _inverted_wf(blocked=[ToolPattern(topic="/sabertooth/*/control", actions=["*"])])
+    verdict = check_tool_call(
+        wf,
+        ProposedAction(kind="tool", topic="/sabertooth/sabertooth-1/control", action="motor_set"),
+    )
+    assert not verdict.allowed
+    assert verdict.guard == "block_list"
+
+
+def test_safety_gate_default_deny_is_unchanged():
+    """Explicitly setting default_policy='deny' (the default) behaves
+    exactly like today — regression anchor distinct from the bundled
+    observe_room tests above, using the same minimal construction as
+    the 'allow' tests so the only variable is the policy value."""
+    wf = Workflow(
+        name="not-inverted",
+        allowed_tools=AllowedTools(allowed=[], blocked=[], default_policy="deny"),
+    )
+    verdict = check_tool_call(
+        wf,
+        ProposedAction(kind="tool", topic="/speech/speech-1/control", action="list_voices"),
+    )
+    assert not verdict.allowed
+    assert verdict.guard == "allow_list"
+
+
+def test_load_allowed_tools_default_allow_inherits_shared_excludes(workspace):
+    """A workflow on disk with default_policy: allow automatically
+    gets the shared hard-exclude list merged into its own `blocked` —
+    not opt-in, not something the workflow author has to reference."""
+    wf_dir = workspace / "workflows" / "wide_open"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "workflow.yaml").write_text("name: wide_open\n")
+    (wf_dir / "prompt.md").write_text("p")
+    (wf_dir / "allowed_tools.yaml").write_text(
+        "default_policy: allow\nallowed: []\nblocked: []\n"
+    )
+    wf = load_workflow("wide_open", workspace)
+    assert wf.allowed_tools.default_policy == "allow"
+    blocked_topics = {p.topic for p in wf.allowed_tools.blocked}
+    # From the shared excludes file, not written anywhere in this
+    # workflow's own allowed_tools.yaml above.
+    assert "/sabertooth/*/control" in blocked_topics
+    assert "/motor_control/*/control" in blocked_topics
+
+    # And the gate actually enforces the inherited exclude.
+    verdict = check_tool_call(
+        wf,
+        ProposedAction(kind="tool", topic="/sabertooth/sabertooth-1/control", action="motor_set"),
+    )
+    assert not verdict.allowed
+    assert verdict.guard == "block_list"
+
+    # While something NOT in the shared excludes is reachable by the
+    # inverted default, with no allowed-list entry needed.
+    verdict2 = check_tool_call(
+        wf,
+        ProposedAction(kind="tool", topic="/speech/speech-1/control", action="list_voices"),
+    )
+    assert verdict2.allowed, verdict2.reason
+
+
+def test_load_allowed_tools_default_deny_unaffected_by_shared_excludes(workspace):
+    """A normal (non-inverted) workflow's blocked list is untouched —
+    the shared excludes only apply under default_policy: allow."""
+    wf_dir = workspace / "workflows" / "normal"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "workflow.yaml").write_text("name: normal\n")
+    (wf_dir / "prompt.md").write_text("p")
+    (wf_dir / "allowed_tools.yaml").write_text("allowed: []\nblocked: []\n")
+    wf = load_workflow("normal", workspace)
+    assert wf.allowed_tools.default_policy == "deny"
+    assert wf.allowed_tools.blocked == []
+
+
 def test_safety_gate_max_steps():
     wf = _bundled_observe_room()
     assert check_max_steps(wf, 0).allowed
     assert check_max_steps(wf, wf.max_steps - 1).allowed
     assert not check_max_steps(wf, wf.max_steps).allowed
+
+
+# ─── lazy_tools (progressive tool disclosure) ─────────────────────────
+
+
+def test_capability_prefix():
+    from brain.safety_gate import capability_prefix
+    assert capability_prefix("/speech/speech-1/control") == "speech"
+    assert capability_prefix("/tasmota/switch-1/control") == "tasmota"
+    assert capability_prefix("/brain/brain-1/control") == "brain"
+    # Degenerate input doesn't crash — falls back to the input itself.
+    assert capability_prefix("") == ""
+
+
+def _lazy_catalog():
+    """A small catalog spanning 3 capability prefixes: stt (always-
+    loaded candidate), brain (implicitly always-loaded), and widget (a
+    stand-in for any lazy-by-default capability like tasmota)."""
+    descriptors = [
+        ToolDescriptor(topic="/stt/ear/control", action="listen", description="", parameters={}),
+        ToolDescriptor(
+            topic="/brain/brain-1/control", action="describe_capability", description="",
+            parameters={"type": "object", "properties": {"capability": {"type": "string"}}},
+        ),
+        ToolDescriptor(topic="/widget/widget-1/control", action="press", description="press it", parameters={}),
+    ]
+    return {d.name: d for d in descriptors}
+
+
+def _lazy_engine(workspace, *, lazy_tools: bool, always_loaded_prefixes=None, adapter=None):
+    wf = Workflow(
+        name="lazy_test",
+        lazy_tools=lazy_tools,
+        # These tests use a tiny catalog on purpose — force lazy mode on
+        # regardless of size (the default only goes lazy above 120 tools).
+        lazy_tools_threshold=0,
+        always_loaded_prefixes=always_loaded_prefixes or [],
+        allowed_tools=AllowedTools(allowed=[], blocked=[], default_policy="allow"),
+        max_steps=5,
+        timeout_seconds=30,
+    )
+    return WorkflowEngine(
+        workflow=wf, workspace_dir=workspace,
+        adapter=adapter or MockAdapter(script=[script_done("ok")]),
+        tool_caller=lambda *a, **kw: None,  # unused by the methods under test
+        publish=lambda *a, **kw: None,
+        bus_prefix="/brain/brain-1",
+        tool_catalog=_lazy_catalog(),
+    )
+
+
+def test_lazy_tool_descriptors_noop_when_disabled(workspace):
+    """lazy_tools=False returns the full allowed list — identical to
+    _allowed_tool_descriptors, no filtering at all."""
+    engine = _lazy_engine(workspace, lazy_tools=False)
+    assert len(engine._lazy_tool_descriptors()) == len(engine._allowed_tool_descriptors()) == 3
+
+
+def test_lazy_tool_descriptors_narrows_by_default(workspace):
+    """lazy_tools=True with nothing discovered yet: only always-loaded
+    prefixes (here 'stt', plus the implicit 'brain') are visible —
+    'widget' is hidden until discovered."""
+    engine = _lazy_engine(workspace, lazy_tools=True, always_loaded_prefixes=["stt"])
+    visible = {d.topic for d in engine._lazy_tool_descriptors()}
+    assert visible == {"/stt/ear/control", "/brain/brain-1/control"}
+
+
+def test_lazy_tool_descriptors_expands_after_discovery(workspace):
+    """Marking 'widget' discovered (what the engine does after a
+    successful describe_capability call) makes its tools visible."""
+    engine = _lazy_engine(workspace, lazy_tools=True, always_loaded_prefixes=["stt"])
+    engine._discovered_prefixes.add("widget")
+    visible = {d.topic for d in engine._lazy_tool_descriptors()}
+    assert visible == {"/stt/ear/control", "/brain/brain-1/control", "/widget/widget-1/control"}
+
+
+def test_capability_index_text_lists_hidden_only(workspace):
+    engine = _lazy_engine(workspace, lazy_tools=True, always_loaded_prefixes=["stt"])
+    text = engine._capability_index_text()
+    assert "widget" in text
+    assert "widget-1" in text
+    assert "stt" not in text  # already fully visible — not "hidden"
+    assert "brain" not in text  # implicitly always-loaded
+
+
+def test_capability_index_text_empty_when_disabled(workspace):
+    engine = _lazy_engine(workspace, lazy_tools=False)
+    assert engine._capability_index_text() == ""
+
+
+def test_capability_index_text_empty_once_everything_discovered(workspace):
+    engine = _lazy_engine(workspace, lazy_tools=True, always_loaded_prefixes=["stt"])
+    engine._discovered_prefixes.add("widget")
+    assert engine._capability_index_text() == ""
+
+
+@pytest.mark.asyncio
+async def test_lazy_tools_discovery_unlocks_capability_next_turn(workspace):
+    """End-to-end: 'widget' is NOT offered to the model on turn 1; the
+    model calls describe_capability("widget"); turn 2's request to the
+    adapter actually includes /widget/widget-1/control::press — proving
+    the engine re-expands `tools` mid-run, not just once at start."""
+    adapter = MockAdapter(script=[
+        script_call("/brain/brain-1/control", "describe_capability", {"capability": "widget"}),
+        script_call("/widget/widget-1/control", "press", {}),
+        script_done("pressed it"),
+    ])
+
+    calls_log: list = []
+
+    async def fake_tool_caller(topic, action, args):
+        calls_log.append((topic, action, args))
+        if action == "describe_capability":
+            # Mirrors brain.service.BrainService.m_describe_capability's
+            # real shape for a match.
+            return ToolResult(
+                status="ok",
+                value={
+                    "capability": args.get("capability"),
+                    "topics": ["/widget/widget-1/control"],
+                    "actions": [{"topic": "/widget/widget-1/control", "action": "press"}],
+                },
+                duration_ms=0,
+            )
+        return ToolResult(status="ok", value={"pressed": True}, duration_ms=0)
+
+    engine = _lazy_engine(workspace, lazy_tools=True, always_loaded_prefixes=["stt"], adapter=adapter)
+    engine.tool_caller = fake_tool_caller
+    record = await engine.run()
+
+    assert record.status == "success"
+    assert len(adapter.calls) == 3
+
+    turn1_topics = {t["topic"] for t in adapter.calls[0]["tools"]}
+    turn2_topics = {t["topic"] for t in adapter.calls[1]["tools"]}
+    assert "/widget/widget-1/control" not in turn1_topics, (
+        "widget must NOT be offered before discovery"
+    )
+    assert "/widget/widget-1/control" in turn2_topics, (
+        "widget must be offered on the turn AFTER a successful describe_capability"
+    )
+    assert "widget" in engine._discovered_prefixes
+
+
+@pytest.mark.asyncio
+async def test_lazy_tools_failed_discovery_does_not_unlock(workspace):
+    """describe_capability for a capability with no live matches
+    (empty `actions`) must NOT mark it discovered — the model should
+    be able to retry with a corrected name instead of silently
+    'succeeding' at nothing."""
+    adapter = MockAdapter(script=[
+        script_call("/brain/brain-1/control", "describe_capability", {"capability": "nonexistent"}),
+        script_done("gave up"),
+    ])
+
+    async def fake_tool_caller(topic, action, args):
+        return ToolResult(
+            status="ok",
+            value={"capability": args.get("capability"), "topics": [], "actions": [],
+                   "error": "no live tools under that capability"},
+            duration_ms=0,
+        )
+
+    engine = _lazy_engine(workspace, lazy_tools=True, always_loaded_prefixes=["stt"], adapter=adapter)
+    engine.tool_caller = fake_tool_caller
+    await engine.run()
+    assert "nonexistent" not in engine._discovered_prefixes
+
+
+@pytest.mark.asyncio
+async def test_describe_capability_groups_by_topic_prefix():
+    """Exercise the real BrainService.m_describe_capability method
+    (not a logic duplicate) against a fake self carrying just
+    _tool_catalog, avoiding the heavy BrainService fixture chain."""
+    from types import SimpleNamespace
+    from brain.service import BrainService
+    fake_self = SimpleNamespace(_tool_catalog=_lazy_catalog())
+
+    result = await BrainService.m_describe_capability(fake_self, capability="widget")
+    assert result["topics"] == ["/widget/widget-1/control"]
+    assert len(result["actions"]) == 1
+    assert result["actions"][0]["action"] == "press"
+
+    miss = await BrainService.m_describe_capability(fake_self, capability="nope")
+    assert miss["actions"] == []
+    assert "error" in miss
 
 
 # ─── workflow loader tests ──────────────────────────────────────────
@@ -281,6 +572,50 @@ async def test_observe_room(workspace, tool_catalog):
     topics = {topic for topic, _, _ in published}
     assert any(t.endswith("/result") for t in topics), "result topic should have been published"
     assert any("/runs/" in t and t.endswith("/steps") for t in topics), "step events should have been published"
+
+
+@pytest.mark.asyncio
+async def test_multiple_actions_in_one_step_all_execute(workspace, tool_catalog):
+    """A single model turn proposing several tool calls (e.g. act, then
+    confirm via speak) must execute ALL of them in order, not just the
+    first — the real bug behind docs/TODO_BRAIN_GAP_FIXES.md Gap 5,
+    hit live: a model called power_set + speak together and the speak
+    confirmation was silently dropped. Both actions from the same
+    model turn also count as ONE step (LLM round-trip), not two."""
+    wf = _bundled_observe_room()
+
+    batched = ModelResponse(
+        action=script_call("/video/video-1/control", "capture_frame", {"camera": 0}, tool_call_id="tc-1"),
+        actions=[
+            script_call("/video/video-1/control", "capture_frame", {"camera": 0}, tool_call_id="tc-1"),
+            script_call("/speech/speech-1/control", "speak", {"text": "Capturing now."}, tool_call_id="tc-2"),
+        ],
+    )
+    adapter = MockAdapter(script=[batched, script_done("done")])
+
+    calls = []
+
+    async def fake_tool_caller(topic, action, args):
+        calls.append((topic, action))
+        return ToolResult(status="ok", value={"ok": True}, duration_ms=1)
+
+    engine = WorkflowEngine(
+        workflow=wf,
+        workspace_dir=workspace,
+        adapter=adapter,
+        tool_caller=fake_tool_caller,
+        publish=lambda *a, **kw: None,
+        bus_prefix="/brain/brain-1",
+        tool_catalog=tool_catalog,
+    )
+    record = await engine.run()
+
+    assert record.status == "success", record.failure_reason
+    assert calls == [
+        ("/video/video-1/control", "capture_frame"),
+        ("/speech/speech-1/control", "speak"),
+    ], "both tool calls from the batched response must execute, in order"
+    assert record.steps_used == 2, f"expected 2 steps (1 batched turn + done), got {record.steps_used}"
 
 
 @pytest.mark.asyncio
@@ -1128,10 +1463,12 @@ def test_conversation_session_config_is_keyword_only():
     wf = _bundled_conversation_session()
     assert wf.terminate_on == [], "terminate_on must be empty — it would end the session after the first speak"
     assert wf.exit_on_phrase is not None
-    assert wf.exit_on_phrase.matches == ["goodbye"]
+    assert wf.exit_on_phrase.matches == ["goodbye", "good by"]   # STT splits "goodbye"
     assert wf.exit_on_phrase.case_insensitive is True
     assert wf.exit_on_phrase.whole_message is False
-    assert wf.exit_on_phrase.listen_topic == "/chat/+/inbox"
+    assert wf.exit_on_phrase.listen_topics == [
+        "/stt/+/text", "/chat/+/inbox", "/discord/+/inbox", "/slack/+/inbox", "/google_chat/+/inbox",
+    ]
     assert wf.loop_on_timeout is not None
     assert wf.loop_on_timeout.tool == "listen"
     assert wf.loop_on_timeout.field == "timeout"
@@ -1331,3 +1668,177 @@ async def test_clear_runs_empty_dir_is_noop(workspace):
     fake = SimpleNamespace(_workspace=workspace, _runs={})
     res = await BrainService.m_clear_runs(fake)
     assert res == {"removed": 0, "skipped_active": 0, "errors": 0}
+
+
+# ─── keepalive (restart_on_end) ──────────────────────────────────────
+
+
+def _keepalive_fake(**overrides):
+    """Minimal duck-typed BrainService stand-in for exercising
+    _keepalive_restart without the full Service/bus fixture chain —
+    same pattern as the clear_runs tests above."""
+    from types import SimpleNamespace
+    calls: list = []
+
+    async def fake_start_workflow(*, name, inputs, backend, model, configuration, restart_on_end):
+        calls.append({
+            "name": name, "inputs": inputs, "backend": backend, "model": model,
+            "configuration": configuration, "restart_on_end": restart_on_end,
+        })
+        return {"run_id": "new-run-id", "status": "running"}
+
+    from brain.service import BrainService
+    fake = SimpleNamespace(
+        _keepalive_restarts={},
+        _KEEPALIVE_MAX_RESTARTS=BrainService._KEEPALIVE_MAX_RESTARTS,
+        _KEEPALIVE_WINDOW_S=BrainService._KEEPALIVE_WINDOW_S,
+        _KEEPALIVE_DELAY_S=0,  # don't actually sleep in tests
+        m_start_workflow=fake_start_workflow,
+        calls=calls,
+    )
+    for k, v in overrides.items():
+        setattr(fake, k, v)
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_keepalive_restart_relaunches_with_same_args():
+    from brain.service import BrainService
+    fake = _keepalive_fake()
+    restart_args = {
+        "name": "conversation_session", "inputs": {"listen_window_seconds": 8},
+        "backend": "ollama", "model": "qwen2.5:7b-instruct", "configuration": None,
+    }
+    await BrainService._keepalive_restart(fake, restart_args)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0] == {**restart_args, "restart_on_end": True}
+    assert len(fake._keepalive_restarts["conversation_session"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_keepalive_restart_gives_up_after_rate_cap():
+    """A workflow that fails instantly every time must NOT restart-loop
+    forever — once _KEEPALIVE_MAX_RESTARTS is hit within the window,
+    stop relaunching it."""
+    import time as time_mod
+    from brain.service import BrainService
+    now = time_mod.monotonic()
+    fake = _keepalive_fake(
+        _keepalive_restarts={"flaky": [now] * BrainService._KEEPALIVE_MAX_RESTARTS},
+    )
+    await BrainService._keepalive_restart(fake, {
+        "name": "flaky", "inputs": None, "backend": None, "model": None, "configuration": None,
+    })
+    assert fake.calls == [], "must not restart once the rate cap is already hit"
+
+
+@pytest.mark.asyncio
+async def test_keepalive_restart_prunes_old_timestamps_outside_window():
+    """Restarts from outside the rate-limit window don't count against
+    the cap — a workflow that failed a lot yesterday can still restart
+    today."""
+    import time as time_mod
+    from brain.service import BrainService
+    now = time_mod.monotonic()
+    stale = now - BrainService._KEEPALIVE_WINDOW_S - 10
+    fake = _keepalive_fake(
+        _keepalive_restarts={"conversation_session": [stale] * BrainService._KEEPALIVE_MAX_RESTARTS},
+    )
+    await BrainService._keepalive_restart(fake, {
+        "name": "conversation_session", "inputs": None, "backend": None,
+        "model": None, "configuration": None,
+    })
+    assert len(fake.calls) == 1
+    # Old entries pruned, only the fresh restart remains.
+    assert len(fake._keepalive_restarts["conversation_session"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_pops_keepalive_before_cancelling():
+    """A deliberate operator cancel must remove the run from the
+    keepalive set BEFORE engine.cancel() fires — otherwise
+    _run_to_completion's finally would auto-restart a run the operator
+    explicitly stopped."""
+    from types import SimpleNamespace
+    from brain.service import BrainService
+
+    class _FakeEngine:
+        def __init__(self):
+            self.cancelled_with = None
+        def cancel(self, reason: str) -> None:
+            self.cancelled_with = reason
+
+    engine = _FakeEngine()
+    fake = SimpleNamespace(
+        _runs={"run-1": engine},
+        _run_tasks={},
+        _keepalive={"run-1": {"name": "conversation_session"}},
+    )
+    result = await BrainService.m_cancel(fake, run_id="run-1", reason="operator stop")
+    assert result == {"cancelled": True}
+    assert "run-1" not in fake._keepalive
+    assert engine.cancelled_with == "operator stop"
+
+
+# ─── stale tool eviction (release / rename_service) ───────────────────────
+
+
+def _catalog_for(*topics):
+    out = {}
+    for t in topics:
+        d = ToolDescriptor(topic=t, action="scan_now", description="", parameters={})
+        out[f"{t}::scan_now"] = d
+    return out
+
+
+def test_evict_proxy_tools_drops_only_that_proxy():
+    from types import SimpleNamespace
+    from brain.service import BrainService
+
+    fake = SimpleNamespace(_tool_catalog=_catalog_for(
+        "/network_scanner/network_scanner-1/control",
+        "/network_scanner/other-1/control",
+        "/video/network_scanner-1/control",  # same id, different type: keep
+    ))
+    n = BrainService._evict_proxy_tools(fake, "network_scanner-1", "network_scanner")
+    assert n == 1
+    assert sorted(fake._tool_catalog) == [
+        "/network_scanner/other-1/control::scan_now",
+        "/video/network_scanner-1/control::scan_now",
+    ]
+
+
+def test_evict_proxy_tools_without_type_matches_any_type():
+    from types import SimpleNamespace
+    from brain.service import BrainService
+
+    fake = SimpleNamespace(_tool_catalog=_catalog_for("/a/x-1/control", "/b/x-1/control", "/a/y-1/control"))
+    assert BrainService._evict_proxy_tools(fake, "x-1") == 2
+    assert list(fake._tool_catalog) == ["/a/y-1/control::scan_now"]
+
+
+@pytest.mark.asyncio
+async def test_watch_lifecycle_evicts_on_uninstalled_only():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+    from brain.service import BrainService
+
+    fake = SimpleNamespace(
+        proxy_id="brain-1",
+        _tool_catalog=_catalog_for("/stub/gone-1/control", "/stub/kept-1/control"),
+        _publish_state=AsyncMock(),
+    )
+    fake._evict_proxy_tools = lambda pid, t=None: BrainService._evict_proxy_tools(fake, pid, t)
+
+    class _Bus:
+        async def subscribe(self, topic, subscriber_id):
+            for payload in (
+                {"id": "kept-1", "status": "running", "service_meta_id": "stub@1.0.0"},
+                {"id": "gone-1", "status": "uninstalled", "service_meta_id": "stub@1.0.0"},
+            ):
+                yield SimpleNamespace(payload=payload)
+
+    with patch("brain.service.get_bus", lambda: _Bus()):
+        await BrainService._watch_lifecycle(fake)
+    assert list(fake._tool_catalog) == ["/stub/kept-1/control::scan_now"]

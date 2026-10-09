@@ -2,6 +2,7 @@
 from models.config_base import ConfigBase
 from models.auth_user import AuthUser
 from models.log_event import LogEvent
+from models.audit_event import AuditEvent
 from models.auth_registration import AuthRegistration
 from models.auth_token_pair import AuthTokenPair
 from models.auth_session import AuthSession

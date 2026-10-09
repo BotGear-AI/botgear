@@ -17,12 +17,14 @@ Usage:
 """
 import base64
 import logging
-from fastapi import Depends, HTTPException, Security, Header
+from fastapi import Depends, HTTPException, Security, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, Callable, Dict, Any, List
 import time
 import random
+from database.factory import get_database_client
 from .factory import get_auth_provider
+from .user_status import is_inactive_user
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,16 @@ class AuthDependencies:
         self.config_provider = config_provider
         self.auth = get_auth_provider(config_provider)
         self.security = HTTPBearer(auto_error=False)
-    
+        self.user_database_provider: Optional[Callable[[], Any]] = None
+
+    def set_user_database_provider(self, provider: Callable[[], Any]) -> None:
+        """Set the live user database used to revalidate bearer identities."""
+        self.user_database_provider = provider
+
+    def set_auth_provider(self, provider) -> None:
+        """Bind this dependency instance to its app's current auth provider."""
+        self.auth = provider
+
     def set_shared_secret_validator(self, validator: Callable[[str], Optional[dict]]):
         """
         Set a callback function to validate shared secrets (API keys).
@@ -108,9 +119,32 @@ class AuthDependencies:
         credentials: Optional[HTTPAuthorizationCredentials] = Security(HTTPBearer(auto_error=False)),
         x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
         authorization: Optional[str] = Header(None, alias="Authorization"),
+        # NB: annotate as bare `Request` (not Optional[Request]) — FastAPI only
+        # injects the live Request for the exact `Request` annotation; wrapping it
+        # in Optional makes FastAPI treat it as a Pydantic field and fail at
+        # collection. The `= None` default still allows direct/unit-test calls.
+        request: Request = None,
     ) -> dict:
         """Get current authenticated user from token OR validate service via shared secret."""
-        
+
+        # Stash the resolved principal on request.state so request-auditing
+        # middleware (which runs before the auth dependency) can read the caller
+        # identity after the handler returns. `request` is injected by FastAPI when
+        # used as a dependency (None for direct/unit-test calls).
+        def _resolved(user: dict) -> dict:
+            if request is not None:
+                request.state.audit_principal = user
+            # Tag the rest of this request's log lines and audit events with who
+            # it is (applog's request context; optional — apps without applog skip).
+            try:
+                from applog import set_log_context
+            except ImportError:
+                pass
+            else:
+                set_log_context(user_id=user.get("id") or user.get("email") or user.get("username"),
+                                user_email=user.get("email"), tenant_id=user.get("tenant_id"))
+            return user
+
         # Check auth type in config
         config = self.config_provider()
         auth_type = config.get("auth_type", "local").lower()
@@ -118,8 +152,8 @@ class AuthDependencies:
         # Authentication is bypassed only when auth_type is explicitly set to "none".
         if auth_type == "none":
             logger.debug("Authentication disabled - allowing access")
-            return {"id": "no-auth", "username": "no-auth", "roles": [], "auth_type": "none"}
-        
+            return _resolved({"id": "no-auth", "username": "no-auth", "roles": [], "auth_type": "none"})
+
         # Try shared secret authentication first (for service-to-service calls)
         if isinstance(x_api_key, str) and x_api_key:
             logger.debug("Attempting shared secret authentication")
@@ -133,7 +167,7 @@ class AuthDependencies:
                     if user:
                         logger.info(f"API key validated via callback for user: {user.get('username')}")
                         user["auth_type"] = "shared_secret"
-                        return user
+                        return _resolved(user)
                 except Exception as e:
                     logger.error(f"Error in shared secret validator callback: {e}")
                     raise HTTPException(status_code=500, detail="Internal authentication error")
@@ -142,14 +176,14 @@ class AuthDependencies:
             expected_secret = config.get("api_shared_secret")
             if expected_secret and x_api_key == expected_secret:
                 logger.info("Service authenticated via global shared secret")
-                # FIXME - make configurable service user info 
-                return {
+                # FIXME - make configurable service user info
+                return _resolved({
                     "id": "service",
-                    "email": "service@service.internal", 
+                    "email": "service@service.internal",
                     "username": "service",
                     "roles": [],  # Global fallback grants no roles (least privilege)
                     "auth_type": "shared_secret"
-                }
+                })
             
             # Invalid API key
             logger.warning("Invalid shared secret provided")
@@ -170,7 +204,7 @@ class AuthDependencies:
                     if user:
                         logger.info(f"Basic auth validated for user: {user.get('username')}")
                         user["auth_type"] = "basic_auth"
-                        return user
+                        return _resolved(user)
                 except Exception as e:
                     logger.error(f"Error in Basic auth validator: {e}")
                     raise HTTPException(status_code=500, detail="Internal authentication error")
@@ -182,7 +216,7 @@ class AuthDependencies:
             try:
                 user = self.get_current_user(credentials)
                 user["auth_type"] = "token"
-                return user
+                return _resolved(user)
             except HTTPException as e:
                 logger.warning(f"Token authentication failed: {e.detail}")
                 raise e
@@ -204,11 +238,32 @@ class AuthDependencies:
             
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid or expired token")
-            
+
+            # Providers may cache their database adapter. Re-read through the
+            # current registry so deleted or disabled accounts lose existing
+            # bearer tokens immediately, including OAuth-issued sessions.
+            db = self.user_database_provider() if self.user_database_provider else get_database_client()
+            if self.user_database_provider and not db:
+                raise HTTPException(status_code=401, detail="User status could not be verified")
+            if db:
+                identity = str(
+                    user.get("id") or user.get("email") or user.get("username") or ""
+                ).strip().lower()
+                current_user = db.get_item("user", identity) if identity else None
+                if not current_user:
+                    raise HTTPException(status_code=401, detail="Invalid or expired token")
+                user = {**user, **current_user}
+
+            if is_inactive_user(user):
+                raise HTTPException(status_code=401, detail="Account is not active")
+
             # Check if the token is an MFA token and validate accordingly
             if user.get("mfa_required") and not user.get("mfa_verified"):
                 raise HTTPException(status_code=401, detail="MFA verification required")
-            
+
+            user = dict(user)
+            for key in ("password_hash", "password", "token", "totp_secret", "reset_token", "reset_token_expiry"):
+                user.pop(key, None)
             return user
         except Exception as e:
             logger.error(f"Error while authenticating user: {e}")
@@ -252,6 +307,53 @@ class AuthDependencies:
     def require_role_or_service(self, required_roles: List[str]):
         """Alias for require_role for backward compatibility."""
         return self.require_role(required_roles)
+
+    def require_permission(self, required_permissions: List[str], base_dependency: Optional[Callable] = None):
+        """Dependency factory for fine-grained, per-user permission checks —
+        the __method_permissions__ DSL counterpart to require_role's
+        __method_roles__. Checked against user.permissions (a free-form list
+        of capability strings, e.g. "auction.schedule.view"), NOT user.roles.
+
+        Composable with require_role: pass an existing require_role(...)
+        dependency as `base_dependency` so a route can require both a role
+        AND a permission (the permission check runs after the role check
+        succeeds). Defaults to plain authentication (get_current_user_or_service)
+        when no role gate applies to the same route.
+
+        Same Admin-bypass semantics as require_role (an Admin always passes,
+        regardless of what's in user.permissions) and same any-of semantics
+        across multiple required_permissions, for consistency with how
+        required_roles is already checked.
+        """
+        dep = base_dependency or self.get_current_user_or_service
+
+        def permission_checker(user: dict = Depends(dep)):
+            if user.get("auth_type") == "none":
+                return user
+            if not required_permissions:
+                return user
+            if "Admin" in (user.get("roles") or []):
+                return user
+            user_permissions = user.get("permissions") or []
+            if not any(p in user_permissions for p in required_permissions):
+                logger.error(f"Access denied for user {user.get('id')}: missing permissions {user_permissions} for required {required_permissions}")
+                raise HTTPException(status_code=403, detail="Access denied: Insufficient permissions")
+            return user
+        return permission_checker
+
+
+def has_permission(user: dict, key: str) -> bool:
+    """Plain, importable helper for row/field-level permission checks inside
+    unmanaged service code — e.g. filtering a subset of rows out of a mixed
+    list result, where a whole-route require_permission(...) gate would be
+    too coarse (it would hide the entire response, not just the gated rows).
+
+    Same Admin-bypass semantics as require_role/require_permission: an Admin
+    always has every permission.
+    """
+    if "Admin" in (user.get("roles") or []):
+        return True
+    return key in (user.get("permissions") or [])
 
 
 def create_auth_dependencies(config_provider: Callable[[], Dict[str, Any]]) -> AuthDependencies:

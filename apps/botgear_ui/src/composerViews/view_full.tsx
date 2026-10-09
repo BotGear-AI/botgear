@@ -11,18 +11,28 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { NodeResizeControl, ResizeControlVariant } from '@xyflow/react'
-import { FolderInput, Hexagon, Loader2, Maximize2, Minimize2, Minus, Play, Save, Square, X } from 'lucide-react'
+import { ExternalLink, FolderInput, Hexagon, Loader2, Maximize2, Minimize2, Minus, Pencil, Play, Save, X } from 'lucide-react'
 
 import { ServiceIcon, STATUS_DOT, metaNameFromId, metaVersionFromId } from './_shared'
 import { NodeViewMenu } from './_NodeViewMenu'
 import { getOriginView } from './index'
 import { getFullView } from '../serviceViews'
 import { DynamicServiceView } from '../serviceViews/DynamicServiceView'
-import { useApiFetch } from '../contexts/ActiveRuntimeContext'
+import { MessageSchemasPanel } from '../components/MessageSchemasPanel'
+import { useApiFetch, useActiveRuntimeOptional } from '../contexts/ActiveRuntimeContext'
+import { useInDock } from '../contexts/DockContext'
 import type { ComposerViewDefinition, ComposerViewProps } from './types'
 
 
-function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleton }: ComposerViewProps) {
+function ProxyNodeFullView({
+  proxy,
+  selected,
+  onViewChange,
+  onAction,
+  isSingleton,
+  isMaximized: isMaximizedProp,
+  onSetMaximized,
+}: ComposerViewProps) {
   const status = proxy.status ?? 'stopped'
   // Compact status dot — same colour grammar as view_min. The verbose
   // pill we used before crowded the title bar once we added action
@@ -49,6 +59,9 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
   const onStart = (e: ReactMouseEvent) => { e.stopPropagation(); onAction?.(proxyId, 'start_service') }
   const onStop = (e: ReactMouseEvent) => { e.stopPropagation(); onAction?.(proxyId, 'stop_service') }
   const onRelease = (e: ReactMouseEvent) => { e.stopPropagation(); onAction?.(proxyId, 'release_service') }
+  const onRename = (e: ReactMouseEvent) => { e.stopPropagation(); onAction?.(proxyId, 'rename_service') }
+  // A rename needs the service stopped (and never the singleton runtime).
+  const canRename = !isSingleton && ['placeholder', 'installed', 'stopped', 'error'].includes(status)
 
   // Save this service's config to its yml in the active config set.
   // Backed by ``POST /v1/system/save-config/{proxy_id}`` (per-proxy
@@ -140,25 +153,11 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
   // ReactFlow keeps the node in its nodes array and we can snap
   // back to the same position on restore.
   //
-  // Persisted via localStorage keyed by proxy_id so the maximize
-  // state survives page refresh.
-  const MAX_KEY = `rlx-node-maximized-${proxyId}`
-  const [isMaximized, setIsMaximized] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem(MAX_KEY) === '1'
-    } catch {
-      return false
-    }
-  })
-  useEffect(() => {
-    try {
-      if (isMaximized) localStorage.setItem(MAX_KEY, '1')
-      else localStorage.removeItem(MAX_KEY)
-    } catch {
-      // Quota / private-mode / disabled storage — non-fatal, just
-      // means the state won't survive refresh for this user.
-    }
-  }, [MAX_KEY, isMaximized])
+  // The full-screen SLOT is owned by the page (Composer.tsx), not this
+  // component — see ComposerViewProps.isMaximized. That's what lets the
+  // page reassign the slot to a different proxy (registry selection)
+  // instead of this node being the only thing that can ever release it.
+  const isMaximized = isMaximizedProp ?? false
   const anchorRef = useRef<HTMLDivElement | null>(null)
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null)
   useEffect(() => {
@@ -187,14 +186,42 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
   useEffect(() => {
     if (!isMaximized) return
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setIsMaximized(false)
+      if (e.key === 'Escape') onSetMaximized?.(proxyId, false)
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [isMaximized])
+  }, [isMaximized, onSetMaximized, proxyId])
   const onToggleMaximize = (e: ReactMouseEvent) => {
     e.stopPropagation()
-    setIsMaximized((prev) => !prev)
+    onSetMaximized?.(proxyId, !isMaximized)
+  }
+
+  // Open in window — pops this Full view out into its own chrome-less
+  // browser popup (DockView at /r/:runtimeId/dock/:proxyId?view=view_full),
+  // still showing this same title bar + kebab there, just without the
+  // app's outer nav. Hidden when already inside a dock window — popping
+  // a dock out of a dock is a no-op worth avoiding — and when there's no
+  // resolvable runtime (e.g. rendered outside a /r/:runtimeId/* route).
+  //
+  // The canvas node itself falls back to its pre-Full origin shape once
+  // the pop-out window has it (same back-target onTitleDoubleClick
+  // uses) — the point of popping out is to view this service in its own
+  // window while the canvas node goes back to being one compact node
+  // among the others, not a second live copy of the same Full panel.
+  const activeRuntime = useActiveRuntimeOptional()
+  const inDock = useInDock()
+  const runtimeId = activeRuntime?.runtimeId
+  const canPopOut = !inDock && !!runtimeId && !!proxyId
+  const onPopOut = (e: ReactMouseEvent) => {
+    e.stopPropagation()
+    if (!runtimeId || !proxyId) return
+    const url = `/r/${encodeURIComponent(runtimeId)}/dock/${encodeURIComponent(proxyId)}?view=view_full`
+    window.open(
+      url,
+      `rlx-dock-${proxyId}`,
+      'popup=yes,width=480,height=680,menubar=no,toolbar=no,location=no,status=no',
+    )
+    onViewChange?.(proxyId, getOriginView(proxyId))
   }
 
   const titleBar = (
@@ -249,11 +276,22 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
               type="button"
               onClick={onRelease}
               onPointerDown={(e) => e.stopPropagation()}
-              title="Release (delete) — removes the service proxy + node"
+              title="Release — removes from the canvas; config is kept, so re-adding the same name resumes it"
               className="nodrag nopan rounded p-1 text-slate-400 hover:bg-rose-900/40 hover:text-rose-300"
             >
               <X className="h-3.5 w-3.5" />
             </button>
+            {canRename && (
+              <button
+                type="button"
+                onClick={onRename}
+                onPointerDown={(e) => e.stopPropagation()}
+                title="Rename — moves config, layout and references to the new name (preview first)"
+                className="nodrag nopan rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-sky-300"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button
               type="button"
               onClick={onStart}
@@ -266,12 +304,14 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
           </>
         )}
       </div>
-      {/* View controls — top-right window-style trio: minimize to pill,
-          panel (current), maximize to canvas. The "panel" icon shows
-          as active when the node is in view_full and NOT canvas-
-          maximized; the canvas-max icon shows as active when
-          isMaximized. Clicking the same icon as the current state is
-          a no-op. */}
+      {/* View controls — top-right window-style group: minimize to
+          pill, maximize to canvas / restore, open in a separate browser
+          window (popped via DockView, same shape + kebab, just without
+          the app's outer nav — formerly a kebab item available from
+          every shape; now lives only here since it's the one place an
+          icon slot was available). (A "panel view" icon used to sit
+          between minimize and maximize too, but while maximized it was
+          functionally identical to Restore — removed as redundant.) */}
       <div className="flex shrink-0 items-center gap-0.5">
         {/* Load — re-reads this proxy's yml from the active config set
             and applies it to the live service (inverse of Save). For
@@ -333,21 +373,6 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
         </button>
         <button
           type="button"
-          onClick={(e) => {
-            e.stopPropagation()
-            if (isMaximized) setIsMaximized(false)
-            onViewChange?.(proxyId, 'view_full')
-          }}
-          onPointerDown={(e) => e.stopPropagation()}
-          title="Panel view"
-          className={`nodrag nopan rounded p-1 hover:bg-slate-800 ${
-            !isMaximized ? 'bg-slate-800 text-sky-300' : 'text-slate-400 hover:text-slate-200'
-          }`}
-        >
-          <Square className="h-3.5 w-3.5" />
-        </button>
-        <button
-          type="button"
           onClick={onToggleMaximize}
           onPointerDown={(e) => e.stopPropagation()}
           title={isMaximized ? 'Restore (Esc)' : 'Maximize to canvas'}
@@ -357,6 +382,17 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
         >
           {isMaximized ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
         </button>
+        {canPopOut && (
+          <button
+            type="button"
+            onClick={onPopOut}
+            onPointerDown={(e) => e.stopPropagation()}
+            title="Open in window"
+            className="nodrag nopan rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+          </button>
+        )}
         {/* Kebab — every view shape carries one so the operator can
             cross to ANY other shape without having to bounce through
             Min first. The window-style trio above is shortcuts for
@@ -393,6 +429,15 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
     </div>
   )
 
+  // Every service's message definitions (published / subscribed topics,
+  // control actions, config), from its type descriptor. A footer rather
+  // than part of ``body`` so full-height views (CLI's xterm) keep their
+  // space while it's collapsed.
+  const typeName = metaNameFromId(proxy.service_meta_id)
+  const messages = typeName && proxyId
+    ? <MessageSchemasPanel typeName={typeName} proxyId={proxyId} />
+    : null
+
   if (isMaximized && portalTarget) {
     return (
       <>
@@ -408,6 +453,7 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
           <div className="pointer-events-auto absolute inset-0 z-50 flex flex-col rounded border-2 border-sky-400 bg-slate-900 shadow-2xl">
             {titleBar}
             {body}
+            {messages}
           </div>,
           portalTarget,
         )}
@@ -500,6 +546,7 @@ function ProxyNodeFullView({ proxy, selected, onViewChange, onAction, isSingleto
       )}
       {titleBar}
       {body}
+      {messages}
     </div>
   )
 }

@@ -19,9 +19,11 @@ each servo's latest snapshot (current_angle, min/max). That cache feeds
 pose capture and the synchronized-arrival math. The roster (which servos
 are members) + poses + sequences persist in config across restarts.
 
-Bus topics:
-  /servo_mixer/{id}/state    retained — members + poses + sequences + player
-  /servo_mixer/{id}/control  incoming actions
+Wire shape is declared in code below (``ServoMixerState``,
+``SpeakPayload``, ``SpeakDonePayload`` via ``state_schema``/
+``topic_schemas``/``subscribes_schemas``) — introspected into
+``/runtime/runtime/types/servo_mixer``. ``control`` actions are
+discoverable the same way, off their @service_method signatures.
 
 This file deliberately avoids ``from __future__ import annotations`` — like
 servo.py, it's loaded in-process via importlib, and Pydantic v2 resolves
@@ -41,7 +43,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -132,10 +134,70 @@ class ServoMixerConfig(ServiceConfig):
     speak_timeout_ms: int = Field(8000, ge=0, description="Max wait for a /servo_mixer/{id}/speak_done ack on a blocking speak step before advancing anyway.")
 
 
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class MemberState(BaseModel):
+    """One member as it appears in ``/state`` — roster entry joined with
+    the member servo's cached ``/servo/{id}/state``."""
+    servo_id: str
+    label: str
+    enabled: bool
+    online: bool = Field(description="True once a /servo/{id}/state has been seen")
+    current_angle: Optional[int]
+    angle: Optional[int]
+    min_angle: int
+    max_angle: int
+
+
+class PlayerState(BaseModel):
+    playing: bool
+    paused: bool
+    current_sequence: Optional[str]
+    current_step: int = Field(description="-1 when no sequence step is active")
+    current_timeline: Optional[str]
+    playhead_ms: int
+
+
+class ServoMixerState(BaseModel):
+    """Retained on ``/servo_mixer/{id}/state`` — members + poses +
+    sequences + timelines + player."""
+    members: List[MemberState]
+    poses: List[PoseModel]
+    sequences: List[SequenceModel]
+    timelines: List[TimelineModel]
+    default_transition_ms: int
+    speak_target: Optional[str]
+    speak_timeout_ms: int
+    player: PlayerState
+    last_error: Optional[str]
+
+
+class SpeakPayload(BaseModel):
+    """Published on ``/servo_mixer/{id}/speak`` whenever a step (or the
+    ``speak`` action) emits speech — observable even with no
+    ``speak_target`` configured."""
+    text: str
+    blocking: bool = Field(description="True when the sequence waits for /speak_done before advancing")
+    sequence: Optional[str]
+    step: int
+    ts: float
+
+
+# ── wire schema for what this service SUBSCRIBES to (inbound) ─────────
+
+class SpeakDonePayload(BaseModel):
+    """Consumed from ``/servo_mixer/{id}/speak_done`` — ANY message
+    releases a blocking speak step; the body is never read."""
+    model_config = ConfigDict(extra="allow")
+
+
 class ServoMixerService(Service):
     """In-process servo choreographer. See module docstring for the model."""
 
     config_class = ServoMixerConfig
+    state_schema = ServoMixerState
+    topic_schemas = {"speak": SpeakPayload}
+    subscribes_schemas = {"speak_done": SpeakDonePayload}
     publishes = ["state", "speak"]
 
     _control_task: Optional[asyncio.Task] = None
@@ -720,10 +782,11 @@ class ServoMixerService(Service):
             return False
         if step.blocking:
             self._speak_done.clear()
-        self.publish("speak", {
-            "text": text, "blocking": bool(step.blocking),
-            "sequence": self._cur_seq, "step": self._cur_step, "ts": time.time(),
-        })
+        event = SpeakPayload(
+            text=text, blocking=bool(step.blocking),
+            sequence=self._cur_seq, step=self._cur_step, ts=time.time(),
+        )
+        self.publish("speak", event.model_dump())
         if self.config.speak_target:
             self.publish(self.config.speak_target, {"action": "speak", "text": text})
         return True
@@ -786,34 +849,35 @@ class ServoMixerService(Service):
         members = []
         for m in self.config.members:
             st = self._servo_states.get(m.servo_id, {})
-            members.append({
-                "servo_id": m.servo_id,
-                "label": m.label or m.servo_id,
-                "enabled": m.enabled,
-                "online": m.servo_id in self._servo_states,
-                "current_angle": st.get("current_angle"),
-                "angle": st.get("angle"),
-                "min_angle": st.get("min_angle", 0),
-                "max_angle": st.get("max_angle", 180),
-            })
-        return {
-            "members": members,
-            "poses": [p.model_dump() for p in self.config.poses],
-            "sequences": [s.model_dump() for s in self.config.sequences],
-            "timelines": [t.model_dump() for t in self.config.timelines],
-            "default_transition_ms": self.config.default_transition_ms,
-            "speak_target": self.config.speak_target,
-            "speak_timeout_ms": self.config.speak_timeout_ms,
-            "player": {
-                "playing": self._playing,
-                "paused": self._paused,
-                "current_sequence": self._cur_seq,
-                "current_step": self._cur_step,
-                "current_timeline": self._cur_timeline,
-                "playhead_ms": self._playhead_ms,
-            },
-            "last_error": self._last_error,
-        }
+            members.append(MemberState(
+                servo_id=m.servo_id,
+                label=m.label or m.servo_id,
+                enabled=m.enabled,
+                online=m.servo_id in self._servo_states,
+                current_angle=st.get("current_angle"),
+                angle=st.get("angle"),
+                min_angle=st.get("min_angle", 0),
+                max_angle=st.get("max_angle", 180),
+            ))
+        state = ServoMixerState(
+            members=members,
+            poses=list(self.config.poses),
+            sequences=list(self.config.sequences),
+            timelines=list(self.config.timelines),
+            default_transition_ms=self.config.default_transition_ms,
+            speak_target=self.config.speak_target,
+            speak_timeout_ms=self.config.speak_timeout_ms,
+            player=PlayerState(
+                playing=self._playing,
+                paused=self._paused,
+                current_sequence=self._cur_seq,
+                current_step=self._cur_step,
+                current_timeline=self._cur_timeline,
+                playhead_ms=self._playhead_ms,
+            ),
+            last_error=self._last_error,
+        )
+        return state.model_dump()
 
     async def _publish_state(self) -> None:
         self.publish("state", self._snapshot(), retained=True)

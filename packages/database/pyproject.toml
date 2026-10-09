@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=83.0.0", "wheel"]
+requires = ["setuptools>=84.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -29,4 +29,10 @@ where = ["src"]
 database = ["*.json"]
 
 [project.optional-dependencies]
-dev = ["pytest", "black", "mypy"]
+dev = ["pytest", "black", "mypy", "moto"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: needs a live PostgreSQL (DATABASE_ID_TEST_DSN); fails when selected without one",
+]
+addopts = ["-m", "not integration"]

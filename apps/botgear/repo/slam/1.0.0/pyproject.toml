@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slam_service"
+version = "1.0.0"
+description = "botgear slam service — cheap 2D occupancy mapping for worke (see docs/TODO_SLAM.md). Phase 1: core algorithm layer (config, geometry, pluggable mapping backend) — no bus/SubprocessService wiring yet, that's Phase 2. Deliberately dependency-light: numpy only, no OpenCV/depthai."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    # SlamConfig subclasses rlx_bus.ServiceConfig now, ahead of Phase 2's
+    # actual SubprocessService wiring, so the config shape doesn't need
+    # to change when that lands. Pre-installed into every service venv
+    # by runtime/installer.py once this becomes a real botgear service
+    # (package.yml + entry.argv, not added yet — see docs/TODO_SLAM.md
+    # Phase 2) — listed here for completeness/documentation.
+    "rlx_bus",
+]
+
+[project.scripts]
+slam_service = "slam_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discord_service"
+version = "1.0.0"
+description = "botgear Discord bot — the `messaging` capability over Discord's Gateway. rlx_bus + rlx_messaging are pre-installed into the venv by runtime/installer.py."
+requires-python = ">=3.10"
+dependencies = [
+    "discord.py>=2.4,<3.0",
+]
+
+[project.scripts]
+discord_service = "discord_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

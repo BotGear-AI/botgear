@@ -183,3 +183,37 @@ async def test_bind_unbind(kb):
 def test_normalize_event_from_browser_payload():
     ev = normalize_event({"type": "up", "key": "A", "code": "KeyA", "modifiers": {"shift": True}})
     assert ev["type"] == "up" and ev["modifiers"]["shift"] is True
+
+
+# ─── runtime-wide HALT hotkey ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_halt_hotkey_broadcasts_halt_and_skips_keymap(kb):
+    kb.config.halt_combo = "ctrl+alt+KeyH"
+    kb.config.bindings = [{"id": "h", "combo": "ctrl+alt+KeyH", "topic": "/t", "on_down": {"v": 1}}]
+    await kb.handle_event({"type": "down", "code": "KeyH", "modifiers": {"ctrl": True, "alt": True}, "ts": 1.0})
+    halts = kb.bus.to_topic("/runtime/halt")
+    assert len(halts) == 1
+    assert halts[0]["payload"]["level"] == "stop"
+    assert halts[0]["payload"]["source"] == "keyboard:kb-test"
+    assert kb.bus.to_topic("/t") == []           # the hotkey wins over a clashing binding
+
+
+@pytest.mark.asyncio
+async def test_halt_hotkey_needs_exact_combo_and_can_be_disabled(kb):
+    kb.config.halt_combo = "ctrl+alt+KeyH"
+    await kb.handle_event({"type": "down", "code": "KeyH", "modifiers": {"ctrl": True}, "ts": 1.0})
+    await kb.handle_event({"type": "up", "code": "KeyH", "modifiers": {"ctrl": True, "alt": True}, "ts": 1.1})
+    assert kb.bus.to_topic("/runtime/halt") == []
+    kb.config.halt_combo = ""
+    await kb.handle_event({"type": "down", "code": "KeyH", "modifiers": {"ctrl": True, "alt": True}, "ts": 1.2})
+    assert kb.bus.to_topic("/runtime/halt") == []
+
+
+@pytest.mark.asyncio
+async def test_on_halt_releases_held_bindings(kb):
+    kb.config.bindings = [{"id": "fwd", "combo": "KeyW", "topic": "/motor", "on_down": {"v": 1}, "on_up": {"v": 0}}]
+    await kb.handle_event({"type": "down", "code": "KeyW", "ts": 1.0})
+    await kb.on_halt({"level": "stop", "source": "test"})
+    assert kb.bus.to_topic("/motor")[-1]["payload"] == {"v": 0}    # all-stop fired

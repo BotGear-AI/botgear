@@ -17,7 +17,7 @@ author: CloudSeeder
 tags: [cli, terminal, introspection, builtin]
 icon: icon.svg
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md). Bundles
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section). Bundles
 # its own third-party deps (xterm); their CSS is inlined into ui.js.
 ui:
   entry: ui/dist/ui.js

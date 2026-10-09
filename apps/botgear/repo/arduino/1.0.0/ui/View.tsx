@@ -50,7 +50,6 @@ interface ArduinoState {
   last_baud?: number | null
 }
 
-const PIN_MODES = ['input', 'output', 'pwm', 'analog', 'servo']
 // Digital pins take these; an analog pin ('A<n>') is always analog input.
 const DIGITAL_MODES = ['input', 'output', 'pwm', 'servo']
 const isAnalogPin = (label: string) => label.trim().toUpperCase().startsWith('A')
@@ -902,10 +901,11 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 function ActionButton({
-  children, onClick, disabled, tone = 'normal', type = 'button',
+  children, onClick, disabled, tone = 'normal', type = 'button', title,
 }: {
   children: React.ReactNode
   onClick?: () => void
+  title?: string
   disabled?: boolean
   tone?: 'normal' | 'primary'
   type?: 'button' | 'submit'
@@ -919,6 +919,7 @@ function ActionButton({
       onClick={(e) => { e.stopPropagation(); onClick?.() }}
       onPointerDown={(e) => e.stopPropagation()}
       disabled={disabled}
+      title={title}
       className={`nodrag nopan rounded px-2 py-1 text-xs font-medium ${base} disabled:cursor-not-allowed disabled:opacity-40`}
     >
       {children}

@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import socket
 import threading
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import ifaddr
 
@@ -47,20 +47,71 @@ _browser = None           # zeroconf.ServiceBrowser
 _registered_name: Optional[str] = None
 _local_runtime_id: Optional[str] = None
 _auto_connect: bool = True
+# Whether THIS runtime serves its API over TLS (settings.ssl_enabled).
+# Peers dial the scheme WE speak — every runtime in a federation is
+# assumed to share the same SSL posture (same deployment convention),
+# so this is our own flag, not something learned per-peer.
+_use_ssl: bool = False
+# The kwargs the last successful ``start()`` call was made with (minus
+# the test-only factory injections). Lets ``rescan()`` rebuild with the
+# same identity without the caller having to remember runtime_id/port.
+_last_start_kwargs: Optional[Dict[str, Any]] = None
+
+
+
+# Interface name prefixes for virtual/container bridges that show up
+# on any dev box running Docker, Podman, libvirt, etc. These carry
+# private addresses that are only reachable from the SAME host — never
+# from a genuine LAN peer — so they're excluded for the same reason
+# loopback is (see docstring below). Confirmed in the field: a runtime
+# on a Docker host announced ``docker0``'s 172.17.0.1 alongside its
+# real LAN IP, and a remote peer's mDNS resolver happened to cache the
+# Docker address for ``<runtime-id>.local`` — the peer then dialed
+# 172.17.0.1 from a completely different machine, where nothing is
+# listening, and sat in a silent TCP-connect timeout loop forever.
+# Matched case-insensitively against the START of the interface name,
+# so this also catches Linux's numbered variants (docker1, veth3f2a1,
+# br-89ab..., virbr0) without needing exact names.
+_VIRTUAL_IFACE_PREFIXES = (
+    "docker", "br-", "veth", "virbr", "vmnet", "vboxnet",
+    "podman", "cni", "flannel", "tun", "tap",
+)
 
 
 def _all_lan_addresses() -> list[bytes]:
-    """Pack every IPv4 address on every non-loopback interface into
-    the byte form zeroconf wants. Returning ALL of them means a peer
-    on any reachable subnet sees us.
+    """Pack every IPv4 address on every non-loopback, non-virtual
+    interface into the byte form zeroconf wants. Returning ALL of them
+    means a peer on any reachable subnet sees us.
 
-    Loopback is included so two runtimes on the SAME box auto-discover
-    each other — that's the common dev case.
+    Loopback is excluded from the main scan and used only as the
+    last-resort fallback (a genuinely offline/isolated box with no
+    other interface) — NOT mixed in alongside real addresses. Zeroconf
+    has no way to tell a remote peer "ignore this one, it's only for
+    same-box discovery"; if 127.0.0.1 ends up in the list a remote
+    querier can end up resolving our hostname straight back to
+    ITSELF instead of to us, which is silent and easy to misdiagnose
+    (the connecting side sees a resolvable hostname and a live socket,
+    just talking to the wrong process). ``ifaddr.get_adapters()``
+    enumerates the loopback adapter too, so this must be filtered
+    explicitly — the previous version's docstring claimed "every
+    non-loopback interface" but never actually excluded it.
+
+    Docker/Podman/libvirt bridge interfaces get the same treatment for
+    the same reason, just with a different symptom: instead of us
+    resolving to ourselves, a REMOTE peer resolves our SRV hostname to
+    an address that only means something on our box, and hangs in a
+    TCP-connect timeout against a private subnet it can't route to —
+    see ``_VIRTUAL_IFACE_PREFIXES`` above.
     """
     addrs: list[bytes] = []
     for adapter in ifaddr.get_adapters():
+        name = (adapter.name or "").lower()
+        if name.startswith(_VIRTUAL_IFACE_PREFIXES):
+            continue
         for ip in adapter.ips:
             if not ip.is_IPv4:
+                continue
+            if ip.ip.startswith("127."):
                 continue
             try:
                 addrs.append(socket.inet_aton(ip.ip))
@@ -129,7 +180,14 @@ def _on_service_change(
         if not info.addresses:
             return
         host = socket.inet_ntoa(info.addresses[0])
-    url = f"ws://{host}:{info.port}/v1/ws"
+    # Dial the scheme WE speak (settings.ssl_enabled) — every federation
+    # peer is assumed to share the same SSL posture. A plaintext ws://
+    # dial against a TLS-only port (or vice versa) doesn't fail cleanly:
+    # the handshake bytes just don't parse as either protocol, surfacing
+    # as an opaque ``InvalidMessage`` retry loop with no clue it was a
+    # scheme mismatch.
+    scheme = "wss" if _use_ssl else "ws"
+    url = f"{scheme}://{host}:{info.port}/v1/ws"
 
     if not _auto_connect:
         logger.info("mdns: discovered peer %s at %s (auto_connect=False)", peer_id, url)
@@ -177,20 +235,32 @@ def start(
     *,
     version: str = "0.0.0",
     auto_connect: bool = True,
+    use_ssl: bool = False,
     zc_factory: Optional[Callable[[], object]] = None,
     browser_factory: Optional[Callable[[object, str, Callable], object]] = None,
 ) -> None:
     """Announce + browse. Idempotent — calling twice is a no-op.
 
+    ``use_ssl`` should mirror ``settings.ssl_enabled`` — it decides
+    whether discovered peers are dialed over ``wss://`` or ``ws://``
+    (see the scheme comment in ``_on_service_change``).
+
     ``zc_factory`` and ``browser_factory`` are injection points for
     tests so we can drive the discovery callback without real
     multicast. Production uses the real zeroconf classes.
     """
-    global _zc, _browser, _registered_name, _local_runtime_id, _auto_connect
+    global _zc, _browser, _registered_name, _local_runtime_id, _auto_connect, _use_ssl, _last_start_kwargs
+    # Recorded unconditionally (even on the idempotent no-op path below)
+    # so ``rescan()`` always has the latest identity to restart with.
+    _last_start_kwargs = dict(
+        runtime_id=runtime_id, port=port, version=version,
+        auto_connect=auto_connect, use_ssl=use_ssl,
+    )
     if _zc is not None:
         return
     _local_runtime_id = runtime_id
     _auto_connect = auto_connect
+    _use_ssl = use_ssl
 
     if zc_factory is None:
         from zeroconf import Zeroconf
@@ -275,12 +345,44 @@ def is_started() -> bool:
     return _zc is not None
 
 
+def rescan() -> bool:
+    """Tear down + rebuild the zeroconf engine in place, without
+    restarting the runtime.
+
+    Why this exists: ``start()`` runs once at boot, and
+    ``_all_lan_addresses()`` — plus zeroconf's own interface
+    enumeration inside ``Zeroconf()`` — snapshot whatever interfaces
+    exist *at that instant*. On a laptop, the backend routinely wins
+    the race against DHCP: it's up and calling ``start()`` before Wi-Fi
+    has an IP, so it announces itself on the ``127.0.0.1`` fallback and
+    the zeroconf instance never joins the multicast group on the real
+    interface — it stays deaf to LAN peers even after Wi-Fi comes up
+    seconds later, because nothing re-evaluates interfaces after
+    construction. A brand-new ``Zeroconf()`` re-enumerates from
+    scratch, so tearing down + restarting just this module (not the
+    whole process) is a full fix and is cheap enough to expose as a
+    user-facing "Rescan network" action instead of "restart botgear".
+
+    No-op (returns False) if ``start()`` was never called — nothing to
+    rebuild. Returns True once the rebuild has been kicked off; peers
+    reappear asynchronously as the browser re-discovers them (near
+    instant for anything actively broadcasting on the LAN).
+    """
+    if _last_start_kwargs is None:
+        return False
+    kwargs = _last_start_kwargs
+    stop()
+    start(**kwargs)
+    return True
+
+
 def reset_for_tests() -> None:
     """Force-clear module state without touching network resources.
     Tests that injected fake factories use this to reset between cases."""
-    global _zc, _browser, _registered_name, _local_runtime_id, _auto_connect
+    global _zc, _browser, _registered_name, _local_runtime_id, _auto_connect, _last_start_kwargs
     _zc = None
     _browser = None
     _registered_name = None
     _local_runtime_id = None
     _auto_connect = True
+    _last_start_kwargs = None

@@ -1,0 +1,50 @@
+name: fast_decision
+title: Fast Decision (Jev)
+description: |
+  System One machine-native decision service powered by TypeSafe AI (Jev)
+  or deterministic offline heuristics. Evaluates State against typed
+  questions (Noul, Choice, Score) in sub-150ms for instant robotic reflexes,
+  tool candidate pruning, and rapid physical actuation.
+language: builtin
+status: development
+author: CloudSeeder
+tags: [ai, decision, reflex, jev, typesafe]
+icon: icon.svg
+
+bundled: true
+publish: true
+
+install:
+  kind: builtin
+
+entry:
+  in_process:
+    module: service
+    class: FastDecisionService
+
+wizard_config:
+  - id: settings
+    title: Decision Settings
+    fields:
+      - id: api_key
+        type: string
+        title: TypeSafe API Key
+        description: |
+          Optional API key from console.typesafe.ai. When blank or starting with 'mock',
+          runs offline via deterministic heuristics.
+      - id: base_url
+        type: string
+        title: Base URL
+        default: "https://api.typesafe.ai"
+      - id: confidence_threshold
+        type: number
+        title: Autonomous Execution Confidence Threshold
+        default: 0.95
+      - id: residency
+        type: select
+        title: Data Residency
+        options: [local_only, cloud_ok]
+        default: local_only
+        description: |
+          local_only forces offline evaluation, preventing robot telemetry or utterances
+          from leaving the host. cloud_ok enables live Jev API evaluation.

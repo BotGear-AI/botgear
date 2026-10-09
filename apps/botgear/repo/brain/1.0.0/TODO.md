@@ -4,6 +4,10 @@ Operator-facing followups for the brain service. Each entry is a
 question or a piece of work that hasn't been done yet; status field
 tracks whether ideation is open or closed.
 
+Strategy-level work (extracting brain's runtime into a shared agent
+surface, the MCP gateway, agent_harness integration, pluggable minds)
+lives in [`docs/AGENT_ROADMAP.md`](../../../docs/AGENT_ROADMAP.md), not here.
+
 
 ## OPEN — How to maintain workflows across model + backend differences
 
@@ -159,7 +163,15 @@ Until we have data, defer.
 
 ## OPEN — Engine convergence semantics: when is `done` legitimate?
 
-**Status**: open question, surfaced by the qwen2.5-coder:7b run.
+**Status**: partly answered (2026-10-04). Settled:
+- `terminate_on` workflows: `done` before the required actions → failure.
+- `exit_on_phrase` workflows: `done` before any `listen` → failure; after
+  it, `resume_on_done` speaks the `done` text (if unspoken) and listens
+  again — small models put their reply there.
+- Runaways: `loop_breaker`.
+
+Still open: plain workflows (neither field), where `done` is taken at face
+value. Surfaced by the qwen2.5-coder:7b run:
 
 When a model emits `kind=done` (either explicitly or by returning
 text-only with no tool call), the engine currently terminates the

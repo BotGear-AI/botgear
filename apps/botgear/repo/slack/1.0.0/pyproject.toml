@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slack_service"
+version = "1.0.0"
+description = "botgear Slack bot — the `messaging` capability over Slack Socket Mode. rlx_bus + rlx_messaging are pre-installed into the venv by runtime/installer.py."
+requires-python = ">=3.10"
+dependencies = [
+    # slack_sdk>=3.36 renamed its aiohttp extra to "optional" (which also
+    # pulls in boto3/SQLAlchemy/aiodns/websockets — unneeded here), and
+    # older slack_sdk releases don't define "optional" at all. Depending
+    # on aiohttp directly is the only spec that resolves the async
+    # Socket Mode client (slack_sdk.socket_mode.aiohttp.SocketModeClient)
+    # across that range — it's the only third-party import that module
+    # makes. Async-native, so it runs directly in this service's own
+    # asyncio loop rather than needing slack_bolt's separate app lifecycle.
+    "slack_sdk>=3.27,<4.0",
+    "aiohttp>=3.8",
+]
+
+[project.scripts]
+slack_service = "slack_service.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

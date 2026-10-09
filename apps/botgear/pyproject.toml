@@ -10,7 +10,6 @@ description = "A FastAPI application in a monorepo"
 authors = [{ name = "GroG Bot", email = "grogbot@botgear.ai" }]
 requires-python = ">=3.12"
 dependencies = [
-
     # Internal packages
     "auth",
     "config",
@@ -33,7 +32,15 @@ dependencies = [
     # the app venv too, not just the per-service venvs the installer
     # builds. Pure-Python, depends only on pydantic.
     "rlx_servo_cal",
-
+    # Shared messaging capability (MessagingServiceBase — inbox queue +
+    # listen/speak/send/list_channels + retained state, see
+    # docs/TODO_MESSAGING.md). discord/slack/google_chat service tests
+    # import it directly, so it must resolve in the app venv too, not
+    # just the per-service venvs the installer builds. Pure-Python.
+    "rlx_messaging",
+    # Fast System One decision primitives (Jev / TypeSafe AI) for robotics
+    # event routing, fast reflex bypass, and tool candidate pruning.
+    "rlx_decision",
     # Common package
     "fastapi",
     "uvicorn",
@@ -50,6 +57,11 @@ dependencies = [
     "ruamel.yaml",
     "requests",
     "psutil",
+    # slam_service (repo/slam/1.0.0) is deliberately numpy-only — no
+    # OpenCV/depthai — so its tests (imported via sys.path, same
+    # pattern as discord/slack/oakd) need numpy resolvable in the main
+    # app venv too, not just a per-service venv.
+    "numpy>=1.24",
     # Used by the in-process cron service (repo/cron/1.0.0). Standard
     # 5-field cron expressions + next-run computation. Tiny pure-Python
     # dep, ships with no extras.
@@ -58,17 +70,31 @@ dependencies = [
     # runtime on the LAN as ``_botgear._tcp.local.`` and browses for
     # peers. Pure Python, no system avahi/Bonjour dependency.
     "zeroconf>=0.140,<1.0",
+    # Pure-Python D-Bus client (no system libdbus/GLib dev headers, no
+    # GLib mainloop) with an asyncio-native API — fits directly into the
+    # FastAPI event loop. Used by runtime/power_state.py to subscribe to
+    # systemd-logind's PrepareForSleep signal on the system bus so the
+    # runtime can detect suspend/resume (Linux only). Chosen over
+    # dbus-python/PyGObject specifically to avoid the system-package +
+    # mainloop-threading + PyInstaller-bundling cost of those.
+    "jeepney>=0.9,<1.0",
     # Markdown is a first-class file format in the brain workspace
     # (prompts, success/failure copy, run results, memory notes).
     # The browser renders for display via react-markdown; this Python
     # dep covers backend-side concerns: extracting frontmatter from
     # workflow.yaml siblings, syntax-checking edits before they hit
     # disk via the file API, and any future server-rendered HTML
-    # (e.g. RSS, exports). See docs/TODO_BRAIN_VIEWER.md.
-    "markdown-it-py>=3.0,<4.0"
+    # (e.g. RSS, exports). See repo/brain/1.0.0/README.md's
+    # "Workspace file browser (UI)" section.
+    "markdown-it-py>=3.0,<4.0",
+    "mcp>=2.3,<3",
+    # Runs WORKFLOW.md agent work on rented harnesses (Claude Code, ...):
+    # botgear's own agent content lives in agent_harness/ (roadmap Phase 2+).
+    "agent_harness",
 ]
 
 [tool.uv.sources]
+agent_harness = { path = "../../packages/agent_harness", editable = true }
 auth = { path = "../../packages/auth", editable = true }
 config = { path = "../../packages/config", editable = true }
 database = { path = "../../packages/database", editable = true }
@@ -81,6 +107,8 @@ rlx_bus = { path = "../../packages/rlx_bus", editable = true }
 rlx_audio = { path = "../../packages/rlx_audio", editable = true }
 rlx_input = { path = "../../packages/rlx_input", editable = true }
 rlx_servo_cal = { path = "../../packages/rlx_servo_cal", editable = true }
+rlx_messaging = { path = "../../packages/rlx_messaging", editable = true }
+rlx_decision = { path = "../../packages/rlx_decision", editable = true }
 
 [project.optional-dependencies]
 dev = [
@@ -91,6 +119,11 @@ dev = [
         "pip-tools",
         "coverage",
         "httpx"
+]
+# brain's claude_agent backend (a rented Claude agent session as the mind,
+# roadmap Phase 4). Optional: the SDK bundles the Claude Code CLI (~230 MB).
+claude-agent = [
+        "claude-agent-sdk>=0.2.160"
 ]
 
 [tool.pytest.ini_options]

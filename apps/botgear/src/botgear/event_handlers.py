@@ -6,6 +6,7 @@ from models.auth_oauth_provider_config import AuthOauthProviderConfig
 from models.auth_oauth_callback_data import AuthOauthCallbackData
 from models.auth_session import AuthSession
 from models.database_tinydb_config import DatabaseTinydbConfig
+from models.database_sqlite_config import DatabaseSqliteConfig
 from database.factory import create_database_client, get_database_client
 from botgear.models.config import Config as BotgearConfig
 from botgear.models.user import User
@@ -70,6 +71,8 @@ def on_startup():
     from botgear.runtime import log_bus
     log_bus.install()
 
+    _install_sigterm_handler()
+
     # Serialize the exact launch command so POST /v1/system/restart can
     # re-exec it (incl. any CLI args) — see runtime/system.py.
     from botgear.runtime import system
@@ -112,10 +115,22 @@ def on_startup():
     # working file isolated. (botgear onboards via first_user_claim, so
     # there is no admin_password.txt.)
     _databases_dir = str(Path(settings.data_dir or "data") / "databases")
-    create_database_client(DatabaseTinydbConfig(
-        name="default",
-        data_dir=_databases_dir,
-    ))
+    if settings.database_type == "sqlite":
+        # TinyDB/lowdb rewrites a whole table's JSON file on every write —
+        # a process killed mid-write leaves a truncated file and the whole
+        # table unreadable (see TODO_SQLITE.md for the 2026-06-20 incident).
+        # SQLite's own journal/WAL makes a torn write impossible: a crash
+        # mid-transaction leaves either the prior committed state or the
+        # new one, never a corrupt file.
+        create_database_client(DatabaseSqliteConfig(
+            name="default",
+            sqlite_path=str(Path(_databases_dir) / "botgear.db"),
+        ))
+    else:
+        create_database_client(DatabaseTinydbConfig(
+            name="default",
+            data_dir=_databases_dir,
+        ))
     db: DatabaseAdapter = get_database_client()
     if not db:
         logger.error("Database client not created.")
@@ -130,6 +145,12 @@ def on_startup():
     db.ensure_table(model=ServiceRequest)
     db.ensure_table(model=Workspace)
     db.ensure_table(model=ApiClient)
+    # The config/default row is written below (and read/written throughout
+    # registry.py, config_service.py, registry_api.py) without ever being
+    # ensure_table'd elsewhere. TinyDB tolerates that (tables materialize
+    # lazily on first access); sqlite does not — an un-created "config"
+    # table would 500 the very first boot at the get_item() check below.
+    db.ensure_table(model=BotgearConfig)
 
     # Register the X-API-Key validator so requests carrying an `X-API-Key`
     # header authenticate against the api_client table. packages/auth's
@@ -183,6 +204,21 @@ def on_startup():
     # announce themselves with a 'hello' before we go spawning new ones.
     _discovery.start()
 
+    # Runtime-wide HALT status tracker (/runtime/halt_state). Services react
+    # to /runtime/halt directly; this only keeps the retained status the UI
+    # banner + brain start-latch read. See runtime/halt.py.
+    from botgear.runtime import halt as _halt
+    _halt.start()
+
+    # MCP gateway (/v1/mcp): external AI agents drive live services under one
+    # tool policy + HALT. Its catalog watchers + MCP session manager run in
+    # this (the backend's) event loop. See mcp_gateway/ + docs/AGENT_ROADMAP.md.
+    try:
+        from botgear import mcp_gateway as _mcp_gateway
+        _mcp_gateway.start()
+    except Exception:  # noqa: BLE001 — the robot must boot even if the gateway can't
+        logger.exception("mcp_gateway: failed to start")
+
     # Throttled per-topic publish-rate digest on /bus/stats — feeds the
     # Composer's live-flow overlay without exposing per-message traffic.
     _bus_stats.start()
@@ -196,7 +232,7 @@ def on_startup():
     # boot under the new system the migrator writes yml files from the
     # existing rows; on every boot after that, the yml files become
     # authoritative and any drift propagates row-ward.
-    # See docs/TODO_CONFIG_SETS.md for the contract.
+    # See AGENTS.md's "Config sets" section for the contract.
     from botgear.runtime.boot import boot_from_config_set
     from botgear.runtime.config_sets import pin_booted_set
     data_dir_path = Path(settings.data_dir or "data")
@@ -265,7 +301,11 @@ def on_startup():
     if not _data_dir.is_absolute():
         _data_dir = Path.cwd() / _data_dir
     runtime_cfg = read_runtime_config(_data_dir)
-    peer_urls = runtime_cfg.get("peers") or []
+    # Each entry is either a bare URL string (Option A — shared
+    # JWT_SECRET_KEY) or {"url", "secret"} (Option B — a per-peer
+    # api_client credential minted on the REMOTE side for us; see
+    # peer_service.mint_peer_credential / peer_manager.connect).
+    peer_entries = runtime_cfg.get("peers") or []
 
     # stone 4b migration: shed any legacy service_config left on the runtime
     # row by older builds (peers/mdns now live in runtime.yml; runtime_id in
@@ -276,10 +316,19 @@ def on_startup():
         _rt.pop("service_config", None)
         db.delete_item("service_proxy", "runtime")
         db.insert_item("service_proxy", "runtime", _rt)
-    for url in peer_urls:
+    for entry in peer_entries:
+        if isinstance(entry, dict):
+            url, secret = entry.get("url"), entry.get("secret")
+        else:
+            url, secret = entry, None
+        if not url:
+            continue
         try:
-            _peer_manager.connect(url)
-            logger.info("peer_manager.boot: dialed persisted peer %s", url)
+            _peer_manager.connect(url, secret=secret)
+            logger.info(
+                "peer_manager.boot: dialed persisted peer %s (auth=%s)",
+                url, "api_key" if secret else "shared_secret",
+            )
         except Exception:  # noqa: BLE001
             logger.exception("peer_manager.boot: failed to dial %s", url)
 
@@ -294,6 +343,7 @@ def on_startup():
                 port=port,
                 version=_read_version(),
                 auto_connect=bool(runtime_cfg.get("mdns_auto_connect", True)),
+                use_ssl=bool(getattr(settings, "ssl_enabled", False)),
             )
         except Exception:  # noqa: BLE001
             logger.exception("mdns.start failed — discovery disabled this boot")
@@ -308,6 +358,15 @@ def on_startup():
     except Exception:  # noqa: BLE001
         logger.exception("runtime.system_state: failed to start publisher")
 
+    # Start the runtime's own /runtime/runtime/power publisher — battery,
+    # AC, and (Linux) suspend/resume detection. Same idempotent-start
+    # convention as system_state above.
+    try:
+        from botgear.runtime import power_state
+        power_state.start_publisher(proxy_id="runtime", interval_s=5.0)
+    except Exception:  # noqa: BLE001
+        logger.exception("runtime.power_state: failed to start publisher")
+
     # Start the runtime's services-index publisher — aggregates every
     # service's /<type>/<id>/meta retained topic into a single
     # /runtime/runtime/services digest so consumers have a single
@@ -317,6 +376,15 @@ def on_startup():
         services_index.start_publisher()
     except Exception:  # noqa: BLE001
         logger.exception("runtime.services_index: failed to start publisher")
+
+    # Read-only request/reply surface for the runtime itself —
+    # /runtime/runtime/meta + /control (get_time, get_info, ...), so
+    # brain workflows and other bus clients can ask the runtime things.
+    try:
+        from botgear.runtime import runtime_control
+        runtime_control.start()
+    except Exception:  # noqa: BLE001
+        logger.exception("runtime.control: failed to start")
 
     # Start the runtime's types-index publisher — introspects every
     # registered service type's config_class, @service_method args,
@@ -371,20 +439,74 @@ def _read_version() -> str:
         return "0.0.0"
 
 
+def _install_sigterm_handler() -> None:
+    """Make SIGTERM run on_shutdown (drain services) before the process dies.
+
+    uvicorn's Server.capture_signals swaps in its own handler while serving,
+    then on exit RESTORES the handler that was there before and re-raises
+    the signal. With the default SIGTERM disposition that kills the process
+    on the spot — main.run()'s ``finally: on_shutdown()`` never runs and
+    every subprocess service is orphaned. Installing this before uvicorn
+    starts means the restored handler is this one: drain, then re-raise
+    with the default disposition so the exit status is still SIGTERM's.
+    Ctrl-C (SIGINT → KeyboardInterrupt) already unwinds through that
+    ``finally`` and doesn't need this."""
+    import signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    def _on_sigterm(signum, _frame):
+        try:
+            on_shutdown()
+        finally:
+            signal.signal(signum, signal.SIG_DFL)
+            signal.raise_signal(signum)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
 def on_shutdown():
     logger.info("Application is shutting down.")
-    # Stop the system_state publisher so it doesn't fight uvicorn's
-    # task cancellation. asyncio.run() here is safe because on_shutdown
-    # runs on the main thread post-loop, with no loop attached.
+    # Stop every service before the process goes (SIGTERM / Ctrl-C land
+    # here). Subprocess services run in their own session, so without this
+    # they outlive the backend and the next boot adopts a mix of old and
+    # new processes. Skipped when a graceful restart/shutdown already
+    # drained (those paths never return here anyway — execv / os._exit).
     try:
-        from botgear.runtime import system_state
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(system_state.stop_publisher())
-        finally:
-            loop.close()
+        from botgear.runtime import system
+        if not system.is_draining():
+            system.drain_for_exit("backend exit", snapshot=False)   # keep hand-edited ymls
     except Exception:  # noqa: BLE001
-        logger.exception("runtime.system_state: shutdown failed")
+        logger.exception("shutdown: draining services failed")
+    # Stop the system_state / power_state publishers so they don't fight
+    # uvicorn's task cancellation. on_shutdown normally runs with the main
+    # loop still running (main.run()'s finally, or the SIGTERM handler) —
+    # a nested run_until_complete raises there — so schedule the stop on
+    # that loop; only drive a fresh loop when none is running.
+    from botgear.runtime import power_state, system_state
+    for name, stop in (("system_state", system_state.stop_publisher),
+                       ("power_state", power_state.stop_publisher)):
+        try:
+            _run_coroutine_best_effort(stop())
+        except Exception:  # noqa: BLE001
+            logger.exception("runtime.%s: shutdown failed", name)
+
+
+def _run_coroutine_best_effort(coro) -> None:
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is not None:
+        running.create_task(coro)
+        return
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def on_new_registration(registration, request: Optional[Request] = None):
@@ -502,6 +624,21 @@ def register_admin_routes(app) -> None:
     # System control — GET /v1/system/info, POST /v1/system/restart.
     from botgear.api.system_api import router as system_router
     app.include_router(system_router, prefix="/v1", tags=["System"])
+
+    # Explicit per-instance config save (yml-aware) — POST
+    # /v1/service-proxy/{id}/config. Counterpart to the generic CRUD PUT,
+    # which only writes the (largely unused, for subprocess types) DB
+    # row's service_config and never reaches the yml a subprocess
+    # actually starts from.
+    from botgear.api.service_proxy_config_api import router as proxy_config_router
+    app.include_router(proxy_config_router, prefix="/v1", tags=["Service Proxy Config"])
+
+    # MCP gateway endpoint — see on_startup for its background work.
+    try:
+        from botgear import mcp_gateway as _mcp_gateway
+        _mcp_gateway.mount(app)
+    except Exception:  # noqa: BLE001
+        logger.exception("mcp_gateway: failed to mount /v1/mcp")
 
 
 def resolve_ui_dir() -> Optional[str]:

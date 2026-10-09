@@ -54,6 +54,12 @@ _peers_by_url: Dict[str, PeerConnection] = {}
 # Subscriptions the bus told us about before the peer was connected.
 # Replayed when the peer transitions to CONNECTED.
 _pending_subs: Dict[str, Set[str]] = {}     # peer_id (or url-key) → set of base topics
+# Per-peer Option B credential, keyed by URL (the stable key — remote_id
+# isn't known until after connecting). Populated by connect(url, secret=...).
+# Never exposed via peers()'s snapshot; read back only by
+# peer_service._persist_peers so a restart reconnects with the same
+# credential instead of silently falling back to Option A.
+_peer_secrets: Dict[str, str] = {}
 _lock = threading.Lock()
 
 
@@ -64,9 +70,17 @@ def _token_provider() -> str:
     return get_subprocess_token()
 
 
-def connect(url: str) -> PeerConnection:
+def connect(url: str, secret: Optional[str] = None) -> PeerConnection:
     """Open (or look up) a PeerConnection to ``url``. Idempotent —
-    repeat calls with the same URL return the existing connection.
+    repeat calls with the same URL return the existing connection
+    (``secret`` is ignored on an idempotent hit; disconnect + reconnect
+    to change a peer's credential).
+
+    ``secret`` is an ``api_client`` row's secret minted ON THE REMOTE
+    side for us specifically (Option B — see peer_connection.py). When
+    given, the connection authenticates with it instead of the shared
+    JWT_SECRET_KEY subprocess token (Option A, the default when
+    ``secret`` is None — what auto-discovered/unpaired peers still use).
 
     The remote id is unknown at this point. Once the peer's identify
     phase completes (``on_state_change`` fires with state=CONNECTED),
@@ -79,6 +93,10 @@ def connect(url: str) -> PeerConnection:
         existing = _peers_by_url.get(url)
         if existing is not None:
             return existing
+        if secret:
+            _peer_secrets[url] = secret
+        else:
+            _peer_secrets.pop(url, None)
     # Build the PeerConnection with a per-peer message closure so the
     # inbound dispatch knows which peer the frame came from without
     # changing PeerConnection's callback signature (it stays generic
@@ -97,13 +115,25 @@ def connect(url: str) -> PeerConnection:
     def _local_id() -> str:
         return get_runtime_id()
 
-    pc = PeerConnection(
-        url=url,
-        token_provider=_token_provider,
-        on_state_change=_on_peer_state_change,
-        on_message=_msg_callback,
-        local_id_provider=_local_id,
-    )
+    if secret:
+        def _fixed_token_provider(_s: str = secret) -> str:
+            return _s
+        pc = PeerConnection(
+            url=url,
+            token_provider=_fixed_token_provider,
+            auth_param="api_key",
+            on_state_change=_on_peer_state_change,
+            on_message=_msg_callback,
+            local_id_provider=_local_id,
+        )
+    else:
+        pc = PeerConnection(
+            url=url,
+            token_provider=_token_provider,
+            on_state_change=_on_peer_state_change,
+            on_message=_msg_callback,
+            local_id_provider=_local_id,
+        )
     pc_holder[0] = pc
     with _lock:
         _peers_by_url[url] = pc
@@ -123,6 +153,7 @@ async def disconnect(peer_id_or_url: str) -> None:
         for u, p in list(_peers_by_url.items()):
             if p is pc:
                 _peers_by_url.pop(u, None)
+                _peer_secrets.pop(u, None)
     await pc.stop()
     logger.info("peer_manager: disconnected %s", peer_id_or_url)
 
@@ -130,7 +161,8 @@ async def disconnect(peer_id_or_url: str) -> None:
 def peers() -> Dict[str, Dict[str, Any]]:
     """Snapshot of all known peers. Used by the topology API to render
     a peers panel. Returns {peer_id_or_url: {state, url, remote_id,
-    upstream_subs, collision}}."""
+    upstream_subs, collision, auth}}. ``auth`` is "api_key" or
+    "shared_secret" — never the secret itself."""
     out: Dict[str, Dict[str, Any]] = {}
     with _lock:
         for url, pc in _peers_by_url.items():
@@ -140,11 +172,22 @@ def peers() -> Dict[str, Dict[str, Any]]:
                 "remote_id": pc.remote_id,
                 "state": pc.state.value,
                 "upstream_subs": sorted(pc._upstream_subscriptions),
+                "auth": "api_key" if url in _peer_secrets else "shared_secret",
             }
             if pc.collision_detected:
                 entry["collision"] = pc.collision_detail or "runtime id collision with self"
             out[key] = entry
     return out
+
+
+def peer_secret(url: str) -> Optional[str]:
+    """The Option B credential configured for ``url``, if any — read
+    back by peer_service._persist_peers so a restart reconnects with
+    the same credential instead of silently downgrading to the shared
+    JWT_SECRET_KEY fallback. Not part of peers()'s public snapshot."""
+    from botgear.runtime.peer_connection import _normalise_peer_url
+    with _lock:
+        return _peer_secrets.get(_normalise_peer_url(url))
 
 
 # ─── bus callbacks ────────────────────────────────────────────────────
@@ -348,6 +391,7 @@ def reset_for_tests() -> None:
         _peers_by_url.clear()
         _peers_by_id.clear()
         _pending_subs.clear()
+        _peer_secrets.clear()
 
 
 # ─── test affordances kept for step 2a's stub-era unit tests ──────────

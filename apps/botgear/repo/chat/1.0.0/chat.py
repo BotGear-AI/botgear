@@ -8,20 +8,23 @@ travel as plain text over the bus instead of audio. Useful for
 developing conversation workflows on a dev box without hooking up STT
 + TTS.
 
-Bus topics
-----------
-  /chat/{proxy_id}/inbox      <- {"text": str, ...optional}
-                                 operator publishes utterances here
-                                 (UI text box, ``rlx publish``, etc.)
-  /chat/{proxy_id}/spoken     -> {"text": str, "ts": float}
-                                 published when the brain calls
-                                 ``speak()`` — UI subscribes + renders
-  /chat/{proxy_id}/state      -> {"listening": bool, "queued": int,
-                                  "last_inbox": str, "last_spoken": str}
-                                 retained snapshot for late subscribers
-  /chat/{proxy_id}/control    <- standard framework envelope.
-                                 Actions: ``listen``, ``speak``,
-                                 ``send`` (back-channel for tests).
+Implements the ``messaging`` capability (``implements: [messaging]`` in
+package.yml — see ``docs/TODO_MESSAGING.md``), the same wire contract
+``discord``/``slack``/``google_chat`` implement, so any of them can
+stand in for chat in a brain workflow. chat satisfies it by hand (it's
+in-process, not a subclass of ``rlx_messaging.MessagingServiceBase`` —
+the capability is a wire contract, not a shared base class) with
+``channel``/``list_channels`` as inert shape-parity stubs, since chat
+has no channel concept.
+
+Wire shape is declared below in code, not documented here:
+``topic_schemas`` for what this service PUBLISHES (``spoken``,
+``state``), ``subscribes_schemas`` for what it CONSUMES (``inbox`` —
+operator utterances: UI text box, ``rlx publish``, etc.). Both are
+introspected into this type's descriptor at
+``/runtime/runtime/types/chat``. ``control`` actions (listen/speak/
+send/list_channels) are discoverable the same way, off their
+@service_method signatures.
 
 Why ``listen()`` blocks instead of streaming
 --------------------------------------------
@@ -39,6 +42,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from pydantic import BaseModel, ConfigDict
 from rlx_bus import ServiceConfig
 from botgear.framework import Service, service_method
 
@@ -47,14 +51,54 @@ logger = logging.getLogger(__name__)
 
 
 class ChatConfig(ServiceConfig):
-    """No persistent knobs — chat is stateless between runs. ServiceConfig
-    is still required so the framework can mount ``set_config`` and any
-    future fields land in the same place."""
-    pass
+    """``default_channel``/``echo_own_messages`` exist purely for shape
+    parity with ``rlx_messaging.MessagingConfig`` (see
+    docs/TODO_MESSAGING.md) — chat has no channel concept, so
+    ``default_channel`` is always ``None`` and ignored. Kept so a future
+    generic "messaging config" UI panel doesn't need a chat-specific
+    exception."""
+    default_channel: Optional[str] = None
+    echo_own_messages: bool = False
+
+
+# ── wire schemas for what this service PUBLISHES ──────────────────────
+
+class SpokenPayload(BaseModel):
+    """Published on ``/chat/{id}/spoken`` when ``speak()`` is called."""
+    text: str
+    ts: float
+
+
+class ChatState(BaseModel):
+    """Retained on ``/chat/{id}/state`` — UI reads it without
+    subscribing to every event topic."""
+    connected: bool
+    listening: bool
+    queued: int
+    last_inbox: str
+    last_spoken: str
+    default_channel: Optional[str]
+    capabilities: Dict[str, bool]
+
+
+# ── wire schema for what this service SUBSCRIBES to (inbound) ─────────
+
+class InboxPayload(BaseModel):
+    """Consumed from ``/chat/{id}/inbox`` — operator utterances (UI text
+    box, ``rlx publish``, etc.). Only ``text`` is read by
+    ``_inbox_loop``; extra fields are accepted and ignored there, so
+    this model allows them too rather than rejecting a payload the
+    runtime itself wouldn't reject."""
+    model_config = ConfigDict(extra="allow")
+    text: str
+    ts: Optional[float] = None
 
 
 class ChatService(Service):
     config_class = ChatConfig
+    state_schema = ChatState
+    topic_schemas = {"spoken": SpokenPayload}
+    subscribes_schemas = {"inbox": InboxPayload}
     publishes = ["spoken", "state"]
     _inbox_queue: "asyncio.Queue[Dict[str, Any]]"
     _inbox_task: Optional[asyncio.Task]
@@ -90,6 +134,7 @@ class ChatService(Service):
     async def listen(
         self,
         timeout_seconds: int = 8,
+        channel: Optional[str] = None,
         bearing: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Pull one operator utterance off the inbox queue. Blocks for
@@ -98,14 +143,17 @@ class ChatService(Service):
         to retry or terminate (the brain's conversation_session exits
         after two timeouts in a row).
 
-        ``bearing`` is reserved — the speech service would report an
-        angle to the speaker; chat has no audio so it's None. Kept in
-        the signature so the brain's prompt + workflows transfer
-        verbatim between chat and a future speech service.
+        ``channel`` is accepted for shape parity with the ``messaging``
+        capability (docs/TODO_MESSAGING.md) — chat has no channels, so
+        it's ignored and always echoed back as ``None``. ``bearing`` is
+        reserved — the speech service would report an angle to the
+        speaker; chat has no audio so it's None. Both are kept in the
+        signature so the brain's prompt + workflows transfer verbatim
+        across every ``messaging`` implementor.
 
-        Returns ``{"text": str, "bearing": float | None,
-        "timeout": bool}``."""
-        del bearing  # accepted for API parity, unused in text chat
+        Returns ``{"text": str, "sender": None, "channel": None,
+        "bearing": float | None, "timeout": bool}``."""
+        del bearing, channel  # accepted for API parity, unused in text chat
         try:
             timeout = max(0.5, float(timeout_seconds))
         except (TypeError, ValueError):
@@ -117,58 +165,72 @@ class ChatService(Service):
         except asyncio.TimeoutError:
             self._listening = False
             self._publish_state()
-            return {"text": "", "bearing": None, "timeout": True}
+            return {"text": "", "sender": None, "channel": None, "bearing": None, "timeout": True}
         text = str(msg.get("text", "")).strip()
         self._last_inbox = text
         self._listening = False
         self._publish_state()
-        return {"text": text, "bearing": None, "timeout": False}
+        return {"text": text, "sender": None, "channel": None, "bearing": None, "timeout": False}
 
     @service_method("speak", publishes=["spoken", "state"])
-    def speak(self, text: str) -> Dict[str, Any]:
+    def speak(self, text: str, channel: Optional[str] = None) -> Dict[str, Any]:
         """Emit a reply. Publishes to ``/chat/{id}/spoken`` so the UI
         renders it. Returns immediately — text "speech" has no
         playback to wait for, so the brain workflow's
         ``await speak; await listen`` ordering simply means "publish,
         then go back to listening".
 
-        Returns ``{"spoken": str, "ts": float}`` so callers can log
-        what they emitted."""
+        ``channel`` is accepted for ``messaging``-capability shape
+        parity and ignored (chat has no channels).
+
+        Returns ``{"spoken": str, "ts": float, "channel": None,
+        "sent": True}`` so callers can log what they emitted."""
+        del channel
         if not isinstance(text, str):
             raise TypeError(f"speak.text must be str, got {type(text).__name__}")
         ts = time.time()
         self._last_spoken = text
-        self.publish("spoken", {"text": text, "ts": ts})
+        self.publish("spoken", SpokenPayload(text=text, ts=ts).model_dump())
         self._publish_state()
-        return {"spoken": text, "ts": ts}
+        return {"spoken": text, "ts": ts, "channel": None, "sent": True}
 
     @service_method("send")
-    def send(self, text: str) -> Dict[str, Any]:
+    def send(self, text: str, channel: Optional[str] = None) -> Dict[str, Any]:
         """Back-channel for tests + manual exercises. Equivalent to
         publishing ``{"text": text}`` to ``/chat/{id}/inbox`` directly.
+        ``channel`` is accepted for shape parity and ignored.
 
         Useful when you want to script an operator turn without the UI
         — e.g. ``rlx call /chat/chat-1/control send text="hi"``."""
+        del channel
         if not isinstance(text, str):
             raise TypeError(f"send.text must be str, got {type(text).__name__}")
         self.publish("inbox", {"text": text, "ts": time.time()})
         return {"sent": text}
+
+    @service_method("list_channels")
+    def list_channels(self) -> Dict[str, Any]:
+        """chat has exactly one implicit channel — returned as a
+        synthetic entry so a ``messaging``-capability consumer that
+        always calls ``list_channels()`` doesn't need a chat-specific
+        branch."""
+        return {"channels": [{"id": "local", "name": "local"}]}
 
     # ─── internals ──────────────────────────────────────────────────────
 
     def _publish_state(self) -> None:
         """One retained state message — UI reads it to render the
         current chat status without subscribing to every event topic."""
-        self.publish(
-            "state",
-            {
-                "listening": self._listening,
-                "queued": self._inbox_queue.qsize() if hasattr(self, "_inbox_queue") else 0,
-                "last_inbox": self._last_inbox,
-                "last_spoken": self._last_spoken,
-            },
-            retained=True,
+        state = ChatState(
+            connected=True,  # chat is local — always "connected"
+            listening=self._listening,
+            queued=self._inbox_queue.qsize() if hasattr(self, "_inbox_queue") else 0,
+            last_inbox=self._last_inbox,
+            last_spoken=self._last_spoken,
+            default_channel=None,
+            capabilities={"listen": True, "speak": True, "channels": False},
         )
+        self.publish("state", state.model_dump(), retained=True)
 
     async def _inbox_loop(self) -> None:
         """Drain ``/chat/{id}/inbox`` into the queue. Anything that

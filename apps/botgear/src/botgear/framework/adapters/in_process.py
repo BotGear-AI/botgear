@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
+from rlx_bus.halt import HALT_TOPIC, RESUME_TOPIC
+
 from botgear.runtime.bus import get_bus
 
 from ..adapter import ServiceAdapter, ServiceHandle
@@ -208,10 +210,27 @@ class InProcessAdapter(ServiceAdapter):
             service._bind_runtime(loop, stop_event)
             ready.set()
 
+            async def _watch_halt(topic: str, hook_name: str) -> None:
+                # Runtime-wide HALT / RESUME broadcast (rlx_bus.halt) — its
+                # own subscription so a stop never queues behind the
+                # service's data traffic. A hook that raises is logged and
+                # the watcher keeps going.
+                async for msg in get_bus().subscribe(topic, f"{type_name}-{proxy_id}-{hook_name}"):
+                    payload = msg.payload if isinstance(msg.payload, dict) else {}
+                    try:
+                        await getattr(service, hook_name)(payload)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("%s for %s raised", hook_name, proxy_id)
+
             async def _drive() -> None:
                 meta_topic = f"/{type_name}/{proxy_id}/meta"
+                halt_tasks: list = []
                 try:
                     await service.on_start()
+                    halt_tasks = [
+                        asyncio.create_task(_watch_halt(HALT_TOPIC, "on_halt")),
+                        asyncio.create_task(_watch_halt(RESUME_TOPIC, "on_resume")),
+                    ]
                     # Standard meta self-description — published AFTER
                     # on_start so any topics the subclass added (extra
                     # streams, filter_catalog, etc.) show up under
@@ -225,6 +244,8 @@ class InProcessAdapter(ServiceAdapter):
                         logger.exception("meta publish failed for %s", proxy_id)
                     await stop_event.wait()
                 finally:
+                    for t in halt_tasks:
+                        t.cancel()
                     # Clear the meta retained topic so a fresh subscriber
                     # after we exit doesn't see stale advertised
                     # methods/topics.

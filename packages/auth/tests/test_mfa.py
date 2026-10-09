@@ -15,6 +15,14 @@ def test_get_totp_uri():
     assert "TestApp" in uri
     assert secret in uri
 
+def test_get_totp_uri_explicit_none_issuer_falls_back_to_default():
+    # A caller passing an explicit None (e.g. an unset settings value) must
+    # not reach pyotp as a bare None — that drops the issuer from the URI
+    # entirely, leaving the authenticator app with no application name.
+    secret = generate_totp_secret("alice")
+    uri = get_totp_uri("alice", secret, issuer=None)
+    assert "issuer=App" in uri
+
 def test_generate_qr_code_returns_streaming_response():
     secret = generate_totp_secret("bob")
     uri = get_totp_uri("bob", secret)

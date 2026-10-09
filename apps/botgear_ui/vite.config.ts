@@ -35,22 +35,26 @@ function readApiTargetFromEnvFiles(mode: string): string {
 }
 
 export default defineConfig(({ mode }) => {
-  // Default to https://localhost:8998 — the backend serves TLS (self-signed)
-  // when ssl is enabled. The .env file in this directory (VITE_API_URL=...)
-  // overrides this fallback (set it to http://… if you run the backend
-  // without ssl).
-  const apiTarget = readApiTargetFromEnvFiles(mode) || 'https://localhost:8998'
-
   // Serve the dev UI over HTTPS (self-signed) so WebXR works from a headset —
   // WebXR requires a secure context, which a plain-HTTP LAN origin is not.
-  // Reuses the backend's self-signed cert (apps/botgear/ssl). Falls back to
-  // HTTP if the cert isn't there (certless checkout / ssl disabled).
+  // Reuses the backend's self-signed cert (apps/botgear/ssl, auto-generated
+  // on the backend's first boot since ssl_enabled defaults to True there —
+  // see templates/apps/botgear.yml). Falls back to HTTP only if the backend
+  // has genuinely never run yet (no cert on disk).
   const sslDir = path.resolve(process.cwd(), '..', 'botgear', 'ssl')
   const certPath = path.join(sslDir, 'cert.pem')
   const keyPath = path.join(sslDir, 'key.pem')
-  const https = fs.existsSync(certPath) && fs.existsSync(keyPath)
+  const certAvailable = fs.existsSync(certPath) && fs.existsSync(keyPath)
+  const https = certAvailable
     ? { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) }
     : undefined
+
+  // Fallback API target tracks the same cert-availability check above — the
+  // backend's default (ssl_enabled=True) means "cert present" and "backend
+  // speaks TLS" are the same condition. Mismatching this from `https` above
+  // is exactly what breaks the WS handshake (ws vs wss). The .env file in
+  // this directory (VITE_API_URL=...) overrides this fallback outright.
+  const apiTarget = readApiTargetFromEnvFiles(mode) || `${certAvailable ? 'https' : 'http'}://localhost:8998`
 
   return {
     plugins: [react(), noReloadOnServiceUi()],

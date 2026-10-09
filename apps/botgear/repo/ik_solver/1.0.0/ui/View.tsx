@@ -407,7 +407,7 @@ function ArmProjection({
             return choices.reduce((best, c) =>
               Math.abs(c - raw) < Math.abs(best - raw) ? c : best, choices[0])
           })()
-          const lines: JSX.Element[] = []
+          const lines: React.JSX.Element[] = []
           for (let k = -R; k <= R + 0.001; k += step) {
             // Lines parallel to Y (varying x)
             const [ax, ay] = projectIso([k, -R, 0])

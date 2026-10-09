@@ -10,6 +10,7 @@ import { ChevronDown, Wrench, User as UserIcon } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useApiFetch } from '../contexts/ActiveRuntimeContext'
 import ConnectionIndicator from './ConnectionIndicator'
+import HaltControl from './HaltControl'
 
 // Primary destinations (always visible). `active(rel)` decides the
 // highlight from the runtime-relative path. Canvas (a specific workspace
@@ -121,6 +122,8 @@ export default function RuntimeNav() {
       </div>
 
       <div className="flex-1" />
+
+      <HaltControl />
 
       <ConnectionIndicator />
 

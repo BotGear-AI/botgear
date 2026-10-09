@@ -8,9 +8,13 @@ from database.types import DateTimeStr
 
 class ServiceRequest(BaseModel):
     id: Optional[str] = Field(None, description="UUID auto-generated on create", json_schema_extra={"example":"123e4567-e89b-12d3-a456-426614174000"})
-    action: str = Field(..., description="Lifecycle action - install, start, stop, restart, uninstall, activate_workspace, deactivate_workspace", json_schema_extra={"example":"start"})
+    action: str = Field(..., description="Lifecycle action - install, start, stop, restart, uninstall, rename, activate_workspace, deactivate_workspace", json_schema_extra={"example":"start"})
     service_meta_id: Optional[str] = Field(None, description="Target service catalog entry - required for install", json_schema_extra={"example":"opencv@4.8.0"})
     proxy_name: Optional[str] = Field(None, description="Desired proxy name - required for install to name the new proxy", json_schema_extra={"example":"pycv"})
+    new_name: Optional[str] = Field(None, description="New proxy name - required for rename (lowercase letters, digits, '-' and '_')", json_schema_extra={"example":"network_scanner"})
+    dry_run: Optional[bool] = Field(None, description="rename only: report what would change without changing anything")
+    rewrite_references: Optional[bool] = Field(None, description="rename only: rewrite references to the old name in other services' configs (default true); false only reports them")
+    placeholder: Optional[bool] = Field(False, description="For create_service - drop a placeholder (no dependency install) instead of installing eagerly; the type's deps install lazily on the instance's first start_service", json_schema_extra={"example":True})
     workspace_id: Optional[str] = Field(None, description="Target workspace name for activate_workspace and deactivate_workspace actions", json_schema_extra={"example":"vision-pipeline"})
     service_proxy_id: Optional[str] = Field(None, description="Target proxy name for start, stop, restart, uninstall actions", json_schema_extra={"example":"pycv"})
     config: Optional[dict] = Field(None, description="Initial or updated config params to apply alongside this request", json_schema_extra={"type":"object","additionalProperties":True,"example":{"port":7070}})

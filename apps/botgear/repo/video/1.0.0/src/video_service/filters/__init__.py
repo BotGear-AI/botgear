@@ -21,6 +21,7 @@ from .gaussian_blur import GaussianBlurFilter
 from .grayscale import GrayscaleFilter
 from .lk_optical_flow import LKOpticalFlowFilter
 from .motion import MotionFilter
+from .overlay import OverlayFilter
 from .pyramid_down import PyramidDownFilter
 from .rotate import RotateFilter
 from .threshold import ThresholdFilter
@@ -41,6 +42,7 @@ _REGISTRY: List[Type[Filter]] = [
     GrayscaleFilter,
     ThresholdFilter,
     CannyFilter,
+    OverlayFilter,
     # Detectors / trackers (publish telemetry)
     MotionFilter,
     FaceDetectFilter,

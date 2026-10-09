@@ -12,7 +12,7 @@ description: |
 
   In-process service — runs inside the rlx backend. Per-instance
   state (workflows, memory, runs) lives under
-  ``<data_dir>/brain/<proxy-id>/``. See docs/TODO_BRAIN.md for the
+  ``<data_dir>/brain/<proxy-id>/``. See this type's README.md for the
   full spec.
 language: builtin
 status: development
@@ -20,7 +20,7 @@ author: CloudSeeder
 tags: [ai, workflow, agent, llm]
 icon: icon.svg
 
-# Modular service UI (Option B — docs/TODO_SERVICE_UI_BUNDLES.md).
+# Modular service UI (Option B — see repo/README.md's "Adding a UI" section).
 ui:
   entry: ui/dist/ui.js
   sdk: "^1.0"
@@ -41,7 +41,7 @@ wizard_config:
     title: Default model
     fields:
       - id: default_model
-        type: enum
+        type: select
         title: Adapter
         options: [mock, ollama, anthropic, openai]
         default: mock

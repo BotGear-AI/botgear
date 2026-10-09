@@ -41,7 +41,7 @@ def create_script(item: Script, user: dict, request: Request):
 
 # read - get all items
 def get_all_script(user: dict, request: Request):
-    logger.info("===============get_all_script called==============")
+    logger.debug("===============get_all_script called==============")
     db = get_database_client()
     if db:
         return db.get_all_items("script")
@@ -49,18 +49,20 @@ def get_all_script(user: dict, request: Request):
 
 # read - get an item
 def get_script(id: str, user: dict, request: Request):
-    logger.info("===============get_script called==============")
-    logger.info(f"Received request to retrieve script with id: {id}")
+    logger.debug("===============get_script called==============")
+    logger.debug(f"Received request to retrieve script with id: {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("script", id)
     return item
 
 # read - get_path an item
 def get_path_script(path: str, user: dict, request: Request):
-    logger.info("===============get_script called==============")
-    logger.info(f"Received request to retrieve {path} with path: {path}")
+    logger.debug("===============get_script called==============")
+    logger.debug(f"Received request to retrieve {path} with path: {path}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("script", path)
     return item
@@ -90,6 +92,7 @@ def delete_script(id: str, user: dict, request: Request):
     logger.info("===============delete_script called==============")
     logger.info(f"Received request to delete script with id {id}")
     db = get_database_client()
+    item = None
     if db:
         item = db.get_item("script", id)
         if not item:

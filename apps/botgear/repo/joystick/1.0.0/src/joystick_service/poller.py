@@ -63,6 +63,33 @@ def inputs_changed(prev: Optional[Dict[str, Any]], cur: Dict[str, Any]) -> bool:
     )
 
 
+def should_publish_input(
+    prev: Optional[Dict[str, Any]],
+    cur: Dict[str, Any],
+    *,
+    now: float,
+    last_publish: float,
+    heartbeat_interval_s: float,
+) -> bool:
+    """True if this snapshot should go out: either it's an actual change
+    (``inputs_changed``), or the heartbeat interval has elapsed since the
+    last publish.
+
+    The heartbeat half exists because a real USB HID gamepad reports
+    continuously regardless of whether anything moved; publishing on
+    change only (to avoid full-poll-rate bus spam while the stick sits
+    still) quietly drops that guarantee — and a downstream consumer that
+    treats "no message in N seconds" as "the source is gone"
+    (motor_control's input_source watchdog is exactly this) will trip on
+    a perfectly healthy, steadily-held stick, since "steady" means
+    "unchanged" means "no publish" under change-only reporting. A stick
+    held at a constant deflection — the ordinary case while actually
+    driving something, not an edge case — would otherwise ALWAYS
+    eventually go quiet long enough to look disconnected.
+    """
+    return inputs_changed(prev, cur) or (now - last_publish) >= heartbeat_interval_s
+
+
 # ─── poll thread ──────────────────────────────────────────────────────
 
 
@@ -83,6 +110,7 @@ class Poller:
         deadzone: float = 0.05,
         enabled: bool = True,
         scan_interval_s: float = 1.0,
+        heartbeat_interval_s: float = 0.2,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._on_devices = on_devices
@@ -93,6 +121,10 @@ class Poller:
         self._deadzone = float(deadzone)
         self._enabled = bool(enabled)
         self._scan_interval = float(scan_interval_s)
+        # See should_publish_input's docstring for why this exists. Well
+        # under any reasonable watchdog timeout; a steady stick costs 5
+        # msg/s at the default, not a full `poll_hz` worth of spam.
+        self._heartbeat_interval = float(heartbeat_interval_s)
         self._logger = logger or logging.getLogger(__name__)
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -167,6 +199,7 @@ class Poller:
         prev_inputs: Optional[Dict[str, Any]] = None
         last_count = -1
         last_scan = 0.0
+        last_publish = 0.0
 
         def _meta(js: Any, index: int) -> Dict[str, Any]:
             return {
@@ -241,8 +274,12 @@ class Poller:
                 # ── read live values ────────────────────────────────
                 if attached is not None and self._enabled:
                     snap = self._read(attached)
-                    if inputs_changed(prev_inputs, snap):
+                    if should_publish_input(
+                        prev_inputs, snap, now=now, last_publish=last_publish,
+                        heartbeat_interval_s=self._heartbeat_interval,
+                    ):
                         prev_inputs = snap
+                        last_publish = now
                         self._dispatch(self._on_input(snap))
 
                 time.sleep(self._poll_dt)

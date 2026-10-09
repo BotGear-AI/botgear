@@ -1,5 +1,6 @@
 # unmanaged
-"""Config-set loader — stone 2 of the TODO_CONFIG_SETS spec.
+"""Config-set loader — stone 2 of the config-sets design (see AGENTS.md's
+"Config sets" section).
 
 Resolves the active config set, parses ``runtime.yml`` + each
 ``<proxy_id>.yml``, walks the parsed tree to decrypt ``Encrypted--``

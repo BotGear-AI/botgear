@@ -1,4 +1,17 @@
-import { getAuthToken } from '../lib/api'
+import { getAuthToken, defaultTryRefresh, defaultOnAuthExpired } from '../lib/api'
+
+// WebSocket close codes the server uses to signal an auth problem
+// specifically, as opposed to a network blip / server restart — mirrors
+// botgear/runtime/ws_endpoint.py's application-range codes exactly.
+//   4401 — no token presented at all
+//   4403 — token present but invalid/expired (also used if a `reauth`
+//          frame carries a bad token)
+//   4408 — an already-open connection's token expired and no `reauth`
+//          arrived within the grace window (see the server's watchdog)
+const WS_CLOSE_NO_TOKEN = 4401
+const WS_CLOSE_BAD_TOKEN = 4403
+const WS_CLOSE_REAUTH_REQUIRED = 4408
+const AUTH_CLOSE_CODES: ReadonlySet<number> = new Set([WS_CLOSE_NO_TOKEN, WS_CLOSE_BAD_TOKEN, WS_CLOSE_REAUTH_REQUIRED])
 
 // Server-sent frame the UI receives over /v1/ws.
 export interface InboundFrame {
@@ -102,10 +115,20 @@ export type TrafficListener = (ev: TrafficEvent) => void
  * the current token — important because tokens rotate via refresh +
  * because the multi-runtime UI keeps tokens in memory per connection
  * rather than in a single localStorage slot.
+ *
+ * ``tryRefresh`` / ``onAuthExpired`` mirror ``ApiFetchConfig`` (see
+ * lib/api.ts) — same recovery policy, applied to the socket instead of a
+ * single request. When the server closes us with an auth-specific code
+ * (see AUTH_CLOSE_CODES above), that means "this token is dead," not
+ * "network blip" — reconnecting with the SAME token would just loop
+ * against the same rejection forever. ``tryRefresh`` gets one attempt to
+ * fix that before ``onAuthExpired`` is treated as final.
  */
 export interface WsClientConfig {
   baseUrl: string
   getToken: () => string | null
+  tryRefresh?: () => Promise<string | null>
+  onAuthExpired?: () => void
 }
 
 /**
@@ -272,7 +295,26 @@ class WsClient {
     this.connecting = true
     this.setState('connecting')
     const url = `${this.wsBaseUrl()}/v1/ws?token=${encodeURIComponent(token)}`
-    const ws = new WebSocket(url)
+    let ws: WebSocket
+    try {
+      ws = new WebSocket(url)
+    } catch (err) {
+      // The constructor can throw SYNCHRONOUSLY (malformed URL, a
+      // browser-enforced cap on rapid failed connection attempts,
+      // insecure-context/CSP rejection, …) rather than failing async via
+      // onerror/onclose. Without this guard `connecting` stays true
+      // forever, so every future connect() call — including
+      // scheduleReconnect()'s own timer — silently no-ops on the guard
+      // above: the indicator gets stuck on "connecting…" permanently,
+      // with no further attempts and no visible error, recoverable only
+      // by a full page reload / re-login. Treat it like any other
+      // connect failure instead: reset, drop to 'disconnected', retry.
+      console.error('wsClient: WebSocket construction failed', err)
+      this.connecting = false
+      this.setState('disconnected')
+      this.scheduleReconnect()
+      return
+    }
     this.socket = ws
 
     ws.onopen = () => {
@@ -354,16 +396,60 @@ class WsClient {
       }
     }
 
-    ws.onclose = () => {
+    ws.onclose = (ev: CloseEvent) => {
       this.socket = null
       this.connecting = false
       this.setState('disconnected')
+      if (AUTH_CLOSE_CODES.has(ev.code)) {
+        void this.handleAuthRejectedClose()
+        return
+      }
       this.scheduleReconnect()
     }
 
     ws.onerror = () => {
       // onerror is followed by onclose; let the close handler reconnect.
     }
+  }
+
+  /**
+   * The server just told us our credentials are no good (an auth-specific
+   * close code, not a network blip) — see AUTH_CLOSE_CODES. Blindly
+   * reconnecting with the same token would just loop against the same
+   * rejection forever with the indicator stuck red and no way out short
+   * of a manual page reload. Try a refresh first (the same recovery
+   * apiFetch gets on a 401); only escalate to onAuthExpired — and stop
+   * retrying — if that also fails, since at that point retrying truly
+   * cannot succeed.
+   */
+  private async handleAuthRejectedClose(): Promise<void> {
+    if (this.cfg.tryRefresh) {
+      const fresh = await this.cfg.tryRefresh().catch(() => null)
+      if (fresh) {
+        this.reconnectAttempt = 0
+        this.connect()
+        return
+      }
+    }
+    this.cfg.onAuthExpired?.()
+    // Deliberately no scheduleReconnect(): the token is confirmed dead,
+    // and nothing will fix it without a session-level action (re-login)
+    // that onAuthExpired is responsible for driving.
+  }
+
+  /**
+   * Push a freshly-refreshed access token over an OPEN connection so the
+   * server can extend the session without dropping the socket — the
+   * counterpart to ws_endpoint.py's `reauth` method + expiry watchdog.
+   * No-op if there's no open connection; the next connect() picks up the
+   * fresh token via getToken() regardless. Callers: AuthContext's
+   * proactive-refresh timer (see lib/api.ts's scheduleProactiveRefresh)
+   * calls this after every successful refresh so a live teleop session's
+   * socket never has to be torn down just because time passed.
+   */
+  reauth(token: string): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return
+    this.send({ id: this.frameId(), method: 'reauth', data: { token } })
   }
 
   disconnect(): void {
@@ -545,20 +631,31 @@ class WsClient {
    * https:// inputs; passes through ws:// or wss:// unchanged. Trims
    * trailing slashes so the ``+ '/v1/ws'`` append produces a clean URL. */
   private wsBaseUrl(): string {
-    // Dev: bypass the vite proxy for the ws. Vite's ws proxy wedges when
-    // the backend restarts under it (completes the upstream handshake but
-    // stops relaying the 101 to the browser), leaving the client looping
-    // connect→drop until vite is restarted / the page refreshed. Connect
-    // straight to the backend at the SAME host the page was loaded from
-    // (so it works whether you opened localhost on-box or the Pi's LAN IP
-    // remotely), on the backend port. HTTP still goes through vite. No-op
-    // in production builds (import.meta.env.DEV === false → uses the
-    // runtime baseUrl, which already targets the backend directly).
+    // Dev: bypass the vite proxy for the ws — but ONLY for the connection
+    // that actually targets the origin the SPA was served from. Vite's ws
+    // proxy wedges when the backend restarts under it (completes the
+    // upstream handshake but stops relaying the 101 to the browser),
+    // leaving the client looping connect→drop until vite is restarted /
+    // the page refreshed. Connecting straight to the backend at the SAME
+    // host the page was loaded from works around that (whether you opened
+    // localhost on-box or the Pi's LAN IP remotely), on the backend port.
+    // A multi-runtime connection to a DIFFERENT host (e.g. a peer added via
+    // ConnectDialog) isn't going through this page's vite proxy at all —
+    // substituting window.location.hostname for it would silently redirect
+    // that connection's socket back to the LOCAL backend instead of the
+    // remote one it was configured for. No-op in production builds
+    // (import.meta.env.DEV === false → uses the runtime baseUrl, which
+    // already targets the backend directly).
     if (import.meta.env.DEV && typeof window !== 'undefined') {
-      const env = import.meta.env as Record<string, string | undefined>
-      const port = env.VITE_WS_PORT || '8998'
-      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-      return `${proto}://${window.location.hostname}:${port}`
+      const sameOrigin = (() => {
+        try { return new URL(this.cfg.baseUrl).origin === window.location.origin } catch { return false }
+      })()
+      if (sameOrigin) {
+        const env = import.meta.env as Record<string, string | undefined>
+        const port = env.VITE_WS_PORT || '8998'
+        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+        return `${proto}://${window.location.hostname}:${port}`
+      }
     }
 
     let u = (this.cfg.baseUrl || '').replace(/\/+$/, '')
@@ -575,6 +672,8 @@ function _defaultClient(): WsClient {
   return new WsClient({
     baseUrl: typeof location !== 'undefined' ? location.origin : '',
     getToken: getAuthToken,
+    tryRefresh: defaultTryRefresh,
+    onAuthExpired: defaultOnAuthExpired,
   })
 }
 
