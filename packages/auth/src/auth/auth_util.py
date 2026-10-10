@@ -189,7 +189,7 @@ class AuthDependencies:
             logger.warning("Invalid shared secret provided")
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-        # Try Basic auth (METRC-style: Authorization: Basic base64(user_key:software_api_key))
+        # Try Basic auth (vendor-API style: Authorization: Basic base64(user_key:software_api_key))
         if isinstance(authorization, str) and authorization.lower().startswith("basic "):
             logger.debug("Attempting Basic auth authentication")
             try:

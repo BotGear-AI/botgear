@@ -29,7 +29,7 @@ from config.config import (
 # 2. The startup settings dump
 # --------------------------------------------------------------------------
 
-# Real field names from cannamatic's Config model.
+# Field names shaped like real app Config models.
 SECRET_FIELDS = [
     "postgres_password",
     "smtp_password",
@@ -55,7 +55,7 @@ NON_SECRET_FIELDS = [
     "ocr_credentials_file",   # a PATH — worth seeing
     "llm_model",
     "llm_provider",
-    "mock_dutchie_base_url",
+    "mock_vendor_base_url",
     "twilio_account_sid",
     "log_format",
 ]

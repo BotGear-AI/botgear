@@ -62,7 +62,7 @@ def assert_jwt_secret_configured(require: Optional[bool] = None) -> None:
     token forgery). Whether that also *raises* is decided by ``require``:
 
       - ``require=True``  -> raise (fail-hard). Set by apps that must never run on
-        the fallback (e.g. hyrule_api, via the ``require_jwt_secret`` DSL flag).
+        the fallback (via the ``require_jwt_secret`` DSL flag).
       - ``require=False`` -> warn only, keep running on the fallback. The default
         for localhost-first apps that must start with no env configured.
       - ``require=None``  -> defer to the ``REQUIRE_JWT_SECRET`` env var

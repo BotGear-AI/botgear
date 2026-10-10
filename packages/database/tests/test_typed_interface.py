@@ -1,4 +1,4 @@
-"""HYR-945: coverage for database.typed_interface.
+"""coverage for database.typed_interface.
 
 TypedDatabaseAdapter is a thin Pydantic<->dict wrapper over a DatabaseAdapter,
 and DomainService is a per-table facade over that. Both are pure delegation, so

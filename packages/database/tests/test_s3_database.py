@@ -1,4 +1,4 @@
-"""HYR-945: coverage for database.s3_database, the worst-covered module in the
+"""coverage for database.s3_database, the worst-covered module in the
 package (16.5% line / 5.0% branch).
 
 These run against moto's in-process S3 rather than a MagicMock. The adapter
@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from database.s3_database import S3Database
 from models.database_s3_config import DatabaseS3Config
 
-BUCKET = "hyrule-test-bucket"
+BUCKET = "test-bucket"
 REGION = "us-east-1"
 
 

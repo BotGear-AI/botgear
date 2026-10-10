@@ -14,7 +14,7 @@ if __name__ == "__main__":
     # Running either file by path puts src/database/ on sys.path as a plain
     # directory rather than importing it as a package, so its `from .record_transformer`
     # import dies with "attempted relative import with no known parent package".
-    # That is why this script failed at step 1 on every run before HYR-945.
+    # That is why this script used to fail at step 1 on every run.
 
     # Step 1: Flatten the table
     print(f"[1/2] Running convert_to_flattened on {table_name}...")

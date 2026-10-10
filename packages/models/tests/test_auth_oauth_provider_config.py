@@ -1,12 +1,12 @@
 """Regression test for a real, live secret leak (found + fixed 2026-09-15).
 
-/v1/oauth-config (templates/tpl/server.py.j2, generated into 14 apps
-including hyrule_api) built its response with
+/v1/oauth-config (templates/tpl/server.py.j2, generated into every
+app) built its response with
 `provider_config.model_dump()` then `JSONResponse(payload)` -- a raw dict,
 never filtered through FastAPI's response_model. AuthOauthProviderConfig.
 client_secret had no field-level exclusion, so the real OAuth client secret
 was served verbatim to callers, unauthenticated ones too (oauth_config_public
-defaults True everywhere except continuous_mfa). Live since 2026-04-03
+defaults True in most apps). Live since 2026-04-03
 (commit 4b39c9066, templates/tpl/server.py.j2's first version).
 
 Fix: Field(..., exclude=True) on client_secret -- enforced at the model

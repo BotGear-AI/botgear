@@ -1,4 +1,4 @@
-"""HYR-945: coverage for database.dynamodb_database against moto's DynamoDB.
+"""coverage for database.dynamodb_database against moto's DynamoDB.
 
 test_dynamodb_database.py already covers the #289 pagination fixes by calling
 the methods unbound with a fake `self`. That technique cannot reach __init__,
@@ -321,7 +321,7 @@ class TestEnsureTable:
 
 
 class TestBinaryAndSearch:
-    """The two methods DynamoDBDatabase was missing entirely until HYR-945.
+    """The two methods DynamoDBDatabase was missing entirely until coverage was added.
 
     Without them the class stayed abstract and `DynamoDBDatabase(config=...)`
     raised TypeError, so the dynamodb backend could never be constructed.

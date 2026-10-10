@@ -1,4 +1,4 @@
-"""HYR-945: regression guard for database.upgrade_table_to_flattened_and_typed.
+"""regression guard for database.upgrade_table_to_flattened_and_typed.
 
 This module is almost entirely an `if __name__ == "__main__"` block, which
 packages.coveragerc excludes, so these tests move the coverage number barely at

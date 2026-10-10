@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=83.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent_harness"
+version = "0.1.0"
+description = "Run filesystem-defined workflows on rented agent harnesses (Claude Code, Codex, ACP, ...)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+openai = ["openai"]
+anthropic = ["anthropic"]
+dev = ["pytest"]
+
+[project.scripts]
+agent-harness = "agent_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

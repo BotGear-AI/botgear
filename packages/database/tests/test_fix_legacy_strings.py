@@ -1,4 +1,4 @@
-"""HYR-945: coverage for database.fix_legacy_strings (was 0%, and unimportable).
+"""coverage for database.fix_legacy_strings (was 0%, and unimportable).
 
 The module was dead: it imported its siblings flat, so `import
 database.fix_legacy_strings` raised ModuleNotFoundError and running it by path

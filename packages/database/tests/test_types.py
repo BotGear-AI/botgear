@@ -1,4 +1,4 @@
-"""HYR-945: coverage for database.types.
+"""coverage for database.types.
 
 convert_objectid_to_str is the recursive ObjectId->str walk every MongoDB read
 path depends on for JSON serialization, and it was entirely unexecuted. The

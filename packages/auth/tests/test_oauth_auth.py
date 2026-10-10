@@ -1,7 +1,7 @@
 """Regression coverage for a real bug (found + fixed 2026-09-15): /v1/logout's
 handler called self.auth._verify_jwt(token) unconditionally, but that is a
 LocalAuthProvider-only internal -- OAuthAuthProvider has no such method, so
-under OAuth (hyrule_api's default auth_type) every logout call raised
+under OAuth (an app whose default auth_type is oauth) every logout call raised
 AttributeError, got silently swallowed by a bare except, and the endpoint
 always 401'd before ever reaching session cleanup.
 

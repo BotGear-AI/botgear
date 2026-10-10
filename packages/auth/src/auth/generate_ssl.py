@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from datetime import datetime, timedelta, timezone
 
-DEFAULT_SSL_DIR = os.path.join(tempfile.gettempdir(), "hyrule-api-ssl")
+DEFAULT_SSL_DIR = os.path.join(tempfile.gettempdir(), "app-selfsigned-ssl")
 DEFAULT_CERT_FILE = os.path.join(DEFAULT_SSL_DIR, "cert.pem")
 DEFAULT_KEY_FILE = os.path.join(DEFAULT_SSL_DIR, "key.pem")
 

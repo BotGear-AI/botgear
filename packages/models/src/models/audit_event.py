@@ -8,7 +8,7 @@ import yaml
 class AuditEvent(BaseModel):
     id: Optional[str] = Field(None, json_schema_extra={"example":"ae1a2b3c-0000-0000-0000-000000000001"}, description="Audit event id (UUID).")
     ts: Optional[datetime] = Field(None, json_schema_extra={"example":"2026-10-06T14:30:00Z"}, description="When the action completed (server clock, UTC).")
-    service: Optional[str] = Field(None, json_schema_extra={"example":"continuous_mfa"}, description="App that recorded the event.")
+    service: Optional[str] = Field(None, json_schema_extra={"example":"my_app"}, description="App that recorded the event.")
     tenant_id: Optional[str] = Field(None, json_schema_extra={"example":"t1a2b3c4-0000-0000-0000-000000000001"}, description="Tenant whose data was touched; null for system-wide events.")
     actor_user_id: Optional[str] = Field(None, json_schema_extra={"example":"john@company1.com"}, description="User who performed the action; null for a background job with no user.")
     actor_email: Optional[str] = Field(None, json_schema_extra={"example":"john@company1.com"}, description="Actor email cached for display, so reads need no user join.")

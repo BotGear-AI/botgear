@@ -1,4 +1,4 @@
-"""HYR-945: coverage for database.mongodb_database (was 22% line / 8.9% branch).
+"""coverage for database.mongodb_database (was 22% line / 8.9% branch).
 
 test_mongodb_database.py covers the three #291 regressions by calling methods
 unbound with a fake `self`. This file instantiates the real adapter with
@@ -38,7 +38,7 @@ def db(collection):
         adapter = MongoDBDatabase(
             DatabaseMongodbConfig(
                 mongodb_replica_uri="mongodb://localhost:27017",
-                mongodb_database_name="hyrule",
+                mongodb_database_name="testdb",
             )
         )
         adapter._client_cls = client_cls

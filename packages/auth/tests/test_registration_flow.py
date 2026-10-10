@@ -102,7 +102,7 @@ def test_proto_user_id_falls_back_to_email():
 
 
 def test_proto_user_carries_tenant_id_when_registration_has_one():
-    """on_new_registration hooks (e.g. cannamatic's tenant creation) stamp
+    """on_new_registration hooks (e.g. an app creating a tenant) stamp
     tenant_id onto the registration. The proto-user must pick it up."""
     reg = _registration(tenant_id="tenant-123")
     user = build_proto_user_from_registration(reg)
@@ -249,7 +249,7 @@ def test_hook_raising_falls_back_to_proto_user(db, caplog):
 
 
 def test_hook_wrong_signature_falls_back_to_proto_user(db, caplog):
-    """The metrc-style alias-mismatch case: hook accepts wrong arg count.
+    """The alias-mismatch case: hook accepts the wrong arg count.
     Today this is a crash; the helper turns it into a logged exception +
     proto-user fallback."""
     reg = _registration()
