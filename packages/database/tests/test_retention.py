@@ -5,12 +5,17 @@ Postgres tests run against a real server when RETENTION_TEST_PG_PORT is set
 RETENTION_TEST_PG_PASSWORD, default "postgres"); skipped otherwise.
 """
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
-from database.retention import RetentionPolicy, as_utc, is_older, run_retention
+import database.retention as retention_module
+from database.retention import (
+    RetentionPolicy, as_utc, is_older, run_retention, start_retention, stop_retention,
+)
 from database.tinydb import TinyDBDatabase
 from models.database_tinydb_config import DatabaseTinydbConfig
 
@@ -178,3 +183,88 @@ def test_postgres_rejects_bad_identifiers_and_non_time_columns(postgres):
             postgres._older_than_condition(None, "log_event", "note", "boolean", CUT)
     with pytest.raises(ValueError, match="doesn't exist"):
         postgres.prune_older_than("log_event", "nope", CUT)
+
+
+# ── start_retention / stop_retention ────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _clean_retention_threads():
+    yield
+    stop_retention()
+    for t in retention_module._threads.values():
+        t.join(timeout=1)
+    retention_module._threads.clear()
+
+
+def test_start_retention_without_policies_does_nothing(monkeypatch):
+    run_mock = MagicMock()
+    monkeypatch.setattr(retention_module, "run_retention", run_mock)
+
+    assert start_retention(lambda: None, [], name="no-policies") is None
+    run_mock.assert_not_called()
+
+
+def test_start_retention_runs_in_a_background_thread_and_stops_cleanly(monkeypatch):
+    policy = RetentionPolicy(table="job_stats", field="created", days=7)
+    ran = threading.Event()
+    run_mock = MagicMock(side_effect=lambda *a, **k: ran.set())
+    monkeypatch.setattr(retention_module, "run_retention", run_mock)
+
+    thread = start_retention(lambda: object(), [policy], initial_delay_seconds=0, name="runs-once")
+
+    assert ran.wait(timeout=2)
+    stop_retention()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    run_mock.assert_called_once()
+
+
+def test_start_retention_is_idempotent_while_the_thread_is_alive(monkeypatch):
+    monkeypatch.setattr(retention_module, "run_retention", lambda *a, **k: None)
+
+    first = start_retention(lambda: object(), [RetentionPolicy(table="t", field="f", days=1)],
+                             initial_delay_seconds=5, name="idempotent")
+    second = start_retention(lambda: object(), [RetentionPolicy(table="t", field="f", days=1)],
+                              initial_delay_seconds=5, name="idempotent")
+
+    assert first is second
+
+
+def test_start_retention_skips_the_run_when_get_db_returns_none(monkeypatch, caplog):
+    run_mock = MagicMock()
+    monkeypatch.setattr(retention_module, "run_retention", run_mock)
+    checked = threading.Event()
+
+    def get_db():
+        checked.set()
+        return None
+
+    with caplog.at_level("WARNING", logger="database.retention"):
+        thread = start_retention(get_db, [RetentionPolicy(table="t", field="f", days=1)],
+                                  initial_delay_seconds=0, name="no-db-yet")
+        assert checked.wait(timeout=2)
+        stop_retention()
+        thread.join(timeout=2)
+
+    run_mock.assert_not_called()
+    assert "no database client yet" in caplog.text
+
+
+def test_start_retention_survives_a_run_retention_exception(monkeypatch, caplog):
+    attempted = threading.Event()
+
+    def boom(*a, **k):
+        attempted.set()
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(retention_module, "run_retention", boom)
+
+    with caplog.at_level("ERROR", logger="database.retention"):
+        thread = start_retention(lambda: object(), [RetentionPolicy(table="t", field="f", days=1)],
+                                  initial_delay_seconds=0, name="survives-exception")
+        assert attempted.wait(timeout=2)
+        stop_retention()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert "retention run failed" in caplog.text

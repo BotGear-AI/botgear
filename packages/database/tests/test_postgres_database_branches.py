@@ -3,6 +3,7 @@
 The pool, connection and cursor are mocks; statements are captured and rendered
 from psycopg2's sql.Composable tree (no live connection is needed to read them).
 """
+import datetime
 import logging
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
@@ -60,6 +61,23 @@ def pg():
         state.db = PostgresDatabase(config)
         yield state
         state.db._pool = None
+
+
+@pytest.mark.parametrize("result,matched", [(None, False), (("session",), True)])
+def test_compare_and_update_item_is_one_conditional_statement(pg, result, matched):
+    pg.cur.fetchone.return_value = result
+
+    assert pg.db.compare_and_update_item(
+        "auth_session", "session", {"status": "active", "refresh_token_hash": "old"},
+        {"refresh_token_hash": "new", "last_used_at": 123},
+    ) is matched
+
+    assert pg.executed == [(
+        'UPDATE "auth_session" SET "refresh_token_hash" = %s, "last_used_at" = %s '
+        'WHERE id = %s AND "status" IS NOT DISTINCT FROM %s '
+        'AND "refresh_token_hash" IS NOT DISTINCT FROM %s RETURNING id',
+        ["new", 123, "session", "active", "old"],
+    )]
 
 
 # ── pool lifecycle ────────────────────────────────────────────────────────
@@ -217,6 +235,17 @@ def test_transaction_preserves_original_error_when_autocommit_reset_fails(pg):
 
     assert raised.value.__cause__ is original_cause
     pg.conn.rollback.assert_called_once()
+    pg.pool.putconn.assert_called_once_with(pg.conn, close=True)
+
+
+def test_transaction_discards_connection_when_autocommit_reset_fails_after_commit(pg):
+    pg.db._restore_autocommit = MagicMock(side_effect=RuntimeError("reset failed"))
+
+    with pg.db.transaction():
+        pass
+
+    pg.conn.commit.assert_called_once()
+    pg.conn.rollback.assert_not_called()
     pg.pool.putconn.assert_called_once_with(pg.conn, close=True)
 
 
@@ -562,3 +591,293 @@ def test_ensure_table_failure_is_logged_and_raised(pg, caplog):
         with pytest.raises(psycopg2.DatabaseError):
             pg.db.ensure_table(InvoiceLine)
     assert "Error ensuring table for model InvoiceLine" in caplog.text
+
+
+# --- retention: _older_than_condition ---------------------------------------
+
+CUTOFF = datetime.datetime(2026, 10, 6, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+def test_older_than_condition_text_type_widens_prefilter_and_casts(pg):
+    cond, params = pg.db._older_than_condition(pg.cur, "t", "created_at", "text", CUTOFF)
+
+    assert render(cond) == '"created_at" < %s AND cloudseeder_safe_timestamptz("created_at") < %s'
+    assert params[0] == "2026-10-05T12:00:00.000000Z"   # widened by a day
+    assert params[1] == CUTOFF
+    # the safe-cast function is (re)installed before it's referenced
+    assert any("cloudseeder_safe_timestamptz" in text and "CREATE OR REPLACE FUNCTION" in text
+               for text, _ in pg.executed)
+
+
+def test_older_than_condition_timestamp_with_time_zone(pg):
+    cond, params = pg.db._older_than_condition(pg.cur, "t", "created_at", "timestamp with time zone", CUTOFF)
+
+    assert render(cond) == '"created_at" < %s'
+    assert params == [CUTOFF]
+
+
+@pytest.mark.parametrize("data_type", ["timestamp without time zone", "date"])
+def test_older_than_condition_naive_timestamp_or_date_drops_tzinfo(pg, data_type):
+    cond, params = pg.db._older_than_condition(pg.cur, "t", "created_at", data_type, CUTOFF)
+
+    assert render(cond) == '"created_at" < %s'
+    assert params == [CUTOFF.replace(tzinfo=None)]
+
+
+def test_older_than_condition_number_type_is_a_per_row_case(pg):
+    cond, params = pg.db._older_than_condition(pg.cur, "t", "created_at", "bigint", CUTOFF)
+
+    assert render(cond) == 'CASE WHEN "created_at" > %s THEN "created_at" < %s ELSE "created_at" < %s END'
+    threshold, ms_cutoff, seconds_cutoff = params
+    assert threshold == 1e11
+    assert seconds_cutoff == int(CUTOFF.timestamp())
+    assert ms_cutoff == seconds_cutoff * 1000
+
+
+def test_older_than_condition_unsupported_type_raises(pg):
+    with pytest.raises(ValueError, match="not a time column"):
+        pg.db._older_than_condition(pg.cur, "t", "payload", "jsonb", CUTOFF)
+
+
+# --- retention: prune_older_than ---------------------------------------------
+
+def test_prune_older_than_dry_run_without_max_rows(pg):
+    pg.cur.fetchone.side_effect = [("bigint",), (7,)]
+
+    result = pg.db.prune_older_than("job_stats", "created_at", CUTOFF, dry_run=True)
+
+    assert result == 7
+    assert any(text.startswith("SELECT count(*) FROM") and "LIMIT" not in text
+               for text, _ in pg.executed)
+    assert not any(text.startswith("DELETE") for text, _ in pg.executed)
+
+
+def test_prune_older_than_dry_run_with_max_rows_caps_count(pg):
+    pg.cur.fetchone.side_effect = [("bigint",), (3,)]
+
+    result = pg.db.prune_older_than("job_stats", "created_at", CUTOFF, dry_run=True, max_rows=3)
+
+    assert result == 3
+    count_stmt = next(text for text, _ in pg.executed if text.startswith("SELECT count(*)"))
+    assert "LIMIT %s) sub" in count_stmt
+
+
+def test_prune_older_than_missing_column_raises(pg):
+    pg.cur.fetchone.side_effect = [None]
+
+    with pytest.raises(ValueError, match="doesn't exist"):
+        pg.db.prune_older_than("job_stats", "nope", CUTOFF, dry_run=True)
+
+
+def test_prune_older_than_skips_when_lock_held_by_another_process(pg):
+    pg.cur.fetchone.side_effect = [("bigint",), (False,)]
+
+    result = pg.db.prune_older_than("job_stats", "created_at", CUTOFF)
+
+    assert result == 0
+    assert not any(text.startswith("DELETE") for text, _ in pg.executed)
+
+
+def test_prune_older_than_deletes_one_short_batch_and_stops(pg):
+    pg.cur.fetchone.side_effect = [("bigint",), (True,)]
+    pg.cur.rowcount = 3  # fewer than batch_size -> loop stops after one pass
+    pg.cur.connection.autocommit = False
+
+    result = pg.db.prune_older_than("job_stats", "created_at", CUTOFF, batch_size=5000)
+
+    assert result == 3
+    delete_stmts = [text for text, _ in pg.executed if text.startswith("DELETE")]
+    assert len(delete_stmts) == 1
+    assert any(text.startswith("SELECT pg_advisory_unlock") for text, _ in pg.executed)
+    pg.cur.connection.commit.assert_called()
+
+
+# --- bulk_update_items --------------------------------------------------------
+
+def test_bulk_update_items_empty_input_returns_empty_without_touching_the_db(pg):
+    assert pg.db.bulk_update_items("job", {}) == []
+    assert pg.executed == []
+
+
+def test_bulk_update_items_all_rows_dropped_returns_empty_without_touching_the_db(pg):
+    # Every row's only field is None and include_nulls defaults to False.
+    assert pg.db.bulk_update_items("job", {"a": {"status": None}, "b": {"status": None}}) == []
+    assert pg.executed == []
+
+
+def test_bulk_update_items_single_group_casts_by_type_and_returns_rows(pg):
+    pg.cur.fetchall.return_value = [{"id": "a", "status": "done"}, {"id": "b", "status": "done"}]
+
+    result = pg.db.bulk_update_items("job", {
+        "a": {"status": "done", "count": 3},
+        "b": {"status": "done", "count": 5},
+    })
+
+    assert result == [{"id": "a", "status": "done"}, {"id": "b", "status": "done"}]
+    assert len(pg.executed) == 1
+    stmt, params = pg.executed[0]
+    assert stmt == (
+        'UPDATE "job" AS t SET "count" = v."count", "status" = v."status" '
+        'FROM (VALUES (%s::text, %s::BIGINT, %s::TEXT), (%s::text, %s::BIGINT, %s::TEXT)) '
+        'AS v(id, "count", "status") WHERE t.id = v.id RETURNING t.*'
+    )
+    assert params == ["a", 3, "done", "b", 5, "done"]
+
+
+def test_bulk_update_items_groups_rows_with_different_key_sets_separately(pg):
+    pg.cur.fetchall.side_effect = [[{"id": "a"}], [{"id": "b"}]]
+
+    pg.db.bulk_update_items("job", {
+        "a": {"status": "done"},
+        "b": {"count": 5},
+    })
+
+    assert len(pg.executed) == 2  # one UPDATE per distinct key-set group
+
+
+def test_bulk_update_items_id_field_is_never_written(pg):
+    pg.cur.fetchall.return_value = [{"id": "a"}]
+
+    pg.db.bulk_update_items("job", {"a": {"id": "a", "status": "done"}})
+
+    stmt, params = pg.executed[0]
+    assert "status" in stmt and '"id" = v."id"' not in stmt
+    assert params == ["a", "done"]
+
+
+def test_bulk_update_items_include_nulls_keeps_none_values(pg):
+    pg.cur.fetchall.return_value = [{"id": "a"}]
+
+    pg.db.bulk_update_items("job", {"a": {"status": None}}, include_nulls=True)
+
+    stmt, params = pg.executed[0]
+    assert '"status"' in stmt
+    assert params == ["a", None]
+
+
+def test_bulk_update_items_representative_type_skips_a_leading_none_in_the_group(pg):
+    # With include_nulls=True, row "a"'s None must not make the whole
+    # group's "count" column infer as TEXT when row "b" sets a real BIGINT.
+    pg.cur.fetchall.return_value = [{"id": "a"}, {"id": "b"}]
+
+    pg.db.bulk_update_items("job", {
+        "a": {"count": None},
+        "b": {"count": 7},
+    }, include_nulls=True)
+
+    stmt, _ = pg.executed[0]
+    assert '%s::BIGINT' in stmt
+
+
+def test_bulk_update_items_chunks_large_groups(pg):
+    pg.cur.fetchall.return_value = []
+    updates = {f"row-{i}": {"status": "done"} for i in range(501)}
+
+    pg.db.bulk_update_items("job", updates)
+
+    assert len(pg.executed) == 2  # 500 + 1, chunked at 500 rows per statement
+    assert pg.executed[0][1].count("done") == 500
+    assert pg.executed[1][1].count("done") == 1
+
+
+def test_bulk_update_items_wraps_and_reraises_on_error(pg, caplog):
+    pg.fail = psycopg2.DatabaseError("boom")
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        with pytest.raises(psycopg2.DatabaseError):
+            pg.db.bulk_update_items("job", {"a": {"status": "done"}})
+    assert "Error in bulk_update_items" in caplog.text
+
+
+# --- commit_intake_grouping_plan ---------------------------------------------
+
+def test_commit_intake_grouping_plan_happy_path(pg):
+    pg.cur.fetchone.return_value = {"metadata": {"v": 1}}
+    pg.cur.fetchall.return_value = [{"id": "img-1", "metadata": {"v": 1}}]
+    pg.cur.rowcount = 1
+
+    pg.db.commit_intake_grouping_plan(
+        "session-1", {"v": 1}, {"v": 2},
+        {"img-1": {"expected": {"v": 1}, "new": {"v": 2}}},
+    )
+
+    pg.conn.commit.assert_called_once()
+    pg.conn.rollback.assert_not_called()
+    pg.pool.putconn.assert_called_once_with(pg.conn)
+    assert pg.conn.autocommit is True
+
+
+def test_commit_intake_grouping_plan_session_disappeared(pg):
+    pg.cur.fetchone.return_value = None
+
+    with pytest.raises(RuntimeError, match="session disappeared"):
+        pg.db.commit_intake_grouping_plan("session-1", {}, {}, {})
+
+    # A business-logic failure still rolls back and returns the connection
+    # normally via the inner finally (autocommit restored, conn=None) --
+    # the outer except's close=True path is reserved for when that finally
+    # block's own putconn fails (see test below).
+    pg.conn.rollback.assert_called_once()
+    pg.pool.putconn.assert_called_once_with(pg.conn)
+    assert pg.conn.autocommit is True
+
+
+def test_commit_intake_grouping_plan_session_metadata_changed(pg):
+    pg.cur.fetchone.return_value = {"metadata": {"v": 999}}
+
+    with pytest.raises(RuntimeError, match="session changed before commit"):
+        pg.db.commit_intake_grouping_plan("session-1", {"v": 1}, {"v": 2}, {})
+
+    pg.conn.rollback.assert_called_once()
+
+
+def test_commit_intake_grouping_plan_image_set_changed(pg):
+    pg.cur.fetchone.return_value = {"metadata": {"v": 1}}
+    pg.cur.fetchall.return_value = []  # the requested image id no longer exists
+
+    with pytest.raises(RuntimeError, match="photo set changed before commit"):
+        pg.db.commit_intake_grouping_plan(
+            "session-1", {"v": 1}, {"v": 2},
+            {"img-1": {"expected": {"v": 1}, "new": {"v": 2}}},
+        )
+
+
+def test_commit_intake_grouping_plan_image_metadata_changed(pg):
+    pg.cur.fetchone.return_value = {"metadata": {"v": 1}}
+    pg.cur.fetchall.return_value = [{"id": "img-1", "metadata": {"v": 999}}]
+
+    with pytest.raises(RuntimeError, match=r"photo img-1 changed before commit"):
+        pg.db.commit_intake_grouping_plan(
+            "session-1", {"v": 1}, {"v": 2},
+            {"img-1": {"expected": {"v": 1}, "new": {"v": 2}}},
+        )
+
+
+def test_commit_intake_grouping_plan_image_update_rowcount_mismatch(pg):
+    pg.cur.fetchone.return_value = {"metadata": {"v": 1}}
+    pg.cur.fetchall.return_value = [{"id": "img-1", "metadata": {"v": 1}}]
+    pg.cur.rowcount = 0
+
+    with pytest.raises(RuntimeError, match=r"photo img-1 failed to update"):
+        pg.db.commit_intake_grouping_plan(
+            "session-1", {"v": 1}, {"v": 2},
+            {"img-1": {"expected": {"v": 1}, "new": {"v": 2}}},
+        )
+
+    pg.conn.rollback.assert_called_once()
+
+
+def test_commit_intake_grouping_plan_session_update_rowcount_mismatch(pg):
+    pg.cur.fetchone.return_value = {"metadata": {"v": 1}}
+    pg.cur.rowcount = 0  # no images => this is the only rowcount check reached
+
+    with pytest.raises(RuntimeError, match="session failed to update"):
+        pg.db.commit_intake_grouping_plan("session-1", {"v": 1}, {"v": 2}, {})
+
+    pg.conn.rollback.assert_called_once()
+
+
+def test_commit_intake_grouping_plan_discards_connection_on_acquire_failure(pg):
+    pg.pool.getconn.side_effect = OperationalError("pool exhausted")
+
+    with pytest.raises(OperationalError):
+        pg.db.commit_intake_grouping_plan("session-1", {}, {}, {})

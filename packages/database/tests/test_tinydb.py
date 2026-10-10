@@ -112,3 +112,25 @@ def test_copy_table(temp_db):
     assert len(dest_items) == 3
     dest_uuids = {item["uuid"] for item in dest_items}
     assert dest_uuids == {"1", "2", "3"}
+
+
+def test_bulk_update_items_default_implementation_loops_update_item(temp_db):
+    # DatabaseAdapter.bulk_update_items' default falls back to one
+    # update_item() per row; adapters that can push a real multi-row
+    # UPDATE down (Postgres) override it instead.
+    temp_db.insert_item("test", "1", {"uuid": "1", "value": "a"})
+    temp_db.insert_item("test", "2", {"uuid": "2", "value": "b"})
+
+    results = temp_db.bulk_update_items("test", {
+        "1": {"value": "updated-a"},
+        "2": {"value": "updated-b"},
+        "missing": {"value": "ignored"},  # update_item on a missing row returns falsy
+    })
+
+    assert {r["value"] for r in results} == {"updated-a", "updated-b"}
+    assert temp_db.get_item("test", "1")["value"] == "updated-a"
+
+
+def test_compare_and_update_item_default_implementation_raises(temp_db):
+    with pytest.raises(NotImplementedError):
+        temp_db.compare_and_update_item("test", "1", {"value": "a"}, {"value": "b"})

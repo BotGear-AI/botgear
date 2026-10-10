@@ -464,3 +464,22 @@ async def test_fast_reflex_ignores_the_workflow_prompt(workspace):
     engine = _engine(workspace, wf, [script_call(STT, "listen", {})], tools)
     await engine.run()
     assert tools.count("power_set") == 0
+
+
+# ─── timeout_seconds: 0 ─────────────────────────────────────────────────
+
+
+def test_timeout_seconds_zero_means_no_wall_clock_limit(workspace):
+    import math
+    assert _engine(workspace, _wf(timeout_seconds=0), [], _Tools([]))._deadline() == math.inf
+    assert _engine(workspace, _wf(timeout_seconds=5), [], _Tools([]))._deadline() < math.inf
+
+
+@pytest.mark.asyncio
+async def test_unlimited_run_still_ends_normally(workspace):
+    tools = _Tools(["hello"])
+    engine = _engine(workspace, _wf(timeout_seconds=0, max_steps=3, exit_on_phrase=None, loop_on_timeout=None), [
+        script_call(STT, "listen", {}), script_done("ok"),
+    ], tools)
+    record = await engine.run()
+    assert record.status == "success"

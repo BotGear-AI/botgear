@@ -1,7 +1,7 @@
 import os
 import pytest
 from unittest.mock import patch, MagicMock
-from psycopg2 import OperationalError
+from psycopg2 import OperationalError, sql
 from database.postgres_database import PostgresDatabase
 from models.database_postgres_config import DatabasePostgresConfig
 
@@ -50,6 +50,41 @@ def test_insert_and_get_item(postgres_db):
     result = postgres_db.get_item("test", "1")
     assert result["id"] == "1"
     assert result["value"] == "foo"
+
+
+def _render_sql(statement):
+    if isinstance(statement, sql.SQL):
+        return statement.string
+    if isinstance(statement, sql.Identifier):
+        return ".".join(f'"{part}"' for part in statement.strings)
+    if isinstance(statement, sql.Placeholder):
+        return statement._wrapped if statement._wrapped is not None else "%s"
+    if isinstance(statement, sql.Composed):
+        return "".join(_render_sql(part) for part in statement.seq)
+    raise TypeError(f"Unexpected SQL node: {type(statement).__name__}")
+
+
+def test_prepare_insert_statement_controls_returning_and_serializes_values(postgres_db):
+    item = {"id": "1", "paths": ["/docs"]}
+
+    statement, values = postgres_db.prepare_insert_statement("search_spec", item)
+    assert _render_sql(statement).endswith("RETURNING *")
+    assert values == ["1", '["/docs"]']
+
+    statement, values = postgres_db.prepare_insert_statement(
+        "search_spec", item, returning=False
+    )
+    assert not _render_sql(statement).endswith("RETURNING *")
+    assert values == ["1", '["/docs"]']
+
+
+@pytest.mark.parametrize(
+    "item, message",
+    [({}, "Cannot insert empty item"), ({"name": "missing id"}, "must contain 'id'")],
+)
+def test_prepare_insert_statement_validates_item(postgres_db, item, message):
+    with pytest.raises(ValueError, match=message):
+        postgres_db.prepare_insert_statement("search_spec", item)
 
 
 def test_successful_transaction_executes_statements_in_order_and_commits(postgres_db):

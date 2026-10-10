@@ -122,6 +122,22 @@ def test_db_missing_raises():
         verify_and_register(None, "anything")
 
 
+def test_registration_with_no_email_is_refused_before_any_state_mutation(db):
+    """A registration row predating the user_id==email enforcement can have
+    no email at all (the field is optional on the model). There is no
+    trustworthy identity to verify in that case -- refuse it, and before
+    mutating state, so a refused verify doesn't leave the registration
+    stuck 'verified' with no user created."""
+    reg = _registration(email=None)
+    db.insert_item("registration", reg["id"], reg)
+
+    with pytest.raises(ValueError, match="no email; cannot verify"):
+        verify_and_register(db, reg["id"])
+
+    assert db.get_item("registration", reg["id"])["state"] == "registered"
+    assert db.get_item("user", reg["user_id"]) is None
+
+
 def test_already_verified_is_idempotent(db):
     """Re-clicking the link must not re-insert a user or re-run the hook."""
     reg = _registration(state="verified")

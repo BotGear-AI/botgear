@@ -6,6 +6,7 @@ yet. ASCII only, so an old Windows console code page can't choke on it.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import sys
 import threading
@@ -69,6 +70,60 @@ def _has_users() -> Optional[bool]:
         return None
 
 
+# Console browsers webbrowser can fall back to on a display-less box; opening
+# one would take over the terminal BotGear is printing to.
+_TEXT_BROWSERS = {"lynx", "w3m", "links", "elinks", "www-browser", "browsh"}
+
+
+def headless_reason(env: Optional[dict] = None, platform: Optional[str] = None,
+                    interactive: Optional[bool] = None) -> Optional[str]:
+    """Why this process can't usefully open a browser, or None if it can.
+
+    Headless = nobody is sitting at a screen attached to this process: a
+    service (systemd, launchd, Windows service), a container, CI, an SSH
+    session, or — on Linux/BSD — no X11/Wayland display at all.
+    """
+    env = os.environ if env is None else env
+    platform = sys.platform if platform is None else platform
+    if interactive is None:
+        try:
+            interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        except (AttributeError, ValueError):
+            interactive = False
+    if env.get("BOTGEAR_RESTARTED"):
+        return "restart"
+    if env.get("CI"):
+        return "CI"
+    if env.get("SSH_CONNECTION") or env.get("SSH_TTY"):
+        return "SSH session"
+    if env.get("container") or os.path.exists("/.dockerenv"):
+        return "container"
+    if not interactive:
+        return "not started from a terminal"
+    if platform.startswith(("linux", "freebsd", "openbsd", "netbsd")) and not (
+            env.get("DISPLAY") or env.get("WAYLAND_DISPLAY")):
+        return "no graphical display"
+    return None
+
+
+def open_browser(url: str) -> str:
+    """Open ``url`` in the default GUI browser. Returns a short status line."""
+    reason = headless_reason()
+    if reason:
+        return f"Not opening a browser ({reason}) -- open the link above yourself."
+    try:
+        import webbrowser
+        browser = webbrowser.get()
+        name = (getattr(browser, "name", "") or type(browser).__name__).lower()
+        if any(t in name for t in _TEXT_BROWSERS):
+            return "No graphical browser found -- open the link above yourself."
+        if browser.open(url, new=2):
+            return "Opening it in your browser..."
+    except Exception:  # noqa: BLE001 — webbrowser.Error, no browser registered, ...
+        pass
+    return "Couldn't open a browser -- open the link above yourself."
+
+
 def render(version: str, port: int, ssl: bool, data_dir: Optional[str], has_users: Optional[bool]) -> str:
     scheme = "https" if ssl else "http"
     local = f"{scheme}://localhost:{port}"
@@ -107,16 +162,22 @@ def render(version: str, port: int, ssl: bool, data_dir: Optional[str], has_user
 
 def schedule(settings, version: str, delay_s: float = 1.5) -> None:
     """Print the banner shortly after startup, so it lands below uvicorn's
-    'running on' line instead of scrolling above it."""
+    'running on' line instead of scrolling above it; then, when
+    ``open_browser`` is on and someone is at the screen, open the browser."""
     def _print() -> None:
         try:
+            port = int(getattr(settings, "port", None) or 8998)
+            ssl = bool(getattr(settings, "ssl_enabled", False))
             text = render(
                 version=version,
-                port=int(getattr(settings, "port", None) or 8998),
-                ssl=bool(getattr(settings, "ssl_enabled", False)),
+                port=port,
+                ssl=ssl,
                 data_dir=getattr(settings, "data_dir", None),
                 has_users=_has_users(),
             )
+            if getattr(settings, "open_browser", False):
+                status = open_browser(f"{'https' if ssl else 'http'}://localhost:{port}")
+                text += f"  {status}\n"
             sys.stdout.write("\n" + text + "\n")
             sys.stdout.flush()
         except Exception:  # noqa: BLE001

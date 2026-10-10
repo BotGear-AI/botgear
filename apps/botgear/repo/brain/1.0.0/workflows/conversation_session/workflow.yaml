@@ -39,10 +39,10 @@ preferred_model: qwen3:8b
 # Backstops only — the exit keyword terminates the session, not these.
 # Sized generously so a long conversation never trips them: idle
 # re-listens (loop_on_timeout) don't consume steps, so max_steps bounds
-# only real exchanges (~2 steps each → ~250 exchanges). timeout_seconds
-# is the wall-clock ceiling for the whole session (24h).
+# only real exchanges (~2 steps each → ~250 exchanges). No wall-clock
+# ceiling (timeout_seconds: 0) — the session runs until the exit word.
 max_steps: 500
-timeout_seconds: 86400
+timeout_seconds: 0
 requires_human_approval: false
 # Direct light/switch commands ("turn the light off") run without the
 # model — see brain/reflex_engine.py and packages/rlx_decision/README.md.

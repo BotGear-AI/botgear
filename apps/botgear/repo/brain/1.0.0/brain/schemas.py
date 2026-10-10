@@ -214,7 +214,7 @@ class Workflow(BaseModel):
     # before the run starts.
     configurations: List[RunConfiguration] = Field(default_factory=list)
     max_steps: int = 8
-    timeout_seconds: int = 120
+    timeout_seconds: int = 120          # 0 = no wall-clock limit
     max_tokens_per_run: Optional[int] = None
     requires_human_approval: bool = False
     # Progressive tool disclosure. Off by default — zero behavior

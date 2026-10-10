@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import logging
+import math
 import re
 import time
 import uuid
@@ -346,6 +347,12 @@ class WorkflowEngine:
         if isinstance(text, str) and text.strip():
             self._recent_spoken.append((time.monotonic(), text))
             self._recent_spoken = self._recent_spoken[-8:]
+
+    def _deadline(self) -> float:
+        """Wall-clock end of the run; ``timeout_seconds <= 0`` means none."""
+        if self.workflow.timeout_seconds <= 0:
+            return math.inf
+        return time.monotonic() + self.workflow.timeout_seconds
 
     def _is_self_echo(self, action: ProposedAction, result: ToolResult) -> bool:
         """True when a ``listen`` result is (mostly) the robot's own recent
@@ -715,7 +722,7 @@ class WorkflowEngine:
     # ─── step loop ─────────────────────────────────────────────────
 
     async def _loop(self, messages: List[ChatMessage], tools: List[ToolDescriptor]) -> None:
-        deadline = time.monotonic() + self.workflow.timeout_seconds
+        deadline = self._deadline()
         while True:
             if self._cancel_event.is_set():
                 raise asyncio.CancelledError()
@@ -1111,7 +1118,7 @@ class WorkflowEngine:
         system = _system_prompt(self.workflow, session=True) + "\n\n" + note + "\n\n" + context_body
         self._set_phase("starting", "connecting")
         await mind.open(system_prompt=system, tools=offered, handler=self._session_tool, model=self._model_id)
-        deadline = time.monotonic() + self.workflow.timeout_seconds
+        deadline = self._deadline()
         try:
             if listen is None:
                 turn = await self._session_turn(

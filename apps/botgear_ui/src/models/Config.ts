@@ -4,6 +4,7 @@ export interface Config {
   id?: string;
   port?: number;
   ssl_enabled?: boolean;
+  open_browser?: boolean;
   database_type: "postgres" | "lowdb" | "sqlite" | "filesystem" | "none";
   data_dir?: string;
   repo_dir?: string;
@@ -21,6 +22,7 @@ export function createEmptyConfig(): Config {
     id: "default",
     port: 8998,
     ssl_enabled: true,
+    open_browser: true,
     database_type: "sqlite",
     data_dir: "data",
     repo_dir: "repo",
@@ -63,6 +65,11 @@ export const ConfigSchema = {
     "ssl_enabled": {
       "type": "boolean",
       "description": "Serve HTTPS/WSS using a self-signed cert (ssl/cert.pem, ssl/key.pem \u2014 auto-generated on first boot if missing). Overrides ConfigBase's default-off so a fresh clone matches botgear_ui's dev server, which auto-detects and reuses that same cert and derives ws vs wss from its own https/http choice \u2014 leaving this False while the UI has picked up an https cert breaks the WebSocket handshake (endless 'disconnected \u2014 retrying').",
+      "example": true
+    },
+    "open_browser": {
+      "type": "boolean",
+      "description": "Open the default web browser at this runtime's address when it starts. Only on an interactive start (launched from a terminal or console, with a graphical display on Linux); never on a restart or self-update, so headless robots and services are unaffected. Set BOTGEAR_OPEN_BROWSER=false to turn it off.",
       "example": true
     },
     "database_type": {

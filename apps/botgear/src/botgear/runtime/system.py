@@ -123,6 +123,9 @@ def restart() -> None:
         pass
     if cwd and os.path.isdir(cwd):
         os.chdir(cwd)
+    # Inherited by the new process image: tells startup this is a restart
+    # (graceful or self-update), not a fresh launch — e.g. don't open a browser.
+    os.environ["BOTGEAR_RESTARTED"] = "1"
     os.execv(exec_path, new_argv)  # process image is replaced here
 
 

@@ -314,7 +314,7 @@ next loop iteration. `CancelledError` propagates through the awaits
 |---|---|---|
 | `max_steps` | top of every loop iteration via [`check_max_steps`](brain/safety_gate.py) | `workflow.max_steps=N exhausted (used N)` |
 | `max_tokens_per_run` | top of every loop iteration via [`check_max_tokens`](brain/safety_gate.py); skipped when null | `workflow.max_tokens_per_run=N exceeded (used N)` |
-| `timeout_seconds` | top of every loop iteration (`time.monotonic() > deadline`) | `workflow.timeout_seconds=N exceeded` |
+| `timeout_seconds` | top of every loop iteration (`time.monotonic() > deadline`) | `workflow.timeout_seconds=N exceeded` (`0` = no wall-clock limit) |
 | `topic_pattern` allow/deny | per tool call via `check_tool_call` against `allowed_tools.yaml` | `denied by blocked rule …` / `no allow rule matched …` |
 | `terminate_on` mismatch | when model emits `done` before required actions ran | `model emitted done but terminate_on actions were not satisfied: missing [...]` |
 | `requires_human_approval` | between each tool call when the workflow declares it | parks the run; not a guard failure on its own |

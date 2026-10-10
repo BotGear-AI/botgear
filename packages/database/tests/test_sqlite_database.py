@@ -43,6 +43,58 @@ def test_update_item(sqlite_db):
     assert updated["uuid"] == "2"
     assert updated["value"] == "baz"
 
+
+def test_compare_and_update_item_is_conditional_and_persisted(sqlite_db):
+    sqlite_db.insert_item("test", "session", {"value": "old", "type": "active", "name": "tenant-a"})
+
+    assert sqlite_db.compare_and_update_item(
+        "test", "session", {"value": "old", "type": "active"}, {"value": "new"},
+    )
+    assert not sqlite_db.compare_and_update_item("test", "session", {"value": "old"}, {"value": "replay"})
+    sqlite_db.update_item("test", "session", {"type": "revoked"})
+    assert not sqlite_db.compare_and_update_item(
+        "test", "session", {"value": "new", "type": "active"}, {"value": "resurrected"},
+    )
+    row = sqlite_db.get_item("test", "session")
+    assert row["value"] == "new" and row["type"] == "revoked" and row["name"] == "tenant-a"
+    assert not sqlite_db.compare_and_update_item("test", "missing", {"value": "old"}, {"value": "new"})
+
+
+@pytest.mark.parametrize("expected,updates", [
+    ({}, {"value": "new"}),
+    ({"value": "old"}, {}),
+    ({"value": "old"}, {"id": "changed"}),
+    ({"value OR 1=1": "old"}, {"value": "new"}),
+    ({"value": "old"}, {"value; DROP TABLE test": "new"}),
+])
+def test_compare_and_update_rejects_unsafe_or_unconditional_writes(sqlite_db, expected, updates):
+    sqlite_db.insert_item("test", "row", {"value": "old"})
+
+    with pytest.raises(ValueError):
+        sqlite_db.compare_and_update_item("test", "row", expected, updates)
+
+    assert sqlite_db.get_item("test", "row")["value"] == "old"
+
+
+def test_compare_and_update_binds_values_and_matches_null(sqlite_db):
+    sqlite_db.insert_item("test", "row", {"value": "old"})
+    value = "new'; DROP TABLE test; --"
+
+    assert sqlite_db.compare_and_update_item("test", "row", {"name": None}, {"value": value})
+    assert sqlite_db.get_item("test", "row")["value"] == value
+
+
+def test_compare_and_update_preserves_scalar_types(sqlite_db):
+    sqlite_db.insert_item("test", "typed", {"value": 42, "type": True, "name": None})
+
+    assert sqlite_db.compare_and_update_item(
+        "test", "typed", {"value": 42, "type": True, "name": None}, {"value": 43, "type": False},
+    )
+    row = sqlite_db.get_item("test", "typed")
+    assert row["value"] == 43 and isinstance(row["value"], int)
+    assert row["type"] is False and row["name"] is None
+
+
 def test_delete_item(sqlite_db):
     sqlite_db.insert_item("test", "3", {"uuid": "3", "value": "del"})
     sqlite_db.delete_item("test", "3")

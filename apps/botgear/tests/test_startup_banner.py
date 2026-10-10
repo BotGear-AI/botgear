@@ -75,3 +75,59 @@ def test_ssl_cert_lives_under_the_working_dir(monkeypatch, tmp_path):
     assert key == tmp_path / "ssl" / "key.pem"
     if os.name != "nt":
         assert stat.S_IMODE((tmp_path / "ssl").stat().st_mode) == 0o700
+
+
+# ─── open_browser: only when someone is at a screen ─────────────────────
+
+DESKTOP = {"DISPLAY": ":0"}
+
+
+@pytest.mark.parametrize("env, plat, tty, expect", [
+    (DESKTOP, "linux", True, None),
+    ({"WAYLAND_DISPLAY": "wayland-0"}, "linux", True, None),
+    ({}, "darwin", True, None),
+    ({}, "win32", True, None),
+    ({}, "linux", True, "no graphical display"),          # headless Pi / server
+    (DESKTOP, "linux", False, "not started from a terminal"),  # systemd, nohup
+    ({**DESKTOP, "SSH_CONNECTION": "1 2 3 4"}, "linux", True, "SSH session"),
+    ({"SSH_TTY": "/dev/pts/1"}, "darwin", True, "SSH session"),
+    ({**DESKTOP, "CI": "true"}, "linux", True, "CI"),
+    ({**DESKTOP, "container": "podman"}, "linux", True, "container"),
+    ({**DESKTOP, "BOTGEAR_RESTARTED": "1"}, "linux", True, "restart"),
+])
+def test_headless_reason(env, plat, tty, expect, monkeypatch):
+    monkeypatch.setattr(startup_banner.os.path, "exists", lambda p: False, raising=False)
+    assert startup_banner.headless_reason(env=env, platform=plat, interactive=tty) == expect
+
+
+def test_open_browser_skips_headless(monkeypatch):
+    opened = []
+    monkeypatch.setattr(startup_banner, "headless_reason", lambda: "no graphical display")
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", lambda *a, **k: opened.append(a) or True)
+    assert "no graphical display" in startup_banner.open_browser("https://localhost:8998")
+    assert opened == []
+
+
+def test_open_browser_refuses_text_browsers(monkeypatch):
+    import webbrowser
+    monkeypatch.setattr(startup_banner, "headless_reason", lambda: None)
+    lynx = webbrowser.GenericBrowser("lynx")
+    monkeypatch.setattr(webbrowser, "get", lambda *a: lynx)
+    monkeypatch.setattr(lynx, "open", lambda *a, **k: pytest.fail("must not launch lynx"))
+    assert "No graphical browser" in startup_banner.open_browser("https://localhost:8998")
+
+
+def test_open_browser_opens_on_a_desktop(monkeypatch):
+    import webbrowser
+    calls = []
+
+    class Fake(webbrowser.BaseBrowser):
+        def open(self, url, new=0, autoraise=True):
+            calls.append((url, new))
+            return True
+
+    monkeypatch.setattr(startup_banner, "headless_reason", lambda: None)
+    monkeypatch.setattr(webbrowser, "get", lambda *a: Fake("xdg-open"))
+    assert startup_banner.open_browser("https://localhost:8998") == "Opening it in your browser..."
+    assert calls == [("https://localhost:8998", 2)]
