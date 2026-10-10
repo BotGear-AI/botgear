@@ -121,7 +121,7 @@ def test_encode_tools_falls_back_to_proxy_qualified_on_collision():
     """Three proxies of the same type exposing the same action (e.g.
     three tasmota switches' power_set) — only the first keeps the bare
     name; the rest get <proxy_id>_<action>, not opaque indices (see
-    docs/TODO_BRAIN_GAP_FIXES.md Gap 1)."""
+    repo/brain/1.0.0/README.md "Tool names")."""
     tools = [
         ToolDescriptor(topic="/tasmota/office-cord/control", action="power_set"),
         ToolDescriptor(topic="/tasmota/sonoff-cord/control", action="power_set"),

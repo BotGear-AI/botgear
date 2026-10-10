@@ -220,6 +220,20 @@ def test_transaction_preserves_original_error_when_autocommit_reset_fails(pg):
     pg.pool.putconn.assert_called_once_with(pg.conn, close=True)
 
 
+def test_transaction_survives_a_post_commit_autocommit_reset_failure(pg):
+    # The commit already succeeded and is durable; a failure resetting
+    # autocommit afterward must not raise to the caller (who could mistake
+    # it for a failed commit and retry, duplicating the committed write).
+    # The now-unusable connection is still discarded rather than reused.
+    pg.db._restore_autocommit = MagicMock(side_effect=KeyboardInterrupt())
+
+    with pg.db.transaction():
+        pass
+
+    pg.conn.commit.assert_called_once()
+    pg.pool.putconn.assert_called_once_with(pg.conn, close=True)
+
+
 def test_transaction_returns_connection_on_base_exception(pg):
     with pytest.raises(KeyboardInterrupt):
         with pg.db.transaction():

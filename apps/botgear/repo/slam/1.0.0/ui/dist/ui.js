@@ -18730,7 +18730,7 @@ function SlamFullView({ proxy }) {
 							label: "motor_control",
 							value: state.motor_control_connected ? "● connected" : "○ waiting",
 							valueClass: state.motor_control_connected ? "text-emerald-400" : "text-amber-400",
-							hint: "Odometry input — from motor_control's commanded output (no wheel encoders on this robot, see docs/TODO_SLAM.md)."
+							hint: "Odometry input — motor_control's commanded output (no wheel encoders on this robot); the fallback when odometry_source is visual_flow."
 						}),
 						/* @__PURE__ */ jsx(Field, {
 							label: "oakd",
@@ -18741,7 +18741,7 @@ function SlamFullView({ proxy }) {
 						/* @__PURE__ */ jsx(Field, {
 							label: "backend",
 							value: state.mapping_backend ?? "—",
-							hint: "Pluggable mapping backend — see docs/TODO_SLAM.md §5.2a. 'hand_rolled' has no drift correction by design."
+							hint: "Pluggable mapping backend — 'hand_rolled' has no drift correction by design."
 						}),
 						/* @__PURE__ */ jsx(Field, {
 							label: "map",

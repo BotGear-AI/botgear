@@ -10,8 +10,10 @@ lands (mirror the same "verified against the code" discipline the old
 
 Status legend: ✅ done · 🔜 next · ⬜ planned · ⚠️ risk/decision open
 
-Status date: 2026-06-27 (design; nothing in this doc is built yet except
-the primitives in §2).
+Status date: 2026-10-10 — the primitives in §2, versioning (§7), the
+framework update check and the framework self-update MVP are built;
+service update (axis A), the A/B layout, rollback/migrations and polish
+are not.
 
 Prior art it **extends, never forks** — now-closed TODO docs whose
 durable content was migrated into `repo/README.md` / `AGENTS.md` (see
@@ -65,14 +67,16 @@ machinery (A/B layout, backup/rollback, migrations, version surfacing).
 | Per-version UI bundle serving: `/repo/<name>/<ver>/ui.js` (no-cache + ETag) | ✅ | `runtime/script_routes.py:106-127` |
 | Public Releases as the runtime + registry source | ⚠️ | runtime releases ✅; the public service catalog is gone — `../TODO_CROSS_PLATFORM_RELEASE.md` Phase 1, `tools/publish_services.py` |
 
-### Gaps this feature closes
+Also built (documented in `../README.md` "Updating a packaged install"):
+the framework update check (`GET /v1/update/check`, Updates page), framework
+self-update MVP (`POST /v1/update/framework`, `runtime/update_apply.py`),
+the UI showing the running version, and tag-driven `X.Y.Z` releases.
+
+### Gaps still open
 - ⬜ No "what can be upgraded?" detector (installed-vs-latest, framework or service).
 - ⬜ `min_runtime` is captured (`build_services.py:160`) but **enforced nowhere**.
-- ⬜ No framework self-replace: nothing downloads a new bundle, swaps it, and re-execs into it.
 - ⬜ `service_proxy` rows are pinned to `name@OLD_version`; load/install of a new version makes a **parallel** dir and leaves instances on the old one (`lifecycle.py:225-229`, `subprocess.py:32-44`). No "repoint + rolling restart".
 - ⬜ No backup / rollback / data-migration machinery.
-- ⬜ UI `RuntimeMeta.version` is declared but hardcoded `null` (`RuntimeConnection.ts:52,90`) — the UI can't even show the running version yet.
-- ⬜ Versioning is `latest`/sha-based in CI; no monotonic, pollable, `v`-less release scheme (§7).
 
 ---
 
@@ -311,87 +315,16 @@ MAJOR.MINOR jumps (D4).
 
 ---
 
-## 7. Versioning (Phase 0 — prerequisite) ✅ implemented 2026-06-27
+## 7. Versioning ✅
 
-**Status (2026-06-27):** ✅ applied — `.github/workflows/package_botgear.yml`
-(top-level `env: VERSION_PREFIX: "0.1."`; `VERSION: "${{ env.VERSION_PREFIX }}${{ github.run_number }}"`
-on the Build step; "Resolve version" collapsed to the same single source;
-the `botgear-v*` tag trigger removed; a dispatch-gated `Publish Release`
-that tags + titles with the **bare** version, no `v`); `build_arm64.sh`
-`TAG="${VERSION}"` (v dropped); UI `RuntimeConnection` now populates
-`meta.version` + `meta.started_at` from the retained `/runtime/info`.
-⬜ **Remaining (D6/D7):** the action creates the Release in **this**
-(cloudseeder) repo — publishing to the public `BotGear-AI/botgear`
-needs a cross-repo `token:` + `repository:`; x86_64 (CI) and aarch64
-(QEMU-local) still have separate `run_number`s (need a matrix or a shared
-`VERSION`); the legacy public `v0.1.0` release is not yet retired.
-
-**Requirement:** release version/tag = `MAJOR.MINOR.BUILD` with **no
-leading `v`**; the `MAJOR.MINOR.` prefix is a **hardcoded Action variable**;
-`BUILD` = the Action **build number** (`GITHUB_RUN_NUMBER`).
-
-`/.github/workflows/package_botgear.yml` is **hand-written** (no
-`#managed` header) → edit directly. Precedent already in-repo:
-`.github/workflows/build.yml:52` `IMAGE_VERSION: 0.9.${{ github.run_number }}`.
-The version **string** already has no `v`; only the **tag** scheme carries
-it. `build.sh:89` honors the `VERSION` env **first**, so **no build.sh edit
-is needed** — just set it in CI.
-
-**(1) Hardcoded prefix** — add a top-level `env:` (after `permissions:`):
-```yaml
-env:
-  VERSION_PREFIX: "0.1."   # hardcoded major.minor — bump by hand for a minor/major release
-```
-**(2) Inject VERSION** on the Build step:
-```yaml
-      - name: Build
-        working-directory: apps/botgear
-        env:
-          VERSION: "${{ env.VERSION_PREFIX }}${{ github.run_number }}"
-        run: ./packaging/build.sh
-```
-→ `botgear-0.1.<run>-linux-x86_64.tar.gz`, `version.json={"version":"0.1.<run>"}`.
-**(3) Collapse the duplicate "Resolve version" step** (kills the
-documented build.sh-vs-workflow drift + the push-to-main name/content
-mismatch where the artifact is named `0.1.0-<sha>` but contains
-`...-latest` with `version.json=latest`):
-```yaml
-      - name: Resolve version
-        id: ver
-        run: echo "version=${{ env.VERSION_PREFIX }}${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-```
-**(4) Drop the `v` + auto-create a pollable Release.** Move the tag trigger
-off `botgear-v*`; publish with a bare tag so the updater can poll a
-deterministic, monotonically-increasing release:
-```yaml
-      - name: Publish Release
-        if: <release trigger — see D7>
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.VERSION_PREFIX }}${{ github.run_number }}   # e.g. 0.1.42, no 'v'
-          files: |
-            apps/botgear/dist/*.tar.gz
-            apps/botgear/dist/*.tar.gz.sha256
-```
-And `packaging/build_arm64.sh:78` `TAG="v${VERSION}"` → `TAG="${VERSION}"`.
-
-**Downstream impact:** tag/release naming `0.1.<run>` (no `v`);
-version.json / `/v1/version` / OpenAPI / mDNS / `/runtime/info` all become
-`0.1.<run>`; the service registry (`services-latest`, per-service versions)
-is unchanged but `min_runtime` is now comparable; the updater parses
-`MAJOR.MINOR.BUILD` → integer tuple. Local builds keep `latest`/
-`--versioned` (GITHUB_RUN_NUMBER unset) — intentional CI-vs-local split.
-
-⚠️ **Coherence risks (must resolve before relying on it):**
-- `GITHUB_RUN_NUMBER` is **per-workflow-file** and **resets if the workflow
-  is renamed/recreated** → BUILD could go backwards → the updater sees a
-  "downgrade". Never rename `package_botgear.yml` (or persist a
-  monotonic floor + offset).
-- x86_64 (CI) and aarch64 (`build_arm64.sh`, manual QEMU) are **separate
-  runs with separate run_numbers** → the "same" release gets different
-  version strings per platform and the two assets won't land on one
-  `0.1.<run>` Release. Fix via a matrix workflow (shared run_number) or
-  pass an explicit shared `VERSION` to the arm64 build (D6).
+Superseded 2026-10-10 by tag-driven releases (`../TODO_CROSS_PLATFORM_RELEASE.md`
+Phase 3): pushing `botgear-vX.Y.Z` builds all four platforms into Release
+`X.Y.Z` on BotGear-AI/botgear (bare version, no `v`) as a prerelease;
+promoting it to latest is what the updater sees. Pushes to main build as
+`dev-<sha>`. The `0.1.<run_number>` scheme and its coherence risks (run
+numbers resetting on workflow rename, separate x86/arm64 run numbers) are
+gone, as is the legacy `v0.1.0` release. Remaining: `min_runtime` is now
+comparable but still unenforced (§2 gaps).
 
 ---
 
@@ -434,7 +367,7 @@ down-migration); `min_previous_version` says how far back is safe.
 
 | Phase | Scope | Verify |
 |---|---|---|
-| **0 — Versioning + surfacing** ✅ (core) | §7 workflow change ✅; drop `v` in `build_arm64.sh` ✅; wire UI `meta.version` from `/runtime/info` ✅; local-vs-CI sentinel split preserved ✅. ⬜ remaining: public-repo publish (cross-repo token), x86/arm64 run_number coherence (D6), retire legacy `v0.1.0` (D7) | a CI build produces `0.1.<run>`; `/v1/version`, mDNS, `/runtime/info`, UI all show it |
+| **0 — Versioning + surfacing** ✅ | tag-driven `X.Y.Z` releases to BotGear-AI/botgear as prereleases (§7); UI `meta.version` from `/runtime/info` | `/v1/version`, mDNS, `/runtime/info`, UI all show the release version |
 | **1 — Detector (read-only)** 🔜 framework half ✅ | ✅ `GET /v1/update/check` (framework current-vs-latest GitHub release + per-platform asset/sha256 + `0.0.0`/`latest` sentinel handling, graceful on network error — `api/update_api.py` + pure `runtime/updater.py` + unit tests); ✅ `update_repo` config field; ✅ **Updates** page ("Check for updates", Admin-gated) + nav + CI publishes to the public repo (§7). ⬜ remaining: per-service installed-vs-latest diff (PEP440 over remote catalog), `min_runtime` enforcement, the fuller `/update/status` + two-section wizard | ✅ `/v1/update/check` returns current→latest + platform asset on a live check |
 | **2 — Service update (axis A)** 🔜 | `POST /v1/update/services` reusing load+install + progress; repoint instances + rolling restart (subprocess: no reboot); per-service rollback dir; optional GC | update a pip service to a newer version with no backend reboot; config survives; rollback works |
 | **3 — A/B layout migration** ⬜ | flat bundle → `releases/<ver>/` + `current` symlink + stable launcher; `BOTGEAR_HOME` in entry.py; argv[0]=launcher; re-exec-through-symlink proof | idempotent one-time migration; restart still works; argv[0] follows symlink |
@@ -474,7 +407,6 @@ each safe to land incrementally behind the detector.
   loop-upgrade — sentinel handling must hard-disable it.
 - **Port must stay stable** across re-exec or surviving subprocesses
   orphan onto stale code.
-- **`GITHUB_RUN_NUMBER` reset/per-platform divergence** (§7).
 
 ---
 
@@ -487,8 +419,6 @@ each safe to land incrementally behind the detector.
 | **D3** | `var/repo` refresh on framework bump | re-seed framework-owned subset, preserve user types+venvs vs flip `effective_repo_roots` precedence vs accept stale-shadow risk |
 | **D4** | Auto-update policy | manual default; auto-apply BUILD-only within a line, always gate MAJOR.MINOR |
 | **D5** | Framework compat metadata transport | published `runtime-catalog.yml` (reuse fetch/merge) vs per-release `release.json` vs GH release body |
-| **D6** | Cross-platform version coherence | single matrix workflow (shared run_number) vs explicit shared VERSION to arm64 build |
-| **D7** | Tag/Release migration + trigger | start fresh at `0.1.<run>` vs migrate legacy `v0.1.0`; auto-create Release on every main push vs release-branch/dispatch (recommended) |
 | **D8** | `data_version` + migration framework | `var/.data_version` + `runtime/migrations.py` (forward-only, idempotent, recorded); extend config-set `.migrated` |
 | **D9** | Service-instance update policy | auto-repoint + rolling restart (recommended) vs leave pinned until user restarts; + old-version GC/retention |
 | **D10** | Backup scope + retention | critical-subset (db/config_sets/key.bin/runtime_id/.env) vs full `var/` tar; N backups / N releases before prune |

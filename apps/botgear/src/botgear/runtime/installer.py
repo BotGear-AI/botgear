@@ -341,7 +341,7 @@ def install_pip(
 
     # 2d. rlx_messaging — the shared messaging capability
     #     (MessagingServiceBase: inbox queue + listen/speak/send/
-    #     list_channels + retained state — see docs/TODO_MESSAGING.md).
+    #     list_channels + retained state — see packages/rlx_messaging/README.md).
     #     Installed AFTER rlx_bus (depends on it). Pure-Python; harmless
     #     in venvs that never import it.
     if rlx_messaging_path is not None:

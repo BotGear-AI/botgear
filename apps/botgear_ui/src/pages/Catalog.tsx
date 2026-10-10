@@ -41,6 +41,9 @@ interface BrowseRow {
   tags: string[]
   state: TypeState
   sourceRegistry?: string
+  // False when the version's os/arch allow-list excludes this host.
+  supported: boolean
+  platforms: string
 }
 
 const STATE_CHIP: Record<TypeState, { label: string; cls: string }> = {
@@ -314,6 +317,8 @@ export default function Catalog() {
           description: svc.description, tags: svc.tags ?? [],
           state: catalog.local_state[metaId] ?? 'absent',
           sourceRegistry: svc.source_registry,
+          supported: ver.supported !== false,
+          platforms: [...(ver.os ?? ['any']), ...(ver.arch ?? ['any'])].filter((p) => p !== 'any').join(' / '),
         })
       }
     }
@@ -734,8 +739,11 @@ function BrowseView({ rows, loading, error, query, regBusy, rowError, onAction, 
                 </div>
               </div>
               <div className="flex shrink-0 flex-col items-end gap-2">
-                {row.state === 'absent' && (
+                {row.state === 'absent' && row.supported && (
                   <ActionButton busy={busy} label="Load" busyLabel="Loading…" tone="sky" onClick={() => onAction('load', row)} />
+                )}
+                {row.state === 'absent' && !row.supported && (
+                  <span className="text-xs text-slate-500" title={`runs on ${row.platforms}`}>not available on this platform</span>
                 )}
                 {(row.state === 'loaded' || row.state === 'failed') && (
                   <ActionButton busy={busy} label={row.state === 'failed' ? 'Retry install' : 'Install'} busyLabel="Installing…" tone="emerald" onClick={() => onAction('install', row)} />

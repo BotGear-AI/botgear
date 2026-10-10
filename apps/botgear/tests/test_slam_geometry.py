@@ -1,7 +1,7 @@
 # unmanaged
 """Unit tests for slam_service.geometry — differential-drive odometry
 integration + depth-sample -> robot-frame scan projection. Pure math,
-no bus/hardware needed. See docs/TODO_SLAM.md §5.2."""
+no bus/hardware needed. See repo/slam/1.0.0/README.md § Pipeline"""
 from __future__ import annotations
 
 import math
@@ -190,7 +190,7 @@ def test_flat_wall_z_depth_corrected_to_true_range_off_center():
     to the image plane, not to the camera). Using that z-depth directly
     as the scan's range (this function's behavior before the fix) plots
     a flat wall as an arc bowed toward the robot, worse off-center —
-    confirmed live on real hardware, see docs/TODO_SLAM.md. Each
+    confirmed live on real hardware, see repo/slam/1.0.0/README.md. Each
     column's true range must instead grow with 1/cos(h_angle) as it
     moves off-center, since an edge column's ray travels a longer
     diagonal path to reach the same-distance wall."""
@@ -270,7 +270,7 @@ def test_floor_reads_as_floor_at_nonzero_h_angle_and_tilt_together():
     real live-hardware error was considerably larger than the discrepancy
     this synthetic case shows, so this formula bug was a real, provable,
     worth-fixing contributor, not the sole explanation for what was
-    observed live — see docs/TODO_SLAM.md for that fuller writeup).
+    observed live — see repo/slam/1.0.0/README.md for that fuller writeup).
     """
     config = SlamConfig(
         camera_height_m=0.8128, camera_tilt_deg=45.0,
@@ -529,7 +529,7 @@ def test_points_respects_border_margin_and_max_range():
     assert len(points) == 1
 
 
-# ─── Phase 4b: visual (optical-flow) odometry — docs/TODO_SLAM.md §9 ────
+# ─── Phase 4b: visual (optical-flow) odometry — repo/slam/1.0.0/README.md § Visual odometry ────
 
 _INTRINSICS = {"fx": 450.0, "fy": 450.0, "cx": 320.0, "cy": 240.0}
 
@@ -585,7 +585,7 @@ def test_ransac_kabsch_rejects_outliers():
     t_true = np.array([0.05, 0.0, -0.1])
     Q = (P @ R_true.T) + t_true
     # Corrupt 6 of 20 correspondences with garbage — a real bad-track/
-    # moving-object scenario (docs/TODO_SLAM.md §9.5 step 3).
+    # moving-object scenario (repo/slam/1.0.0/README.md § Visual odometry step 3).
     Q[:6] += rng.normal(scale=2.0, size=(6, 3))
     fit = _ransac_kabsch(P, Q, rng=np.random.default_rng(2))
     assert fit is not None
@@ -673,7 +673,7 @@ def test_estimate_visual_pose_delta_round_trips_through_nonzero_tilt_and_yaw():
     mathematical inverse of the same conversion, must round-trip back
     to the original robot-frame motion. Catches composition/transpose-
     order bugs even though it can't catch a globally-flipped sign
-    convention on its own — see docs/TODO_SLAM.md §9.9 Phase 4c for the
+    convention on its own — see docs/TODO_SLAM.md Phase 4c for the
     real-hardware check that closes that gap."""
     tilt_deg, yaw_deg = 12.0, -8.0
     config = SlamConfig(camera_tilt_deg=tilt_deg, camera_yaw_deg=yaw_deg, visual_odometry_min_matches=3)

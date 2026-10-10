@@ -446,3 +446,53 @@ def test_uninstall_returns_to_loaded(tmp_path):
     extracted = repo_dir / _FAKE_SERVICE_NAME / _FAKE_SERVICE_VERSION
     assert (extracted / "package.yml").is_file(), \
         "uninstall must leave the source dir in place (LOADED state)"
+
+
+# ─── platform allow-lists (package.yml os/arch → catalog) ───────────
+
+
+@pytest.mark.parametrize("entry, host, ok", [
+    ({}, ("windows", "x86_64"), True),                                   # absent = any
+    ({"os": ["any"], "arch": ["any"]}, ("macos", "arm64"), True),
+    ({"os": ["linux"]}, ("linux", "arm64"), True),
+    ({"os": ["linux"]}, ("windows", "x86_64"), False),
+    ({"os": ["linux"], "arch": ["aarch64"]}, ("linux", "arm64"), True),  # alias
+    ({"arch": ["arm64"]}, ("linux", "x86_64"), False),
+    ({"os": ["Darwin"]}, ("macos", "arm64"), True),                      # alias + case
+    ({"arch": ["amd64"]}, ("windows", "x86_64"), True),
+])
+def test_platform_supported(entry, host, ok):
+    assert registry.platform_supported(entry, host) is ok
+
+
+def test_host_platform_is_normalized(monkeypatch):
+    monkeypatch.setattr(registry.sys, "platform", "darwin")
+    monkeypatch.setattr(registry.platform, "machine", lambda: "AMD64")
+    assert registry.host_platform() == ("macos", "x86_64")
+    monkeypatch.setattr(registry.sys, "platform", "linux")
+    monkeypatch.setattr(registry.platform, "machine", lambda: "aarch64")
+    assert registry.host_platform() == ("linux", "arm64")
+
+
+def test_load_refuses_a_type_this_host_cannot_run(tmp_path, monkeypatch):
+    src_repo = _stage_source(tmp_path)
+    catalog_path = _publish_mirror(tmp_path, src_repo)
+    cat = yaml.safe_load(catalog_path.read_text())
+    cat["services"][0]["versions"][0]["os"] = ["windows"]
+    catalog_path.write_text(yaml.safe_dump(cat))
+    monkeypatch.setattr(registry, "host_platform", lambda: ("linux", "x86_64"))
+
+    repo_dir = tmp_path / "target_repo"
+    repo_dir.mkdir()
+    db = FakeDB()
+    with pytest.raises(registry.UnsupportedPlatformError) as exc_info:
+        registry.load(
+            _FAKE_SERVICE_NAME,
+            _FAKE_SERVICE_VERSION,
+            catalog_url=_catalog_url(catalog_path),
+            repo_dir=repo_dir,
+            db=db,
+        )
+    assert "linux/x86_64" in str(exc_info.value)
+    assert not (repo_dir / _FAKE_SERVICE_NAME).exists()
+    assert db.get_all_items("service_meta") == []

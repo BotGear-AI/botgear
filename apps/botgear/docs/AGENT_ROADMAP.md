@@ -15,7 +15,6 @@ Last updated 2026-10-04. Status per phase is in [Roadmap](#roadmap).
 | [`repo/brain/1.0.0/README.md`](../repo/brain/1.0.0/README.md) | brain as a service: workflows, `workflow.yaml` fields, bus actions |
 | [`repo/brain/1.0.0/README_ENGINE.md`](../repo/brain/1.0.0/README_ENGINE.md) | `WorkflowEngine` internals, guards, termination paths |
 | [`repo/brain/1.0.0/TODO.md`](../repo/brain/1.0.0/TODO.md) | brain's open engine questions |
-| [`TODO_BRAIN_GAP_FIXES.md`](TODO_BRAIN_GAP_FIXES.md) | the Discord/tasmota gap fixes (Gaps 1-6) |
 | [`packages/agent_harness/README.md`](../../../packages/agent_harness/README.md) | the harness: skills, workflows, drivers, checks |
 | [`docs/AGENT_HARNESS_COMPARISON.md`](../../../docs/AGENT_HARNESS_COMPARISON.md) (repo root) | how the harness was unified from dealflow + continuous_mfa |
 | [`AGENTS.md`](../AGENTS.md) § Runtime-wide HALT | the stop signal every agent must obey |

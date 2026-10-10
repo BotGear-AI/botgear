@@ -1,7 +1,7 @@
 # unmanaged
 """GoogleChatService — the `messaging` capability's speak-only tier.
 
-See ``apps/botgear/docs/TODO_MESSAGING.md`` §4 for why this is send-only
+See ``packages/rlx_messaging/README.md`` ("Platforms") for why this is send-only
 in v1 (no public HTTPS endpoint / GCP Pub/Sub project available to a
 robot laptop on a home LAN). ``capabilities.listen`` is False —
 ``listen()`` (inherited from ``MessagingServiceBase`` unmodified) simply

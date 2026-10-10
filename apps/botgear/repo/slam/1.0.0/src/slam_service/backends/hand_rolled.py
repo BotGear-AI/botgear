@@ -4,7 +4,7 @@
 Pure numpy: log-odds occupancy grid + Bresenham ray-casting, footprint
 inflation via manual binary dilation (no scipy — keeps the "numpy
 only" dependency story clean), and UNCORRECTED pose integration
-(accepts odometry's pose_change as-is). See docs/TODO_SLAM.md §5.2a
+(accepts odometry's pose_change as-is). See README.md § Mapping backends
 for why this is the deliberate v1 choice over a scan-matching backend.
 """
 from __future__ import annotations

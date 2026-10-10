@@ -2,7 +2,7 @@ name: discord
 title: Discord
 description: |
   Discord bot implementing the ``messaging`` capability (see
-  docs/TODO_MESSAGING.md) — the same ``listen``/``speak``/``send``/
+  packages/rlx_messaging/README.md) — the same ``listen``/``speak``/``send``/
   ``list_channels`` contract ``chat`` exposes, so a brain conversation
   workflow can use a Discord channel exactly like it uses chat's text
   box today.

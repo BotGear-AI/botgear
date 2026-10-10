@@ -39,8 +39,12 @@ class FakeDB:
         existing.update(filtered)
         return dict(existing)
 
+    # Reads return copies, like every real backend: a caller mutating a
+    # fetched row must not silently mutate the stored one (the reset-
+    # password route mutates its row, then re-queries by the old token).
     def get_item(self, table: str, key: str) -> Optional[Dict[str, Any]]:
-        return self._table(table).get(key)
+        row = self._table(table).get(key)
+        return dict(row) if row is not None else None
 
     def delete_item(self, table: str, key: str) -> None:
         self._table(table).pop(key, None)
@@ -51,8 +55,8 @@ class FakeDB:
     def query_items(self, table_name: str, criteria: Dict[str, Any]) -> list:
         rows = self._table(table_name).values()
         if not criteria:
-            return list(rows)
-        return [r for r in rows if all(r.get(k) == v for k, v in criteria.items())]
+            return [dict(r) for r in rows]
+        return [dict(r) for r in rows if all(r.get(k) == v for k, v in criteria.items())]
 
 
 @pytest.fixture

@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class ServiceMeta(BaseModel):
     name: str = Field(..., description="Service name", json_schema_extra={"example":"camera"})

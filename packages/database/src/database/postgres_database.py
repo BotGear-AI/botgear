@@ -246,13 +246,24 @@ class PostgresDatabase(DatabaseAdapter):
                 except BaseException:
                     self._rollback_transaction(conn)
                     raise
-                self._restore_autocommit(conn)
+                # The transaction is durable now; a failure resetting
+                # autocommit doesn't change that, so it must not raise to
+                # the caller (who could mistake it for a failed commit and
+                # retry, duplicating the already-committed operation) — just
+                # discard the connection instead of returning it to the pool.
+                try:
+                    self._restore_autocommit(conn)
+                except BaseException as reset_error:
+                    logger.warning(f"Failed to reset autocommit after commit: {reset_error}")
+                    self._discard_connection(conn)
+                    connection_returned = True
         except BaseException:
             if not connection_returned:
                 self._discard_connection(conn)
             raise
         else:
-            self._return_connection(conn)
+            if not connection_returned:
+                self._return_connection(conn)
 
     def close(self) -> None:
         """Clean shutdown of database connection pool"""
@@ -375,26 +386,36 @@ class PostgresDatabase(DatabaseAdapter):
             logger.error(f"Item keys: {list(item.keys())}")
             raise
 
-    def insert_item(self, table: str, key: str, item: dict) -> Optional[dict]:
-        """Insert item with validation"""
+    def _validate_insert_item(self, table: str, item: dict) -> None:
         self._validate_identifier(table, "table name")
-        for k in item.keys():
-            self._validate_identifier(k, f"column '{k}'")
-
+        for column in item:
+            self._validate_identifier(column, f"column '{column}'")
         if not item:
             raise ValueError("Cannot insert empty item")
-        if 'id' not in item:
+        if "id" not in item:
             raise ValueError("Item must contain 'id' field")
 
+    def _build_insert_statement(self, table: str, item: dict, returning: bool):
+        returning_clause = " RETURNING *" if returning else ""
+        statement = sql.SQL(
+            "INSERT INTO {table} ({cols}) VALUES ({vals})" + returning_clause
+        ).format(
+            table=sql.Identifier(table),
+            cols=sql.SQL(", ").join(sql.Identifier(column) for column in item),
+            vals=sql.SQL(", ").join(sql.Placeholder() for _ in item),
+        )
+        return statement, self._prepare_values(item)
+
+    def prepare_insert_statement(self, table: str, item: dict, *, returning: bool = True):
+        """Build a validated INSERT and values; optionally omit ``RETURNING *``."""
+        self._validate_insert_item(table, item)
+        return self._build_insert_statement(table, item, returning)
+
+    def insert_item(self, table: str, key: str, item: dict) -> Optional[dict]:
+        """Insert item with validation"""
+        self._validate_insert_item(table, item)
         try:
-            values = self._prepare_values(item)
-            stmt = sql.SQL(
-                "INSERT INTO {table} ({cols}) VALUES ({vals}) RETURNING *"
-            ).format(
-                table=sql.Identifier(table),
-                cols=sql.SQL(", ").join(sql.Identifier(k) for k in item.keys()),
-                vals=sql.SQL(", ").join(sql.Placeholder() for _ in item),
-            )
+            stmt, values = self._build_insert_statement(table, item, returning=True)
 
             with self._get_cursor(cursor_factory=RealDictCursor) as cur:
                 self._execute(cur, stmt, values)
@@ -561,7 +582,16 @@ class PostgresDatabase(DatabaseAdapter):
                     # VALUES list doesn't reliably match the target
                     # column (confirmed live: an uncast text param
                     # assigned to a jsonb column fails without this).
-                    pg_types = self._infer_columns({k: rows[0][1][k] for k in key_set})
+                    # The representative value is the first NON-None one in
+                    # the group, not always rows[0]'s: with include_nulls=True
+                    # a None in the first row would otherwise infer TEXT for a
+                    # key every other row in the group sets to a real
+                    # BIGINT/BOOLEAN/JSONB value, and Postgres refuses to
+                    # assign a text-cast expression into that column.
+                    pg_types = self._infer_columns({
+                        k: next((r[1][k] for r in rows if r[1].get(k) is not None), rows[0][1][k])
+                        for k in key_set
+                    })
 
                     for i in range(0, len(rows), chunk_size):
                         chunk = rows[i:i + chunk_size]
@@ -1096,6 +1126,25 @@ class PostgresDatabase(DatabaseAdapter):
     _TEXT_TYPES = {"text", "character varying", "character"}
     _NUMBER_TYPES = {"smallint", "integer", "bigint", "numeric", "real", "double precision"}
 
+    def _ensure_safe_timestamptz_fn(self, cur) -> None:
+        """Idempotently install a timestamptz cast that returns NULL instead
+        of throwing on a value that merely LOOKS like a timestamp (passes the
+        leading-digits regex) but isn't one, e.g. a calendar-invalid date
+        ("2024-02-30...") or trailing garbage after a valid prefix
+        ("2024-01-01T00:00garbage") — the raw ``::timestamptz`` cast raises
+        on both, which would abort the whole retention run over one bad row
+        instead of just keeping it, as the caller documents."""
+        cur.execute("""
+            CREATE OR REPLACE FUNCTION cloudseeder_safe_timestamptz(text)
+            RETURNS timestamptz AS $$
+            BEGIN
+                RETURN $1::timestamptz;
+            EXCEPTION WHEN OTHERS THEN
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql IMMUTABLE;
+        """)
+
     def _older_than_condition(self, cur, table: str, field: str, data_type: str,
                               cutoff: datetime.datetime) -> Tuple[sql.Composable, list]:
         """SQL condition (+ params) for "field is provably before cutoff",
@@ -1103,25 +1152,43 @@ class PostgresDatabase(DatabaseAdapter):
         f = sql.Identifier(field)
         cutoff = cutoff.astimezone(datetime.timezone.utc)
         if data_type in self._TEXT_TYPES:
-            # ISO-8601 text: the plain text comparison uses the column's
-            # b-tree index to find candidates (same leading layout sorts
-            # chronologically); the guarded cast then proves each one — a
-            # value that isn't a timestamp, or whose offset makes it newer,
-            # is kept, never deleted early.
+            # ISO-8601 text, any offset: the plain text prefilter uses the
+            # column's b-tree index to narrow candidates, widened by a day
+            # so a value with a large positive UTC offset -- whose local
+            # text therefore sorts AFTER the UTC cutoff even though its
+            # actual instant is older -- still passes through to the cast
+            # below rather than being wrongly kept. The cast is the real
+            # proof and the only timezone-correct comparison; the prefilter
+            # only needs to never exclude a true positive, not be exact.
+            # cloudseeder_safe_timestamptz returns NULL (never throws) for a
+            # value that merely looks like a timestamp but isn't one (a
+            # calendar-invalid date, trailing garbage after a valid prefix)
+            # -- that row is then kept, matching "unparseable values are
+            # kept", instead of aborting the whole run.
+            self._ensure_safe_timestamptz_fn(cur)
             cond = sql.SQL(
-                "{f} < %s AND CASE WHEN {f} ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ][0-9]{{2}}:[0-9]{{2}}' "
-                "THEN {f}::timestamptz < %s ELSE false END").format(f=f)
-            return cond, [cutoff.strftime("%Y-%m-%dT%H:%M:%S.%fZ"), cutoff]
+                "{f} < %s AND cloudseeder_safe_timestamptz({f}) < %s").format(f=f)
+            widened = (cutoff - datetime.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            return cond, [widened, cutoff]
         if data_type == "timestamp with time zone":
             return sql.SQL("{f} < %s").format(f=f), [cutoff]
         if data_type in ("timestamp without time zone", "date"):
             return sql.SQL("{f} < %s").format(f=f), [cutoff.replace(tzinfo=None)]
         if data_type in self._NUMBER_TYPES:
             from database.retention import EPOCH_MS_THRESHOLD
-            cur.execute(sql.SQL("SELECT max({f}) FROM {t}").format(f=f, t=sql.Identifier(table)))
-            biggest = (cur.fetchone() or [None])[0]
-            factor = 1000 if biggest is not None and float(biggest) > EPOCH_MS_THRESHOLD else 1
-            return sql.SQL("{f} < %s").format(f=f), [int(cutoff.timestamp() * factor)]
+            # Per-VALUE, not per-column: database.retention's own convention
+            # (module docstring) is that the unit is decided by each value's
+            # OWN magnitude, not by a single factor for the whole column --
+            # a column that's ever mixed seconds and milliseconds (a
+            # convention change, or legacy rows) would otherwise have every
+            # seconds-scale value compared against a milliseconds-scale
+            # cutoff and wrongly deleted as "ancient" (or the reverse, wrongly
+            # kept). CASE on each row's own value against the threshold.
+            cond = sql.SQL(
+                "CASE WHEN {f} > %s THEN {f} < %s ELSE {f} < %s END").format(f=f)
+            seconds_cutoff = int(cutoff.timestamp())
+            ms_cutoff = seconds_cutoff * 1000
+            return cond, [EPOCH_MS_THRESHOLD, ms_cutoff, seconds_cutoff]
         raise ValueError(f"retention: {table}.{field} is {data_type!r} — not a time column")
 
     def prune_older_than(self, table: str, field: str, cutoff, *, batch_size: int = 5000,
@@ -1144,7 +1211,18 @@ class PostgresDatabase(DatabaseAdapter):
             data_type = row[0] if not isinstance(row, dict) else row["data_type"]
             cond, params = self._older_than_condition(cur, table, field, data_type, cutoff)
             if dry_run:
-                cur.execute(sql.SQL("SELECT count(*) FROM {t} WHERE ").format(t=t) + cond, params)
+                # Capped at max_rows, same as a real run processes at most
+                # per invocation (TinyDB's prune_older_than does the same
+                # truncation) -- otherwise a dry run overstates what that
+                # one run would actually delete.
+                if max_rows is not None:
+                    cur.execute(
+                        sql.SQL("SELECT count(*) FROM (SELECT 1 FROM {t} WHERE ").format(t=t)
+                        + cond + sql.SQL(" LIMIT %s) sub"),
+                        params + [max_rows],
+                    )
+                else:
+                    cur.execute(sql.SQL("SELECT count(*) FROM {t} WHERE ").format(t=t) + cond, params)
                 n = (cur.fetchone() or [0])
                 return int(n[0] if not isinstance(n, dict) else list(n.values())[0])
             lock_key = f"cloudseeder.retention.{table}"

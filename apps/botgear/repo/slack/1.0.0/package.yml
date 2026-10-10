@@ -2,7 +2,7 @@ name: slack
 title: Slack
 description: |
   Slack bot implementing the ``messaging`` capability (see
-  docs/TODO_MESSAGING.md) — the same ``listen``/``speak``/``send``/
+  packages/rlx_messaging/README.md) — the same ``listen``/``speak``/``send``/
   ``list_channels`` contract ``chat`` exposes.
 
   Full bidirectional via Socket Mode — an OUTBOUND websocket the bot

@@ -1,8 +1,7 @@
 # unmanaged
 """Unit tests for slam_service.backends — the MappingBackend interface
 and its v1 implementation, HandRolledBackend (log-odds ray-casting grid
-+ inflation + uncorrected pose integration). See docs/TODO_SLAM.md
-§5.2a. Pure math, no bus/hardware needed."""
++ inflation + uncorrected pose integration). See repo/slam/1.0.0/README.md § Mapping backends Pure math, no bus/hardware needed."""
 from __future__ import annotations
 
 import sys
@@ -168,7 +167,7 @@ def test_forward_bearing_obstacle_maps_to_smaller_row_not_larger():
     # confusion this test is here to catch a regression of (an operator
     # reading "top of map = forward" sees the map as 90 degrees wrong,
     # even though theta/bearing math underneath is internally
-    # consistent — see docs/TODO_SLAM.md's Phase 2 rotation-direction
+    # consistent — see repo/slam/1.0.0/README.md's Phase 2 rotation-direction
     # writeup).
     backend = HandRolledBackend(_config())
     # Pure forward bearing (0deg), obstacle at 2m: hits world (2, 0).

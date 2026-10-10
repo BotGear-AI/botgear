@@ -2,7 +2,7 @@ name: google_chat
 title: Google Chat
 description: |
   Google Chat integration implementing the ``messaging`` capability
-  (see docs/TODO_MESSAGING.md) — SEND-ONLY in this version.
+  (see packages/rlx_messaging/README.md) — SEND-ONLY in this version.
   ``speak()``/``send()``-via-outbound work; ``listen()`` always returns
   ``timeout: true`` (never raises) because this integration has no way
   to receive messages. ``state.capabilities.listen`` is ``false`` so a

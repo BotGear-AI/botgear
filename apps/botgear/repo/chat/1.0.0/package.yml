@@ -19,7 +19,7 @@ author: CloudSeeder
 tags: [chat, conversation, builtin, brain]
 icon: icon.svg
 
-# messaging capability — see docs/TODO_MESSAGING.md. discord/slack/
+# messaging capability — see packages/rlx_messaging/README.md. discord/slack/
 # google_chat implement the same wire contract (listen/speak/send/
 # list_channels), so any of them can stand in for chat in a brain
 # workflow.

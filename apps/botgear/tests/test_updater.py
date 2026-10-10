@@ -49,7 +49,26 @@ def test_platform_tag_shape():
     tag = updater.platform_tag()
     assert "-" in tag
     os_part, arch_part = tag.split("-", 1)
-    assert os_part in {"linux", "macos", "windows"}
+    assert os_part in {"linux", "darwin", "windows"}
+
+
+@pytest.mark.parametrize("system, machine, tag", [
+    # Must equal packaging/build.sh's PLATFORM_TAG for the same host.
+    ("Linux", "x86_64", "linux-x86_64"),
+    ("Linux", "aarch64", "linux-aarch64"),
+    ("Darwin", "arm64", "darwin-arm64"),
+    ("Windows", "AMD64", "windows-x86_64"),
+])
+def test_platform_tag_matches_build_sh(monkeypatch, system, machine, tag):
+    monkeypatch.setattr(updater.platform, "system", lambda: system)
+    monkeypatch.setattr(updater.platform, "machine", lambda: machine)
+    assert updater.platform_tag() == tag
+
+
+def test_self_update_is_posix_only():
+    assert updater.self_update_supported("linux-x86_64")
+    assert updater.self_update_supported("darwin-arm64")
+    assert not updater.self_update_supported("windows-x86_64")
 
 
 def test_platform_asset_matches_by_suffix():
@@ -68,4 +87,4 @@ def test_platform_asset_matches_by_suffix():
     tar, sha = rel.platform_asset("linux-x86_64")
     assert tar == "https://x/x86.tar.gz"
     # missing platform → (None, None), not a crash
-    assert rel.platform_asset("macos-aarch64") == (None, None)
+    assert rel.platform_asset("darwin-arm64") == (None, None)

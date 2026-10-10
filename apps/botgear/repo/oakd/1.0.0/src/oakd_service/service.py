@@ -15,7 +15,7 @@ Optionally (``publish_depth_samples``, opt-in, default off) a THIRD
 on-device output — StereoDepth's separate ``.depth`` (already metric
 millimeters) — is decimated to a small grid and published as plain JSON
 on ``/oakd/<id>/depth_sample`` at a low, independently-configurable
-rate. Added for the `slam` service (docs/TODO_SLAM.md §4) — raw
+rate. Added for the `slam` service (repo/slam/1.0.0/README.md § Ownership split) — raw
 disparity alone can't convert to real-world range without stereo
 calibration intrinsics, which is why this is a separate on-device
 output rather than reusing the disparity one above.
@@ -25,7 +25,7 @@ of ``publish_depth_samples``) a FOURTH on-device output — DepthAI's
 FeatureTracker node running on the left mono camera — publishes
 matched-id point correspondences + per-point metric depth on
 ``/oakd/<id>/feature_flow_sample``, for visual (optical-flow) odometry.
-See docs/TODO_SLAM.md §9 — this is that design's Phase 4a.
+See repo/slam/1.0.0/README.md § Visual odometry — this is that design's Phase 4a.
 
 Optionally (``mono_stream_camera``, "left"/"right"/None, default None)
 ONE more MJPEG stream — ``/oakd/<id>/mono_left`` or
@@ -195,7 +195,7 @@ class OakdConfig(ServiceConfig):
                          decimated, METRIC (millimeters) depth grid on
                          /oakd/<id>/depth_sample for consumers that need
                          real range data — the `slam` service in
-                         particular. See docs/TODO_SLAM.md §4. Distinct
+                         particular. See repo/slam/1.0.0/README.md § Ownership split Distinct
                          from the disparity-based colorized MJPEG
                          preview above — raw disparity alone can't
                          convert to real-world range without stereo
@@ -223,7 +223,7 @@ class OakdConfig(ServiceConfig):
                          the ALWAYS-ON colorized /depth preview the way
                          aligning to RGB's full native resolution would.
                          Mutually exclusive with publish_feature_flow,
-                         which specifically needs (docs/TODO_SLAM.md
+                         which specifically needs (repo/slam/1.0.0/README.md
                          §9.3) depth to stay in mono_left's own frame for
                          its per-pixel lookup — enabling both raises at
                          device-open time rather than silently breaking
@@ -238,7 +238,7 @@ class OakdConfig(ServiceConfig):
                          per-point metric depth on
                          /oakd/<id>/feature_flow_sample, for visual
                          odometry (the `slam` service; see
-                         docs/TODO_SLAM.md §9). This is Phase 4a of that
+                         repo/slam/1.0.0/README.md § Visual odometry). This is Phase 4a of that
                          design — `oakd` stays a dumb sensor publisher
                          (frame-to-frame id matching only); the
                          rigid-motion fit that turns correspondences
@@ -476,7 +476,7 @@ class OakdService(SubprocessService):
             # fx/fy/cx/cy of the left mono camera (CAM_B), fetched once at
             # device-open time — only populated when publish_feature_flow
             # is on; consumers doing the depth-lookup→3D backprojection
-            # (docs/TODO_SLAM.md §9.5) need this once, not per-sample.
+            # (repo/slam/1.0.0/README.md § Visual odometry) need this once, not per-sample.
             "intrinsics": None,
         }
 
@@ -668,7 +668,7 @@ class OakdService(SubprocessService):
                 # on-device from the stereo calibration intrinsics),
                 # as opposed to `.disparity` above which is relative
                 # units only meaningful for the colorized preview. See
-                # docs/TODO_SLAM.md §4 for why raw disparity alone
+                # repo/slam/1.0.0/README.md § Ownership split for why raw disparity alone
                 # can't be converted to real range downstream. Shared by
                 # both opt-in flags — feature-flow matches (§9.4) need
                 # per-point metric depth lookups too, no reason to build
@@ -684,7 +684,7 @@ class OakdService(SubprocessService):
                 # case for this flag — _validate_config rejects the two
                 # together, see depth_align_to_rgb's docstring), so a
                 # tracked pixel's depth is a direct array lookup with no
-                # alignment step to add. See docs/TODO_SLAM.md §9.3.
+                # alignment step to add. See repo/slam/1.0.0/README.md § Visual odometry
                 # FeatureTracker runs
                 # on the Myriad X VPU (numShaves/numMemorySlices), not
                 # the host CPU — mono_left.out fans out to both `stereo`
@@ -708,7 +708,7 @@ class OakdService(SubprocessService):
             raise ValueError(
                 "depth_align_to_rgb and publish_feature_flow can't both be on: "
                 "feature_flow's per-pixel depth lookup assumes depth stays in "
-                "mono_left's native frame (docs/TODO_SLAM.md §9.3), which "
+                "mono_left's native frame (repo/slam/1.0.0/README.md § Visual odometry), which "
                 "depth_align_to_rgb changes to the RGB camera's frame instead. "
                 "Pick one."
             )
@@ -764,7 +764,7 @@ class OakdService(SubprocessService):
         intrinsics = None
         if self.config.publish_feature_flow:
             # Fetched once here (not per-sample) — a visual-odometry
-            # consumer (docs/TODO_SLAM.md §9.5) needs these to
+            # consumer (repo/slam/1.0.0/README.md § Visual odometry) needs these to
             # back-project matched pixels into 3D, but they're fixed
             # for the life of this device-open (factory calibration, not
             # something that changes frame to frame). 640x480 matches
@@ -1035,7 +1035,7 @@ class OakdService(SubprocessService):
 
     async def _publish_depth_sample(self, depth_mm: np.ndarray, rgb_frame: Optional[np.ndarray] = None) -> None:
         """Decimate the metric depth-in-mm array to the configured
-        small grid and publish as plain JSON — see docs/TODO_SLAM.md
+        small grid and publish as plain JSON — see repo/slam/1.0.0/README.md
         §4. See `_decimate_depth_masked` for why this ISN'T a plain
         `cv2.resize(..., INTER_AREA)` — that blends invalid (0) source
         pixels into the average as if they were real close-range
@@ -1069,7 +1069,7 @@ class OakdService(SubprocessService):
         previous tick's by DepthAI's own persistent track id, look up
         each match's metric depth from the shared depth_mm frame, and
         publish raw pixel/depth correspondences on
-        /oakd/<id>/feature_flow_sample — docs/TODO_SLAM.md §9.4.
+        /oakd/<id>/feature_flow_sample — repo/slam/1.0.0/README.md § Visual odometry
 
         Frame-to-frame CORRESPONDENCE is DepthAI's job already (ids stay
         stable across frames on-device); this only filters to ids seen

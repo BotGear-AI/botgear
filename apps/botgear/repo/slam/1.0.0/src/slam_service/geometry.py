@@ -1,7 +1,7 @@
 # unmanaged
 """Pure-math geometry: differential-drive odometry integration +
 camera depth-sample -> robot-frame range-scan projection. See
-docs/TODO_SLAM.md §5.2 steps 1-2. No image library needed — plain
+README.md § Pipeline steps 1-2. No image library needed — plain
 trig + numpy.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ class PoseDelta:
     convention, dtheta in degrees (+ = counterclockwise/left turn).
     This is what feeds MappingBackend.update() as `pose_change` — not a
     world-frame delta; placing it in the world frame is the backend's
-    job (see docs/TODO_SLAM.md §5.2a), so a correcting backend can
+    job (see README.md § Mapping backends), so a correcting backend can
     override it."""
     dx_m: float
     dy_m: float
@@ -75,7 +75,7 @@ def project_depth_sample_to_scan(
     depth_mm: Sequence[Sequence[int]], config: SlamConfig, max_range_m: float = 8.0,
 ) -> List[ScanPoint]:
     """Collapse an oakd depth_sample grid (already metric millimeters —
-    see docs/TODO_SLAM.md §4's correction from raw disparity) into a 2D
+    see README.md § Ownership split's correction from raw disparity) into a 2D
     range scan in the robot's own frame, one ScanPoint per column.
 
     For each column, scans down through its rows (skipping
@@ -366,7 +366,7 @@ def project_depth_sample_to_points_colored(
     return out
 
 
-# ─── visual (optical-flow) odometry — docs/TODO_SLAM.md §9, Phase 4b ───────
+# ─── visual (optical-flow) odometry — README.md § Visual odometry, Phase 4b ───────
 #
 # Turns oakd's feature_flow_sample point correspondences into a robot-frame
 # PoseDelta, as a drop-in alternative odometry source to
@@ -381,7 +381,7 @@ def project_depth_sample_to_points_colored(
 # is a per-session CONSTANT, not something recomputed per frame).
 
 # RANSAC tuning — not exposed as SlamConfig fields (only
-# visual_odometry_min_matches is, per docs/TODO_SLAM.md §9.4): these are
+# visual_odometry_min_matches is, per README.md § Visual odometry): these are
 # generic outlier-rejection knobs, not robot-specific calibration.
 _RANSAC_ITERATIONS = 200
 _RANSAC_INLIER_THRESHOLD_M = 0.03
@@ -412,7 +412,7 @@ def _ransac_kabsch(
     *, iterations: int = _RANSAC_ITERATIONS, inlier_threshold_m: float = _RANSAC_INLIER_THRESHOLD_M,
     rng: Optional[np.random.Generator] = None,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
-    """RANSAC wrapper around ``_kabsch`` (docs/TODO_SLAM.md §9.5 step 3)
+    """RANSAC wrapper around ``_kabsch`` (README.md § Visual odometry step 3)
     — some correspondences will be on moving objects, people walking
     past, or just bad tracks; a plain least-squares Kabsch fit has no
     rejection ability of its own. Repeatedly fits on a minimal 3-point
@@ -457,7 +457,7 @@ def _camera_to_robot_rotation(camera_tilt_deg: float, camera_yaw_deg: float) -> 
     matches PoseDelta's convention).
 
     The mount is modeled as a pan(yaw)-then-tilt gimbal, matching
-    `worke`'s actual pan/tilt hardware — see docs/TODO_SLAM.md §9.6:
+    `worke`'s actual pan/tilt hardware — see README.md § Visual odometry:
     held static during SLAM operation, so this whole matrix is a
     per-session CONSTANT (computed once from config, not per-frame).
 
@@ -505,7 +505,7 @@ def estimate_visual_pose_delta(
     min_matches: Optional[int] = None,
 ) -> Optional[PoseDelta]:
     """Turn oakd's feature_flow_sample correspondences into a robot-
-    frame PoseDelta (docs/TODO_SLAM.md §9.5) — the visual-odometry
+    frame PoseDelta (README.md § Visual odometry) — the visual-odometry
     counterpart to differential_drive_delta above, same output type,
     meant to feed the SAME pending-delta accumulator in SlamService.
 

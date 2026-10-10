@@ -149,7 +149,7 @@ def _encode_tools(
     """OpenAI tool descriptors: ``{type: function, function: {...}}``
     with ``parameters`` as JSON Schema. Names come from
     ``adapters.base.resolve_tool_names`` (see
-    docs/TODO_BRAIN_GAP_FIXES.md Gap 1) — previously every tool here
+    README.md "Tool names") — previously every tool here
     was unconditionally ``tool_NNN``, even when the bare action name
     was unique and would have worked fine, unlike the other two
     adapters."""
@@ -206,7 +206,7 @@ def _parse_response(
         )
 
     # Every tool call in this one response — see
-    # docs/TODO_BRAIN_GAP_FIXES.md Gap 5. A model that both acts and
+    # README.md "Several tool calls in one response". A model that both acts and
     # confirms in the same turn (e.g. power_set + speak) used to have
     # the confirmation silently dropped; the engine now executes each
     # of these in order.

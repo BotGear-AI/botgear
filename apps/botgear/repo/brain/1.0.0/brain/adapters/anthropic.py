@@ -220,7 +220,7 @@ def _encode_tools(
     """Brain tools → Anthropic tool definitions + reverse map.
 
     Tool names come from ``adapters.base.resolve_tool_names`` (see
-    docs/TODO_BRAIN_GAP_FIXES.md Gap 1). Also returns a forward map
+    README.md "Tool names"). Also returns a forward map
     (on-wire name → ToolDescriptor) so the engine's assistant-message
     reconstruction (``_split_system`` tool_use block) can look up the
     right encoded name when threading the conversation back to
@@ -249,7 +249,7 @@ def _parse_response(
     The ``content`` array can be a mix of text + tool_use blocks, and
     Anthropic can return SEVERAL tool_use blocks in one response (a
     model acting and confirming in the same turn — see
-    docs/TODO_BRAIN_GAP_FIXES.md Gap 5). Every tool_use block becomes
+    README.md "Several tool calls in one response"). Every tool_use block becomes
     its own ``ProposedAction``, in order, each keeping its own ``id``
     so the engine's follow-up ``tool_result`` threads back to the right
     one. If there's no tool_use at all, the concatenated text becomes

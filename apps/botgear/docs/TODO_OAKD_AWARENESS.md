@@ -7,6 +7,11 @@ service to make `worke` aware of its surroundings and, eventually,
 interact with them — without the vision pipeline competing with the
 robot's safety-critical watchdog for the same host's CPU.
 
+Status verified 2026-10-10: Level 0 shipped; Branch B is the `slam`
+service (in development — `repo/slam/1.0.0/README.md`); Level 1, Branch A, the
+watchdog-priority work in §3 and the §4 interaction milestone are not
+started.
+
 No phase here is scheduled or approved for implementation. Each phase
 gets its own proper design pass (research, plan, review — same process
 as `repo/oakd/1.0.0/README.md`) when it's actually taken up.
@@ -90,7 +95,7 @@ full visual SLAM: no dense feature tracking, no loop closure, no drift
 correction — the map will drift over long/complex traversals, and that
 tradeoff is what keeps it cheap.
 
-This got developed into a full design: **`docs/TODO_SLAM.md`** — a new
+This got developed into a full design: **`repo/slam/1.0.0/README.md`** — a new
 service (`slam`) that owns robot dimensions, camera mount extrinsics,
 and odometry fusion, deliberately kept dependency-light (no OpenCV, no
 depthai — just numpy + trig) so it stays low-resource by construction,
@@ -100,7 +105,7 @@ the actual unit — see `repo/oakd/1.0.0/README.md`'s resolved open question) *a
 `motor_control`/`sabertooth` are confirmed strictly open-loop (no wheel
 encoders anywhere in this codebase today) — so odometry is open-loop
 dead-reckoning from commanded output, a named accuracy limitation, not
-a hidden one. See `docs/TODO_SLAM.md` for the full design.
+a hidden one. See `repo/slam/1.0.0/README.md` for the full design.
 
 ### Level 4 — dense/semantic SLAM
 Genuinely compute-intensive — dense mapping, semantic scene
@@ -146,7 +151,7 @@ starts causing problems:
 
 "At some point interact with them" doesn't need new infrastructure.
 Branch A (person detection) plugs directly into work already shipped
-this session: the `messaging` capability (`docs/TODO_MESSAGING.md`) and
+this session: the `messaging` capability (`packages/rlx_messaging/README.md`) and
 the brain's `conversation_session` workflow, which already knows how to
 run a `listen`/`speak` loop against `chat`/`speech_local`/etc.
 
@@ -165,7 +170,7 @@ specifically because it costs almost nothing beyond Branch A itself.
 1. **Level 1** (proximity zones) — cheap, immediately useful, arguably
    *strengthens* rather than competes with the watchdog since it's a
    legitimate additional safety-adjacent signal.
-2. **Branch B** (`slam` — 2D occupancy mapping, `docs/TODO_SLAM.md`) —
+2. **Branch B** (`slam` — 2D occupancy mapping, `repo/slam/1.0.0/README.md`) —
    currently the most-designed of the two branches and the user's
    stated near-term priority; cheaper than Branch A (no NN/model
    management) and independent of it.

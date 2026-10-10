@@ -444,7 +444,7 @@ def _parse_response(
         )
 
     # Every tool call the model made in this one response — see
-    # docs/TODO_BRAIN_GAP_FIXES.md Gap 5. A model that both acts and
+    # README.md "Several tool calls in one response". A model that both acts and
     # confirms in the same turn (e.g. power_set + speak) used to have
     # the confirmation silently dropped; the engine now executes each
     # of these in order.

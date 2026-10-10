@@ -5,6 +5,8 @@
 
 CREATE TABLE IF NOT EXISTS "config" (
     "id" TEXT PRIMARY KEY,
+    "port" BIGINT,
+    "ssl_enabled" BOOLEAN,
     "database_type" TEXT,
     "data_dir" TEXT,
     "repo_dir" TEXT,
@@ -19,6 +21,8 @@ CREATE TABLE IF NOT EXISTS "config" (
 
 -- Add any missing columns to an existing table
 ALTER TABLE "config" ADD COLUMN IF NOT EXISTS "id" TEXT;
+ALTER TABLE "config" ADD COLUMN IF NOT EXISTS "port" BIGINT;
+ALTER TABLE "config" ADD COLUMN IF NOT EXISTS "ssl_enabled" BOOLEAN;
 ALTER TABLE "config" ADD COLUMN IF NOT EXISTS "database_type" TEXT;
 ALTER TABLE "config" ADD COLUMN IF NOT EXISTS "data_dir" TEXT;
 ALTER TABLE "config" ADD COLUMN IF NOT EXISTS "repo_dir" TEXT;

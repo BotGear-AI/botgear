@@ -136,8 +136,8 @@ async def test_speak_defaults_to_last_inbound_channel(svc):
     """No explicit channel + no configured default_channel: fall back
     to the channel the most recent inbound message arrived on — lets a
     caller (LLM tool call, UI composer, script) reply correctly without
-    threading channel through itself (docs/TODO_BRAIN_GAP_FIXES.md's
-    conversation_session gap; the underlying fix)."""
+    threading channel through itself (the conversation_session gap
+    this fixed)."""
     await svc._on_inbox({"text": "hi", "sender": "op", "channel": "dm-42"})
     result = await svc.speak("hello back")
     assert svc.sent == [("dm-42", "hello back")]

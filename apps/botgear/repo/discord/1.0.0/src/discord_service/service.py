@@ -1,7 +1,7 @@
 # unmanaged
 """DiscordService — the `messaging` capability over Discord's Gateway.
 
-See ``apps/botgear/docs/TODO_MESSAGING.md`` for the full design. All the
+See ``packages/rlx_messaging/README.md`` for the full design. All the
 generic plumbing (inbox queue, listen/speak/send/list_channels, retained
 state) lives in ``rlx_messaging.MessagingServiceBase`` — this module only
 implements the Discord-specific hooks.

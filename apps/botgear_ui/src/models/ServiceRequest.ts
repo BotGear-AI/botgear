@@ -27,7 +27,7 @@ export function createEmptyServiceRequest(): ServiceRequest {
     new_name: undefined,
     dry_run: undefined,
     rewrite_references: undefined,
-    placeholder: undefined,
+    placeholder: false,
     workspace_id: undefined,
     service_proxy_id: undefined,
     config: undefined,
@@ -81,11 +81,11 @@ export const ServiceRequestSchema = {
     },
     "dry_run": {
       "type": "boolean",
-      "description": "rename only: report what would change without changing anything"
+      "description": "rename only - report what would change without changing anything"
     },
     "rewrite_references": {
       "type": "boolean",
-      "description": "rename only: rewrite references to the old name in other services' configs (default true); false only reports them"
+      "description": "rename only - rewrite references to the old name in other services' configs (default true); false only reports them"
     },
     "placeholder": {
       "type": "boolean",

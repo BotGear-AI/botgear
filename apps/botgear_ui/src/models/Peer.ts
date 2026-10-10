@@ -8,6 +8,7 @@ export interface Peer {
   state?: string;
   upstream_subs?: string[];
   collision?: string;
+  auth?: string;
 }
 
 export function createEmptyPeer(): Peer {
@@ -19,6 +20,7 @@ export function createEmptyPeer(): Peer {
     state: undefined,
     upstream_subs: undefined,
     collision: undefined,
+    auth: undefined,
   };
 }
 
@@ -70,6 +72,11 @@ export const PeerSchema = {
     "collision": {
       "type": "string",
       "description": "Set when the peer's runtime id collides with ours; human-readable detail"
+    },
+    "auth": {
+      "type": "string",
+      "description": "Credential type in use for this connection \u2014 'api_key' (per-peer, revocable) or 'shared_secret' (JWT_SECRET_KEY). Never the secret itself.",
+      "example": "api_key"
     }
   }
 }

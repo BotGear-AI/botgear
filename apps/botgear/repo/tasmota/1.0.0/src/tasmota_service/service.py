@@ -207,11 +207,11 @@ class TasmotaService(SubprocessService):
             self._relays.sort(key=lambda x: x["index"])
 
     # ─── power_switch capability ───────────────────────────────────────
-    # args_schema is hand-written, not introspected — subprocess methods
-    # get no type-hint-derived schema (docs/TODO_BRAIN_GAP_FIXES.md
-    # Gap 6); without this a brain tool call sees `{}` and has been
-    # observed both hallucinating a phantom argument and guessing a
-    # wrong `relay` default.
+    # args_schema is hand-written rather than introspected from the
+    # signature: it adds `additionalProperties: false`, which blocks the
+    # phantom arguments a brain model was observed inventing (and a
+    # guessed `relay` default) back when subprocess methods carried no
+    # schema at all.
     @service_method("power_set", publishes=["state"], args_schema={
         "type": "object",
         "properties": {

@@ -88,7 +88,7 @@ class ExitOnPhrase(BaseModel):
                     "Payload's ``text`` field is the candidate string. "
                     "Example: ``/chat/+/inbox`` to catch every chat instance. Accepts a LIST "
                     "of topics too — needed when more than one `messaging`-capability service "
-                    "type might be running (see docs/TODO_MESSAGING.md): a single MQTT-style "
+                    "type might be running (see packages/rlx_messaging/README.md): a single MQTT-style "
                     "pattern can wildcard one path SEGMENT but can't alternate between "
                     "different literal type-name segments, e.g. it can't express "
                     "'/chat/+/inbox OR /discord/+/inbox' as one string.",
@@ -351,7 +351,7 @@ class ModelResponse(BaseModel):
     round-trip, in the order the provider returned them — a model can
     (and, observed in practice, sometimes does) emit several tool calls
     in a single response, e.g. an action plus its own confirmation
-    ``speak()`` (see docs/TODO_BRAIN_GAP_FIXES.md Gap 5). Always has at
+    ``speak()`` (see README.md "Several tool calls in one response"). Always has at
     least one entry: an adapter that only constructs ``action`` (single-
     action response, or any path written before this field existed)
     gets ``actions=[action]`` for free via the validator below.

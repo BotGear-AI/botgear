@@ -8,3 +8,4 @@ from models.auth_registration import AuthRegistration
 class Registration(AuthRegistration):
 
     pass
+

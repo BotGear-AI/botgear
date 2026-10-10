@@ -54,16 +54,23 @@ def is_release_version(s: Optional[str]) -> bool:
 
 
 def platform_tag() -> str:
-    """The bundle platform tag, matching packaging/build.sh's PLATFORM_TAG
-    (e.g. ``linux-x86_64``, ``linux-aarch64``)."""
-    osname = {
-        "linux": "linux", "darwin": "macos", "windows": "windows",
-    }.get(platform.system().lower(), platform.system().lower())
-    arch = {
-        "x86_64": "x86_64", "amd64": "x86_64",
-        "aarch64": "aarch64", "arm64": "aarch64",
-    }.get(platform.machine().lower(), platform.machine().lower())
+    """The bundle platform tag, byte-for-byte packaging/build.sh's
+    PLATFORM_TAG — ``<uname -s>-<uname -m>`` lowercased, MINGW/MSYS folded
+    to ``windows``: ``linux-x86_64``, ``linux-aarch64``, ``darwin-arm64``,
+    ``windows-x86_64``. Asset lookup matches on it, so it must not be
+    "prettified" (macOS reports arm64, Linux aarch64 — both kept as-is)."""
+    osname = platform.system().lower()
+    arch = platform.machine().lower()
+    if osname == "windows" and arch == "amd64":  # Windows Python reports AMD64
+        arch = "x86_64"
     return f"{osname}-{arch}"
+
+
+def self_update_supported(ptag: Optional[str] = None) -> bool:
+    """update_apply swaps a ``.tar.gz`` bundle and re-execs in place — POSIX
+    only. Windows ships a ``.zip`` + ``botgear.exe`` and is updated by
+    downloading the new release by hand."""
+    return not (ptag or platform_tag()).startswith("windows-")
 
 
 def decide(current: Optional[str], latest: Optional[str]) -> Tuple[bool, str]:

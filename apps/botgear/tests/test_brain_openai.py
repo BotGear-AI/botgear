@@ -86,7 +86,7 @@ def test_encode_tools_openai_function_shape():
     """OpenAI uses {type: function, function: {name, description, parameters}}.
 
     Names come from adapters.base.resolve_tool_names (see
-    docs/TODO_BRAIN_GAP_FIXES.md Gap 1) — a unique action name encodes
+    repo/brain/1.0.0/README.md "Tool names") — a unique action name encodes
     under its own bare name, matching ollama/anthropic and what a
     workflow prompt says to call. Previously this adapter alone always
     used opaque tool_NNN, even with no collision."""
@@ -226,7 +226,7 @@ async def test_observe_room_via_openai(workspace, tool_catalog):
     def _resp(tool_idx: int, name: str, args: dict, *, in_tok: int, out_tok: int) -> Dict[str, Any]:
         # Names come from resolve_tool_names — bare action name here,
         # since all 4 allowed actions in this workflow are unique (see
-        # docs/TODO_BRAIN_GAP_FIXES.md Gap 1).
+        # repo/brain/1.0.0/README.md "Tool names").
         return {
             "choices": [{"message": {
                 "tool_calls": [{

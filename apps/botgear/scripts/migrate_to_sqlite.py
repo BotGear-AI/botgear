@@ -7,8 +7,8 @@ which case each migrated ``<table>.json`` is renamed to ``<table>.json.bak``
 as a backup — never deleted. Safe to re-run: uses upsert_item, so a
 partial or repeated run just re-copies the same rows.
 
-See TODO_SQLITE.md for why this exists (lowdb/TinyDB corrupts the whole
-table on an interrupted write; sqlite doesn't).
+Why: lowdb/TinyDB corrupts the whole table on an interrupted write;
+sqlite doesn't.
 
 Usage (from apps/botgear):
 

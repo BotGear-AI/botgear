@@ -4,8 +4,8 @@
 Boots a real SqliteDatabase against every model botgear's on_startup()
 ensures a table for, then round-trips a row through the same
 insert/get/list_tables surface admin_db_api.py and the service layer use.
-See TODO_SQLITE.md for why this backend exists (lowdb/TinyDB corruption on
-an interrupted write).
+sqlite is the default because lowdb/TinyDB corrupts a whole table on an
+interrupted write.
 """
 import sys
 from pathlib import Path

@@ -22,8 +22,7 @@ def resolve_tool_names(tools: List[ToolDescriptor]) -> List[str]:
     """Compute one provider-safe, legible name per tool, in order.
 
     Every adapter needs this — duplicated three times with drifting
-    behavior before this was factored out (see docs/TODO_BRAIN_GAP_FIXES.md
-    Gap 1). Strategy, applied per tool against names already claimed by
+    behavior before this was factored out (see README.md "Tool names"). Strategy, applied per tool against names already claimed by
     earlier tools in this same list:
 
     1. The bare action name, if it's a valid tool-name shape AND not

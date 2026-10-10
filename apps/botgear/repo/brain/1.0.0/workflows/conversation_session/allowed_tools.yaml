@@ -6,7 +6,7 @@ allowed:
   #   speech_local — audio OUTPUT (speak) via Piper TTS, topic root /speech/
   #   stt_local    — audio INPUT (listen) via sherpa-onnx STT, topic root /stt/
   #   discord/slack/google_chat — the `messaging` capability (see
-  #     docs/TODO_MESSAGING.md), same listen/speak contract as chat.
+  #     packages/rlx_messaging/README.md), same listen/speak contract as chat.
   #     google_chat is speak-only in v1 (no listen action to grant, but
   #     listing it here is harmless — a not-running/not-applicable action
   #     just never appears in the live tool catalog).
@@ -30,7 +30,7 @@ allowed:
     actions: [move]
   - topic: /brain/*/control
     actions: [read_memory, write_memory]
-  # Named power switches only (see docs/TODO_BRAIN_GAP_FIXES.md Gap 2) —
+  # Named power switches only —
   # exact per-device topics, not /tasmota/*/control, so a new Tasmota
   # device doesn't silently become chat-controllable just by existing.
   # pulse/connect/disconnect deliberately excluded: different risk

@@ -9,6 +9,7 @@ from config import create_app_settings
 from botgear.models.config import Config as BotgearConfig
 from botgear.pipeline import Pipeline
 from botgear.server import AppServer
+from botgear.resource_monitor import ResourceMonitor, resolve_disk_paths
 from botgear.event_handlers import on_startup, on_shutdown
 from dotenv import load_dotenv
 
@@ -80,6 +81,7 @@ async def run():
     logger.debug("Debug logging enabled at level: %s", log_level)
 
 
+
     # Diagnostics: Log config source for each setting - removed to avoid logging sensitive config values
     # logger.info("Configuration diagnostics:")
     # for field, value in settings.model_dump().items():
@@ -111,6 +113,17 @@ async def run():
 
     if settings.app_server_enabled:
         components.append(AppServer(settings))
+
+    if getattr(settings, "resource_monitor_enabled", False):
+        # Watch "/" plus this app's own data directory, if it has one and
+        # it's a different path — app data commonly lives on a separately
+        # mounted volume that can fill up while "/" stays nowhere near
+        # full. ("/" sitting at 51% while a separately mounted data volume
+        # hit 100% is exactly what went unnoticed before this was wired
+        # up — nothing was watching the second volume at all.) The same
+        # resolve_disk_paths() also backs /server-status's on-demand
+        # reading, so both never silently disagree about what's watched.
+        components.append(ResourceMonitor(settings, disk_paths=resolve_disk_paths(settings)))
 
     try:
         await asyncio.gather(*(comp.run() for comp in components))

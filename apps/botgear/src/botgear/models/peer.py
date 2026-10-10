@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class Peer(BaseModel):
     id: Optional[str] = Field(None, description="Peer key — the remote_id once known, else the connect URL (primary key)")

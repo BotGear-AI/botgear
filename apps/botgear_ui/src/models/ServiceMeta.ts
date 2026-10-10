@@ -362,7 +362,7 @@ export const ServiceMetaSchema = {
       "additionalProperties": true
     },
     "ui": {
-      "description": "Modular service-UI bundle descriptor (Option B \u2014 see docs/TODO_SERVICE_UI_BUNDLES.md). When present, the service ships a pre-built frontend ESM the host dynamically imports instead of a built-in serviceViews component. Shape \u2014 entry='ui/dist/ui.js', css?='ui/dist/ui.css', sdk='^1.0'. None = no bundled UI.",
+      "description": "Modular service-UI bundle descriptor (Option B \u2014 see repo/README.md's \"Adding a UI\" section). When present, the service ships a pre-built frontend ESM the host dynamically imports instead of a built-in serviceViews component. Shape \u2014 entry='ui/dist/ui.js', css?='ui/dist/ui.css', sdk='^1.0'. None = no bundled UI.",
       "type": "object",
       "additionalProperties": true
     }

@@ -11,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from botgear.service_response import info_message
-from invoker import safe_invoke
+from invoker import safe_invoke, module_function_exists
+from auth.jwt_util import mint_purpose_token, verify_purpose_token, revoke_jwt, set_revocation_store
 from fastapi.responses import FileResponse, Response, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from botgear.models.registration import Registration
@@ -29,8 +30,12 @@ from botgear.registration_service import verify_and_register
 from botgear.service_response import ServiceResponseMessage
 from auth.factory import get_auth_provider
 from pydantic import BaseModel, Field
-from typing import Any, List, Optional, Literal
-from auth.generate_ssl import generate_self_signed_cert
+from typing import Any, List, NamedTuple, Optional, Literal
+from auth.generate_ssl import (
+    DEFAULT_CERT_FILE,
+    DEFAULT_KEY_FILE,
+    generate_self_signed_cert,
+)
 from contextlib import asynccontextmanager
 from botgear.event_handlers import on_oauth_callback, on_get_oauth_provider_config, on_get_auth_session_ttl_seconds, on_get_jwt_access_token_ttl_minutes, on_get_auth_session_idle_timeout_seconds
 from models.auth_oauth_provider_config import AuthOauthProviderConfig
@@ -107,61 +112,127 @@ def session_client_metadata(request) -> dict:
     }
 
 
-def _delete_active_sessions_for_identity(db, identity: Optional[str]) -> int:
-    """Delete all active auth_session rows for a TRUSTED identity. Best-effort:
-    returns the count deleted, never raises.
+class SessionPurgeResult(NamedTuple):
+    """Outcome of a best-effort auth_session purge.
+
+    ``deleted`` rows are gone; ``failed`` rows were found but could not be
+    deleted; ``query_failed`` means we never obtained a list to work from. A
+    caller that reports success to the user MUST check ``complete`` first —
+    answering "Logout successful" while a session row survives tells the client
+    it is signed out when it is not.
+    """
+
+    deleted: int = 0
+    failed: int = 0
+    query_failed: bool = False
+
+    @property
+    def complete(self) -> bool:
+        """True only when every active session for the identity is gone."""
+        return self.failed == 0 and not self.query_failed
+
+
+def _purge_active_sessions_for_identity(db, identity: Optional[str]) -> SessionPurgeResult:
+    """Delete all active auth_session rows for a TRUSTED identity. Never raises;
+    partial failure is reported in the result rather than swallowed.
 
     #302: the identity MUST come from a verified source (the caller's
     authenticated access token) — never from an attacker-controllable, unsigned
     id_token_hint. OAuth sessions store the lowercased email/id as user_id.
     """
-    if not db or not identity:
-        return 0
+    if not identity:
+        return SessionPurgeResult()
     identity = str(identity).strip().lower()
     if not identity:
-        return 0
-    deleted = 0
+        return SessionPurgeResult()
+    if not db:
+        # A missing database is NOT an empty session list -- we never got to
+        # look. Reporting `complete` here would let POST /v1/logout answer
+        # "Logout successful" while every auth_session row is still live:
+        # get_db_provider() returns get_database_client(), which is Optional and
+        # yields None when no default client is registered, and OAuth token
+        # verification is stateless, so the caller still resolves. The
+        # count-only wrapper below is unaffected -- GET /v1/oauth/logout reads
+        # `.deleted` and redirects either way.
+        logger.warning(f"session cleanup has no database configured; cannot purge sessions for {identity}")
+        return SessionPurgeResult(query_failed=True)
     try:
         sessions = db.query_items("auth_session", {"user_id": identity, "status": "active"})
-        for session in sessions:
-            try:
-                db.delete_item("auth_session", session["id"])
-                deleted += 1
-            except Exception as del_err:
-                logger.warning(f"oauth_logout: failed to delete session {session.get('id')}: {del_err}")
-        logger.info(f"oauth_logout deleted {deleted} active session(s) for {identity}")
     except Exception as exc:
-        logger.warning(f"oauth_logout session cleanup failed for {identity}: {exc}")
-    return deleted
+        logger.warning(f"session cleanup could not list sessions for {identity}: {exc}")
+        return SessionPurgeResult(query_failed=True)
+    deleted = 0
+    failed = 0
+    for session in sessions:
+        try:
+            db.delete_item("auth_session", session["id"])
+            deleted += 1
+        except Exception as del_err:
+            failed += 1
+            logger.warning(f"failed to delete session {session.get('id')} for {identity}: {del_err}")
+    logger.info(f"deleted {deleted} active session(s) for {identity} ({failed} failed)")
+    return SessionPurgeResult(deleted=deleted, failed=failed)
 
-def build_oauth_state(user_id: Optional[str], *, sso_config_id: Optional[str] = None) -> str:
-    """Build an opaque OAuth state token.
+
+def _delete_active_sessions_for_identity(db, identity: Optional[str]) -> int:
+    """Count-only wrapper for callers that proceed regardless of the outcome —
+    GET /v1/oauth/logout redirects to the IdP either way.
+    """
+    return _purge_active_sessions_for_identity(db, identity).deleted
+
+OAUTH_STATE_PURPOSE = "oauth_state"
+OAUTH_STATE_TTL_MINUTES = 10
+
+
+def build_oauth_state(user_id: Optional[str], *, sso_config_id: Optional[str] = None,
+                      extra: Optional[dict[str, Any]] = None) -> str:
+    """Issue the OAuth `state`: a signed, expiring single-purpose token (never
+    usable as a bearer credential). The callback accepts only a state this
+    server issued in the last OAUTH_STATE_TTL_MINUTES, so a missing, forged or
+    replayed-after-expiry state is rejected.
 
     `sso_config_id` is optional and used by multi-tenant deployments to route
-    the callback to the right per-tenant SSO config. Apps that don't supply it
-    behave exactly as before — the key is simply omitted from the payload.
+    the callback to the right per-tenant SSO config. `extra` adds app claims
+    (e.g. an integration flow's kind/provider) that the callback reads back.
     """
-    payload = {
-        "nonce": secrets.token_urlsafe(16),
-    }
+    claims: dict[str, Any] = {**(extra or {}), "nonce": secrets.token_urlsafe(16)}
     if user_id:
-        payload["user_id"] = user_id
+        claims["user_id"] = user_id
     if sso_config_id:
-        payload["sso_config_id"] = sso_config_id
-    raw = json.dumps(payload).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("utf-8")
+        claims["sso_config_id"] = sso_config_id
+    return mint_purpose_token(user_id or "anonymous", OAUTH_STATE_PURPOSE,
+                              ttl_minutes=OAUTH_STATE_TTL_MINUTES, claims=claims)
 
 
 def decode_oauth_state(value: Optional[str]) -> Optional[dict[str, Any]]:
+    """The claims of a state this server issued and that hasn't expired, else None."""
     if not value:
         return None
-    try:
-        padded = value + "=" * (-len(value) % 4)
-        decoded = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
-        return json.loads(decoded)
-    except Exception:
-        logger.warning("Failed to decode OAuth state payload")
-        return None
+    payload = verify_purpose_token(value, OAUTH_STATE_PURPOSE)
+    if payload is None:
+        logger.warning("OAuth state missing, forged, or expired")
+    return payload
+
+
+class _AuthSessionRevocations:
+    """Revoked access tokens, shared by every server process: one auth_session
+    row per token (id "jti_<jti>", status "revoked") that expires with the
+    token. No user_id, so a user's session list (and "no sessions left after
+    logout") never sees them; session purges only delete status="active" rows,
+    so they survive later logouts."""
+
+    def revoke(self, jti: str, expires_at: int, subject: Optional[str]) -> None:
+        db = get_database_client()
+        if not db:
+            return
+        now_ms = int(time.time() * 1000)
+        row = {"id": f"jti_{jti}", "status": "revoked", "created": now_ms,
+               "revoked_at": now_ms, "expires_at": int(expires_at) * 1000}
+        db.insert_item("auth_session", row["id"], row)
+
+    def is_revoked(self, jti: str) -> bool:
+        db = get_database_client()
+        return bool(db and db.get_item("auth_session", f"jti_{jti}"))
 
 # Define request models for proper API documentation
 # FIXME - move to package/models !!!
@@ -187,11 +258,6 @@ class ResetPasswordRequest(BaseModel):
     resetToken: str
     newPassword: str
 
-class AcceptInviteRequest(BaseModel):
-    token: str = Field(..., description="Single-use invite token from the invitation email")
-    newPassword: str = Field(..., description="The password the invitee chooses")
-    fullname: Optional[str] = Field(None, description="Optional display name the invitee provides")
-
 class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
@@ -208,7 +274,7 @@ async def lifespan(app: FastAPI):
     print("Starting up...")  # Setup: DB connection, worker init, etc.
     yield
     print("Shutting down...")  # Teardown: close DB, cleanup tasks, etc.
-    
+
 class AppServer:
     def __init__(self, settings: BotgearConfig):
         self.settings : BotgearConfig = settings
@@ -230,6 +296,7 @@ class AppServer:
             assert_jwt_secret_configured(require=False)
         except ImportError:
             pass
+        set_revocation_store(_AuthSessionRevocations())
 
         self.app = FastAPI(title="Botgear", lifespan=lifespan, version=version.get("version", "0.0.0"), openapi_tags=[{'name': 'Config'}, {'name': 'User'}, {'name': 'Service Meta'}, {'name': 'Service Proxy'}, {'name': 'Service Config'}, {'name': 'Workspace'}, {'name': 'Peer'}, {'name': 'Config Set'}, {'name': 'Link'}, {'name': 'Service Request'}, {'name': 'Script'}, {'name': 'Registration'}, {'name': 'Api Client', 'description': "API client credentials for external/service-to-service access. A client authenticates by sending its secret in the X-API-Key header; the matching row's roles then drive the same role gates as a logged-in user. Full CRUD for management (Admin-gated); validate_api_client_secret is an internal helper the auth package's X-API-Key handler calls and is not exposed as a route."}])
         # CORS (#275): allow_origins=["*"] together with allow_credentials=True makes
@@ -269,7 +336,7 @@ class AppServer:
             response = await call_next(request)
             logger.info(f"HTTP {request.method} {request.url.path} -> {response.status_code}")
             return response
-        
+
         @self.app.middleware("http")
         async def set_cache_headers(request: Request, call_next):
             response = await call_next(request)
@@ -498,7 +565,17 @@ class AppServer:
     def _register_routes(self):
         @self.app.get("/v1/version")
         def get_version():
-            return version
+            # `version` is loaded once from version.json at process start.
+            # Apps can enrich the payload with their own live-computed
+            # fields (e.g. a separately-checked-out engine repo's current
+            # commit) by defining get_version_extra() -> Optional[dict] in
+            # their own event_handlers.py — safe_invoke no-ops for every
+            # app that doesn't define it.
+            payload = dict(version)
+            extra = safe_invoke("botgear.event_handlers", "get_version_extra")
+            if extra:
+                payload.update(extra)
+            return payload
 
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket):
@@ -529,11 +606,28 @@ class AppServer:
             user = db.get_item("user", user_id)
             if not user:
                 raise HTTPException(status_code=404, detail="User not found")
+            # Optional per-app MFA-enrolment gate, same shape as
+            # on_pre_login_check. Apps opt in by defining
+            # on_mfa_setup_check(user, db) in their event_handlers.py,
+            # returning {"status_code": int, "detail": str} to deny enrolment
+            # (e.g. this user's IdP owns MFA, so standalone TOTP enrolment
+            # would seed a way to bypass it), or None/falsy to allow it. Apps
+            # that don't define the hook: silent no-op (safe_invoke returns None).
+            denial = safe_invoke("botgear.event_handlers", "on_mfa_setup_check", [user, db])
+            if denial:
+                logger.warning(f"MFA setup denied by on_mfa_setup_check for user {user_id}: {denial}")
+                raise HTTPException(
+                    status_code=denial.get("status_code", 403),
+                    detail=denial.get("detail", "MFA setup denied"),
+                )
             secret = generate_totp_secret(user_id)
             user["totp_secret"] = secret
             user["is_mfa_enabled"] = True
             db.update_item("user", user_id, user)
-            uri = get_totp_uri(user_id, secret, self.settings.base_url)
+            # getattr: base_url is not a field on every app's Config (hyrule_api's
+            # has none), and a bare attribute access 500'd here AFTER the update
+            # above had already enabled MFA with a secret the caller never saw.
+            uri = get_totp_uri(user_id, secret, getattr(self.settings, "base_url", None))
             return {"secret": secret, "otp_auth_url": uri}
 
         @self.app.get("/v1/mfa/qrcode")
@@ -547,7 +641,15 @@ class AppServer:
             user = db.get_item("user", user_id)
             if not user or not user.get("totp_secret"):
                 raise HTTPException(status_code=404, detail="MFA not set up for this user")
-            uri = get_totp_uri(user_id, user.get("totp_secret"), self.settings.base_url)
+            # Companion to /v1/mfa/setup's gate above -- same hook, same reasoning.
+            denial = safe_invoke("botgear.event_handlers", "on_mfa_setup_check", [user, db])
+            if denial:
+                logger.warning(f"MFA qrcode denied by on_mfa_setup_check for user {user_id}: {denial}")
+                raise HTTPException(
+                    status_code=denial.get("status_code", 403),
+                    detail=denial.get("detail", "MFA setup denied"),
+                )
+            uri = get_totp_uri(user_id, user.get("totp_secret"), getattr(self.settings, "base_url", None))
             return generate_qr_code(uri)
         
         # Include API routes
@@ -646,7 +748,7 @@ class AppServer:
         # the catalog/sources aren't CRUD collections. DEFICIT: (a) attaching
         # actions to a non-CRUD/aggregate resource, and (b) async action
         # handlers (the generated -request handler is sync). See
-        # repo/README.md's "Lifecycle states" section.
+        # docs/TODO_REPO.md.
         from botgear.api.registry_api import register_registry_routes
         register_registry_routes(self.app, self.get_db_provider)
 
@@ -806,7 +908,11 @@ class AppServer:
 
             current_user = self._get_authenticated_user(request)
             state_payload = decode_oauth_state(state)
-            if state_payload and state_payload.get("user_id") and current_user and state_payload["user_id"] != current_user.get("id"):
+            if state_payload is None:
+                # Not issued by this server's /v1/oauth-config (or expired):
+                # nothing ties this callback to a login that was started here.
+                raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+            if state_payload.get("user_id") and current_user and state_payload["user_id"] != current_user.get("id"):
                 logger.error(
                     "OAuth state mismatch: expected user %s but received %s",
                     current_user.get("id"),
@@ -929,6 +1035,13 @@ class AppServer:
                 # plus a UUID refresh_token backed by the auth_session table.
                 session_email = (email or user_data.get("email") or "").strip().lower()
                 if session_email:
+                    # Same rule as password login: a disabled or locked account
+                    # gets no session, or disabling a user does nothing under SSO.
+                    _db = self.get_db_provider()
+                    _status = ((_db.get_item("user", session_email) or {}).get("status")) if _db else None
+                    if _status in ("disabled", "locked"):
+                        logger.warning(f"SSO login denied for {_status} user: {session_email}")
+                        raise HTTPException(status_code=403, detail="Account is not active")
                     server_user = {
                         "id": session_email,
                         "email": session_email,
@@ -966,26 +1079,6 @@ class AppServer:
                             "last_login": now_ms,
                             "modified": now_ms,
                         }
-                        # #310: an IdP sign-in that matches a PENDING invite
-                        # accepts it. The identity provider is decoupled from
-                        # role + tenant — those came from the invite and are
-                        # preserved by the merge above (a brand-new identity gets
-                        # roles=[], i.e. least-privilege, never auto-admin). Here
-                        # we just activate the account and consume the token.
-                        if existing_user.get("status") == "invited":
-                            user_record["status"] = "active"
-                            user_record["email_verified"] = True
-                            user_record["invite_token"] = None
-                            user_record["invite_token_expiry"] = None
-                            # Role + tenant come from the INVITE, not the IdP
-                            # (#310 decoupling). Pin them to the pending row so an
-                            # IdP-supplied `roles` claim can't override what the
-                            # admin granted at invite time (no privilege
-                            # escalation via a misconfigured identity provider).
-                            user_record["roles"] = existing_user.get("roles") or []
-                            if existing_user.get("tenant_id"):
-                                user_record["tenant_id"] = existing_user.get("tenant_id")
-                            logger.info("OAuth sign-in accepted pending invite for %s", session_email)
 
                         if existing_user:
                             db.update_item("user", session_email, user_record)
@@ -1000,7 +1093,7 @@ class AppServer:
                         auth_session = {
                             "id": session_id,
                             "user_id": session_email,
-                            "tenant_id": user_data.get("tenant_id"),
+                            "tenant_id": user_record.get("tenant_id"),
                             "refresh_token_hash": refresh_token_hash,
                             "status": "active",
                             "created": now_ms,
@@ -1042,9 +1135,21 @@ class AppServer:
             Generic OAuth2 logout handler.
             Constructs logout URL and redirects to OAuth provider.
 
-            This is the path the SPA actually uses to sign out (a top-level
-            browser redirect), so it is also where we tear down the server-side
-            auth_session rows — POST /v1/logout is never reached by the SPA.
+            This is the IdP-redirect half of sign-out (a top-level browser
+            redirect). Since 00d78834 (2026-06-03) the SPA calls POST
+            /v1/logout first and then follows this redirect
+            (apps/hyrule_ui/hooks/useAuth.tsx), and POST is what guarantees the
+            server-side teardown.
+
+            This route purges too, but only for a caller it can verify, which in
+            practice means a non-browser one: a top-level navigation never sends
+            an Authorization header, and the SPA has already dropped its token
+            from localStorage by the time it assigns window.location.href
+            (useAuth.tsx). So a browser arriving here resolves caller=None,
+            purges nothing, and just redirects — correctly, because its POST did
+            the work. The purge below is for a direct GET that does carry a
+            Bearer token (curl, a CLI); it is a best-effort second line, not the
+            one that has to hold.
             """
             logger.debug("--> oauth_logout")
             try:
@@ -1065,6 +1170,8 @@ class AppServer:
                 # purges nothing (it still redirects).
                 caller = self._get_authenticated_user(request)
                 caller_identity = (caller or {}).get("id") or (caller or {}).get("email")
+                if caller:
+                    revoke_jwt(self._bearer_token(request))
                 _delete_active_sessions_for_identity(db, caller_identity)
 
                 post_logout_redirect_uri = (
@@ -1116,7 +1223,7 @@ class AppServer:
                     if not registration.client_base_url:
                         registration.client_base_url = (
                             request.headers.get("origin")
-                            or self.settings.base_url
+                            or getattr(self.settings, "base_url", None)
                             or f"{request.url.scheme}://{request.url.netloc}"
                         )
                     registration.verification_token = str(uuid.uuid4())
@@ -1125,16 +1232,33 @@ class AppServer:
                     registration.password = None
                     registration.created = int(time.time() * 1000)  # Milliseconds
                     registration.state = "registered"  # Initial state
-                    if not registration.user_id:
-                        registration.user_id = registration.email
+                    # A user's id IS their (lowercased) email. Accepting any other
+                    # client-supplied user_id would let a registration for an
+                    # email the caller owns create or reactivate someone else's
+                    # account on verification.
+                    if registration.user_id and registration.user_id.lower() != registration.email:
+                        raise HTTPException(status_code=422, detail="user_id must be the registration email")
+                    registration.user_id = registration.email
                     
                     db.insert_item("registration", registration.id, registration.model_dump())
                     logger.info(f"Registration created for {registration.email} with state=registered")
 
-                    try:
-                        send_verification_email(self.settings, registration)
-                    except Exception as email_err:
-                        logger.warning(f"Verification email not sent (continuing): {email_err}")
+                    # Apps opt into a styled (HTML) verification email by defining
+                    # on_send_verification_email(settings, registration) in their own
+                    # event_handlers.py -- it takes over the send entirely (so it can
+                    # pass html_template_path to send_verification_email itself).
+                    # Apps that don't define it get today's plain-text-only send,
+                    # unchanged.
+                    if module_function_exists("botgear.event_handlers", "on_send_verification_email"):
+                        try:
+                            safe_invoke("botgear.event_handlers", "on_send_verification_email", [self.settings, registration])
+                        except Exception as email_err:
+                            logger.warning(f"Verification email not sent (continuing): {email_err}")
+                    else:
+                        try:
+                            send_verification_email(self.settings, registration)
+                        except Exception as email_err:
+                            logger.warning(f"Verification email not sent (continuing): {email_err}")
 
                 safe_invoke("botgear.event_handlers", "on_new_registration", [registration, request])
 
@@ -1176,7 +1300,6 @@ class AppServer:
                 if not user:
                     logger.warning(f"User not found: {user_id}")
                     raise HTTPException(status_code=401, detail="Invalid credentials")
-
                 user_status = user.get("status")
                 if user_status == "invited":
                     # Pending invite — the account exists but has no credential
@@ -1188,20 +1311,50 @@ class AppServer:
                     logger.warning(f"Login denied for {user_status} user: {user_id}")
                     raise HTTPException(status_code=403, detail="Account is not active")
 
+                # Optional per-app pre-login gate. Apps opt in by defining
+                # on_pre_login_check(user, db) in their event_handlers.py,
+                # returning {"status_code": int, "detail": str} to deny the
+                # login, or None/falsy to allow it — e.g. use this
+                # to block sign-in for a user whose tenant is
+                # suspended/inactive (#380), a concept apps without a tenant
+                # table have no reason to define. Apps that don't define the
+                # hook: silent no-op (safe_invoke returns None).
+                denial = safe_invoke("botgear.event_handlers", "on_pre_login_check", [user, db])
+                if denial:
+                    logger.warning(f"Login denied by on_pre_login_check for user {user_id}: {denial}")
+                    raise HTTPException(
+                        status_code=denial.get("status_code", 403),
+                        detail=denial.get("detail", "Login denied"),
+                    )
+
                 token = self.auth.authenticate(user_id, password, ttl_minutes=on_get_jwt_access_token_ttl_minutes(request))
                 if not token:
                     logger.warning(f"Authentication failed for user: {user_id}")
                     raise HTTPException(status_code=401, detail="Invalid credentials")
-                
-                # Generate refresh token and store session
+
+                now_ms = int(time.time() * 1000)
+
+                if user.get("is_mfa_enabled"):
+                    # Deliberately no auth_session row here: this request hasn't
+                    # completed login yet, and the token above is never returned
+                    # to the caller on this branch -- a session with a refresh
+                    # token nobody received would just be dead weight (and,
+                    # before single-purpose MFA tickets, an auth_session.status the caller could never
+                    # legitimately reach "active" for).
+                    safe_invoke(
+                        "botgear.event_handlers",
+                        "on_login",
+                        [user, request, {"mfa_required": True}],
+                    )
+                    return {"mfa_required": True, "message": "MFA verification required"}
+
+                # Generate refresh token and store session -- only reached once
+                # login has actually succeeded (no MFA step pending).
                 refresh_token = str(uuid.uuid4())
                 refresh_token_hash = hash_refresh_token(refresh_token)
-                
-                # Create auth_session record
-                now_ms = int(time.time() * 1000)
                 session_id = f"sess_{uuid.uuid4().hex[:16]}"
                 expires_at = now_ms + (on_get_auth_session_ttl_seconds(request) * 1000)
-                
+
                 auth_session = {
                     "id": session_id,
                     "user_id": user["id"],
@@ -1213,7 +1366,7 @@ class AppServer:
                     "last_used_at": now_ms,
                     **session_client_metadata(fastapi_request),
                 }
-                
+
                 try:
                     db.insert_item("auth_session", session_id, auth_session)
                 except Exception as e:
@@ -1223,12 +1376,9 @@ class AppServer:
                 safe_invoke(
                     "botgear.event_handlers",
                     "on_login",
-                    [user, request, {"mfa_required": bool(user.get("is_mfa_enabled"))}],
+                    [user, request, {"mfa_required": False}],
                 )
-                
-                if user.get("is_mfa_enabled"):
-                    return {"mfa_required": True, "message": "MFA verification required"}
-                
+
                 return {"access_token": token, "token_type": "bearer", "refresh_token": refresh_token}
             
             except HTTPException:
@@ -1252,6 +1402,15 @@ class AppServer:
                 if user_status in ("disabled", "locked"):
                     logger.warning(f"MFA login denied for {user_status} user: {request.username}")
                     raise HTTPException(status_code=403, detail="Account is not active")
+                # Same optional per-app pre-login gate as /v1/login — the MFA
+                # path issues a full token too, so it needs the same check.
+                denial = safe_invoke("botgear.event_handlers", "on_pre_login_check", [user, db])
+                if denial:
+                    logger.warning(f"MFA login denied by on_pre_login_check for user {request.username}: {denial}")
+                    raise HTTPException(
+                        status_code=denial.get("status_code", 403),
+                        detail=denial.get("detail", "Login denied"),
+                    )
                 totp_secret = user["totp_secret"]
                 logger.info(f"Verifying TOTP for user: {request.username}")
                 if not mfa.verify_totp(secret=user.get("totp_secret"), code=request.code, valid_window=1):
@@ -1275,19 +1434,33 @@ class AppServer:
             try:
                 user = db.get_item("user", request.email)
                 if not user:
-                    raise HTTPException(status_code=404, detail="User not found")
-                reset_token = str(uuid.uuid4())
-                user["reset_token"] = reset_token
-                user["reset_token_expiry"] = int(time.time()) + 3600
-                db.update_item("user", user["id"], user)
-                send_reset_password_email(
-                    config=self.settings,
-                    user_email=request.email,
-                    reset_token=reset_token,
-                )
-                logger.info(f"Password reset email sent to {request.email}")
-            except HTTPException:
-                raise  # preserve the intended 404 instead of masking it as a 500 (same pattern as reset-password)
+                    # Same non-enumerating convention /v1/login already uses for
+                    # an unknown username (generic response, real reason only in
+                    # the log) -- don't tell the caller whether this email is
+                    # registered, and don't 500 on it either (this used to raise
+                    # HTTPException(404) here, which the broad `except Exception`
+                    # below then masked as a 500 anyway).
+                    logger.info(f"Forgot-password requested for unknown email: {request.email}")
+                else:
+                    reset_token = str(uuid.uuid4())
+                    user["reset_token"] = reset_token
+                    user["reset_token_expiry"] = int(time.time()) + 3600
+                    db.update_item("user", user["id"], user)
+                    # Apps opt into a styled (HTML) reset email by defining
+                    # on_send_reset_password_email(settings, user_email, reset_token) in
+                    # their own event_handlers.py -- it takes over the send entirely (so
+                    # it can pass html_template_path to send_reset_password_email
+                    # itself). Apps that don't define it get today's plain-text-only
+                    # send, unchanged.
+                    if module_function_exists("botgear.event_handlers", "on_send_reset_password_email"):
+                        safe_invoke("botgear.event_handlers", "on_send_reset_password_email", [self.settings, request.email, reset_token])
+                    else:
+                        send_reset_password_email(
+                            config=self.settings,
+                            user_email=request.email,
+                            reset_token=reset_token,
+                        )
+                    logger.info(f"Password reset email sent to {request.email}")
             except Exception as e:
                 logger.error(f"Error handling forgot password request: {e}")
                 raise HTTPException(status_code=500, detail="Failed to process forgot password request")
@@ -1307,7 +1480,27 @@ class AppServer:
                 user["password_hash"] = self.auth.generate_hash(request.newPassword)
                 user["reset_token"] = None
                 user["reset_token_expiry"] = None
-                db.update_item("user", user["id"], user)
+                # include_nulls=True: update_item() silently drops None-valued
+                # fields by default (a partial-update convenience elsewhere),
+                # which without this flag means the two lines above never
+                # actually reach the database -- the reset token stays valid
+                # and the "single-use" link can be replayed until its 1-hour
+                # TTL expires.
+                #
+                # This is still not a true compare-and-swap: two requests
+                # racing on the same token can both pass the query above
+                # before either write commits, so both would still succeed.
+                # Closing that fully needs a conditional/atomic update
+                # primitive in the shared DatabaseAdapter (packages/database),
+                # which every backend (postgres/dynamodb/mongodb/sqlite/s3/
+                # tinydb/filesystem) would need to implement -- out of scope
+                # here; re-checking immediately before the write at least
+                # narrows the window to a single query-then-update pair
+                # instead of the whole request handler.
+                still_valid = db.query_items("user", {"reset_token": request.resetToken})
+                if not still_valid or still_valid[0]["id"] != user["id"]:
+                    raise HTTPException(status_code=400, detail="Reset token has already been used")
+                db.update_item("user", user["id"], user, include_nulls=True)
                 logger.info(f"Password reset successfully for user: {user['id']}")
             except HTTPException:
                 raise  # preserve the intended 404/400 instead of masking as 500 (#297)
@@ -1315,36 +1508,6 @@ class AppServer:
                 logger.error(f"Error resetting password: {e}")
                 raise HTTPException(status_code=500, detail="Failed to reset password")
             return info_message("Password reset successfully")
-
-        @self.app.post("/v1/accept-invite", description="Accept a staff invitation and set your password")
-        def accept_invite_route(request: AcceptInviteRequest, db: DatabaseAdapter = Depends(self.get_db_provider)):
-            # Public endpoint (#310): the invitee is not authenticated yet. The
-            # single-use token identifies the pending user row; accept_invite
-            # validates + expires it, sets the invitee's OWN password, and flips
-            # status invited -> active. Role + tenant were fixed at invite time
-            # and are NOT taken from the request. Mirrors reset-password.
-            from auth.invite_flow import accept_invite as _accept_invite
-            try:
-                import botgear.event_handlers as _invite_handlers
-            except Exception:
-                _invite_handlers = None
-            try:
-                _accept_invite(
-                    db,
-                    request.token,
-                    request.newPassword,
-                    fullname=request.fullname,
-                    hook_module=_invite_handlers,
-                )
-            except ValueError as e:
-                # Invalid / expired / already-accepted token, or missing password.
-                raise HTTPException(status_code=400, detail=str(e))
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(f"Error accepting invite: {e}")
-                raise HTTPException(status_code=500, detail="Failed to accept invitation")
-            return info_message("Invitation accepted — you can now sign in")
 
         @self.app.post("/v1/refresh-token", response_model=RefreshTokenResponse)
         async def refresh_token(token_request: RefreshTokenRequest, http_request: Request, db: DatabaseAdapter = Depends(self.get_db_provider)):
@@ -1381,25 +1544,32 @@ class AppServer:
                     user_id = session.get("user_id")
                     if not user_id:
                         raise HTTPException(status_code=401, detail="Invalid session")
-                    
+
                     user = db.get_item("user", user_id)
                     if not user:
                         raise HTTPException(status_code=401, detail="User not found")
-                    
+                    # Same rule as /v1/login and /v1/mfa/login: a disabled or
+                    # locked account gets no new tokens, and its session ends now
+                    # instead of minting access tokens until the session TTL.
+                    if user.get("status") in ("disabled", "locked"):
+                        session["status"] = "revoked"
+                        session["revoked_at"] = now_ms
+                        db.update_item("auth_session", session["id"], session)
+                        logger.warning(f"Refresh denied for {user.get('status')} user: {user_id}")
+                        raise HTTPException(status_code=403, detail="Account is not active")
+
                     # Generate new access token
                     new_access_token = self.auth.generate_token(user, ttl_minutes=on_get_jwt_access_token_ttl_minutes(http_request))
-                    
+
                     # Optionally rotate refresh token for better security
                     new_refresh_token = str(uuid.uuid4())
                     new_refresh_token_hash = hash_refresh_token(new_refresh_token)
-                    
                     # Update session with new token hash and last_used_at
                     session["refresh_token_hash"] = new_refresh_token_hash
                     session["last_used_at"] = now_ms
                     db.update_item("auth_session", session["id"], session)
-                    
-                    return {"access_token": new_access_token, "token_type": "bearer", "refresh_token": new_refresh_token}
 
+                    return {"access_token": new_access_token, "token_type": "bearer", "refresh_token": new_refresh_token}
                 provider_config = on_get_oauth_provider_config(http_request)
                 if not provider_config or not provider_config.token_url or not provider_config.client_id:
                     raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -1458,52 +1628,54 @@ class AppServer:
         @self.app.post("/v1/logout", description="Logout the current user")
         async def logout(request: Request, db: DatabaseAdapter = Depends(self.get_db_provider)):
             try:
-                # Extract token from Authorization header
-                auth_header = request.headers.get("authorization")
-                if not auth_header or not auth_header.lower().startswith("bearer "):
-                    raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
-                token = auth_header.split(" ", 1)[1]
-                # Decode token to get user info
-                user = None
-                try:
-                    payload = self.auth._verify_jwt(token)
-                    username = payload.get("sub")
-                    if username:
-                        user = db.get_item("user", username)
-                except Exception:
-                    pass
-                if not user:
-                    raise HTTPException(status_code=401, detail="Invalid token or user not found")
-                
-                # Delete all active auth_sessions for this user
-                # Best practice: DELETE sessions on logout, don't just mark inactive
-                deleted_count = 0
-                try:
-                    # Query for active sessions
-                    sessions = db.query_items("auth_session", {"user_id": user["id"], "status": "active"})
-                    logger.info(f"Found {len(sessions)} active sessions for user {user['id']}")
-                    
-                    for session in sessions:
-                        try:
-                            db.delete_item("auth_session", session["id"])
-                            deleted_count += 1
-                            logger.info(f"Deleted auth_session {session['id']} for user {user['id']}")
-                        except Exception as del_err:
-                            logger.error(f"Failed to delete session {session['id']}: {del_err}")
-                    
-                    if deleted_count == 0 and len(sessions) == 0:
-                        logger.warning(f"No active sessions found for user {user['id']} - may have already been logged out")
-                        
-                except Exception as e:
-                    logger.error(f"Failed to query/delete auth_sessions during logout: {e}", exc_info=True)
-                    # Don't fail the logout if session cleanup fails
-                
-                # Invalidate token and refresh token on user record
-                user["token"] = None
-                user["refresh_token"] = None
-                db.update_item("user", user["id"], user)
-                
-                logger.info(f"Logout successful for user {user['id']}, deleted {deleted_count} sessions")
+                # Resolve the caller via the provider-agnostic helper (same one
+                # /v1/oauth/logout already uses successfully) instead of
+                # self.auth._verify_jwt, which is a LocalAuthProvider-only
+                # internal -- OAuthAuthProvider has no such method, so under
+                # OAuth this raised AttributeError, was silently swallowed by
+                # the bare except below, and every logout 401'd before ever
+                # reaching session cleanup (bug found + fixed 2026-09-15).
+                identity = self._get_authenticated_user(request)
+                user_id = str((identity or {}).get("id") or (identity or {}).get("email") or "").strip()
+                if not user_id:
+                    # Covers a missing header, a bad scheme, and a token that
+                    # does not verify. A blank identity is rejected too rather
+                    # than waved through: there would be nothing to purge, and
+                    # answering "Logout successful" to it would be a lie.
+                    raise HTTPException(status_code=401, detail="Invalid or missing bearer token")
+
+                # Revoke this access token now (it would otherwise stay valid for
+                # the rest of its TTL); the purge below ends the refresh path.
+                revoke_jwt(self._bearer_token(request))
+
+                # Purge by the VERIFIED identity instead of first insisting on a
+                # user row. Requiring the row made logout fail exactly backwards:
+                # a valid token whose user record had since been deleted got a
+                # 401 and left that identity's sessions running. The identity IS
+                # the auth_session key (see _purge_active_sessions_for_identity),
+                # so the row buys nothing here -- and there is nothing to write
+                # back to it either. AuthUser declares no token/refresh_token
+                # field, and update_item defaults to include_nulls=False, which
+                # every backend implements by dropping None values from the
+                # update; the former `user["token"] = None; db.update_item(...)`
+                # therefore revoked nothing at all. It just rewrote the user's
+                # remaining fields to themselves.
+                purge = _purge_active_sessions_for_identity(db, user_id)
+                if not purge.complete:
+                    # Deleting the sessions IS the job. Answering "Logout
+                    # successful" with a session row still live would tell the
+                    # client it is signed out when it is not; 500 says the server
+                    # failed to complete the request, so the caller can retry.
+                    logger.error(
+                        f"Logout incomplete for {user_id}: deleted {purge.deleted}, "
+                        f"failed {purge.failed}, query_failed={purge.query_failed}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Logout incomplete: server-side sessions could not be deleted",
+                    )
+
+                logger.info(f"Logout successful for user {user_id}, deleted {purge.deleted} sessions")
                 return info_message("Logout successful")
             except HTTPException:
                 raise
@@ -1527,11 +1699,15 @@ class AppServer:
                 raise HTTPException(status_code=404, detail="callback not found")
 
     def _get_authenticated_user(self, request: Request) -> Optional[dict]:
-        """Extract the authenticated user from the Authorization header if available."""
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return None
-        token = auth_header.split(" ", 1)[1].strip()
+        """Extract the authenticated user from the Authorization header if available.
+
+        The scheme is matched case-insensitively: RFC 7235 defines it that way,
+        and every endpoint that takes the header through FastAPI's HTTPBearer
+        already accepts any casing. The strict "Bearer " prefix this used to
+        require rejected a correctly-behaving client -- and on POST /v1/logout
+        that meant a 401 with the caller's sessions left running.
+        """
+        token = self._bearer_token(request)
         if not token:
             return None
         try:
@@ -1539,6 +1715,18 @@ class AppServer:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"Failed to resolve user from token: {exc}")
             return None
+
+    @staticmethod
+    def _bearer_token(request: Request) -> Optional[str]:
+        """The Authorization: Bearer token (scheme matched case-insensitively,
+        RFC 7235), or None."""
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return None
+        scheme, _, token = auth_header.partition(" ")
+        if scheme.lower() != "bearer":
+            return None
+        return token.strip() or None
 
     def get_db_provider(self) -> DatabaseAdapter:
         # TODO add config option for get_database_client(settings.db_name)
@@ -1563,12 +1751,19 @@ class AppServer:
             logging.info("Uvicorn access log enabled: %s", access_log_enabled)
         if self.settings.ssl_enabled:
             logging.info("SSL enabled")
-            config_kwargs["ssl_keyfile"] = "ssl/key.pem"
-            config_kwargs["ssl_certfile"] = "ssl/cert.pem"
-            generate_self_signed_cert(
-                cert_file=config_kwargs["ssl_certfile"],
-                key_file=config_kwargs["ssl_keyfile"],
-            )
+            # An app may keep its self-signed cert somewhere of its own (e.g. under
+            # its data dir, so it survives reboots and isn't shared with other
+            # apps on the host) by defining get_ssl_paths(settings) ->
+            # (cert_file, key_file) in its event_handlers; otherwise the shared
+            # default location is used.
+            cert_file, key_file = DEFAULT_CERT_FILE, DEFAULT_KEY_FILE
+            if module_function_exists("botgear.event_handlers", "get_ssl_paths"):
+                ssl_paths = safe_invoke("botgear.event_handlers", "get_ssl_paths", [self.settings])
+                if ssl_paths:
+                    cert_file, key_file = (str(p) for p in ssl_paths)
+            generate_self_signed_cert(cert_file=cert_file, key_file=key_file)
+            config_kwargs["ssl_keyfile"] = key_file
+            config_kwargs["ssl_certfile"] = cert_file
         config = Config(**config_kwargs)
         server = Server(config)
         await server.serve()

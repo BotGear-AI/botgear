@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class ApiClient(BaseModel):
     """API client credentials for external/service-to-service access. A client authenticates by sending its secret in the X-API-Key header; the matching row's roles then drive the same role gates as a logged-in user. Full CRUD for management (Admin-gated); validate_api_client_secret is an internal helper the auth package's X-API-Key handler calls and is not exposed as a route."""

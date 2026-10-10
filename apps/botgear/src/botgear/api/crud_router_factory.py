@@ -106,12 +106,31 @@ def _handle_exception(action: str, slug: str, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content=error_msg.model_dump())
 
 
+# Auth secrets never leave the server through a generated route, whatever the
+# model or its (unmanaged, write-once) service returns: user/registration rows
+# carry them, and the generated user_service stub returned them verbatim from
+# /v1/user-list — hashes, TOTP secrets and password-reset tokens (an account
+# takeover for anyone who can read the list). Nulled, not dropped, so the
+# response shape matches the model either way.
+_SECRET_FIELDS = frozenset({"password_hash", "totp_secret", "reset_token", "reset_token_expiry"})
+
+
+def _redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: (None if k in _SECRET_FIELDS else _redact(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    if isinstance(value, BaseModel) and _SECRET_FIELDS & set(type(value).model_fields):
+        return _redact(value.model_dump())
+    return value
+
+
 def _normalize_result(ret: Any) -> Any:
     if isinstance(ret, Response):
         return ret
     if isinstance(ret, ServiceResponseMessage) and ret.status_code is not None and ret.status_code >= 300:
         return JSONResponse(status_code=ret.status_code, content=ret.model_dump())
-    return ret
+    return _redact(ret)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +171,7 @@ _ROUTES: List[RouteSpec] = [
     RouteSpec("get",         "GET",    "",                     "get_{s}",             [None,            "user", "req"],  "item",    True ),
     RouteSpec("get_by_id",   "GET",    "/{pk}",                "get_{s}",             ["{pk}",          "user", "req"],  "item",    True ),
     RouteSpec("get_by_path", "GET",    "-path/{full_path:path}","get_path_{s}",       ["full_path",     "user", "req"],  "item",    True ),
-    RouteSpec("update",      "PUT",    "/{pk}",                "update_{s}",          ["{pk}", "item",  "user", "req"],  "write",   False),
+    RouteSpec("update",      "PUT",    "/{pk}",                "update_{s}",          ["{pk}", "item",  "user", "req"],  "write",   True ),
     RouteSpec("delete",      "DELETE", "/{pk}",                "delete_{s}",          ["{pk}",          "user", "req"],  "write",   True ),
     RouteSpec("request",     "POST",   "-request",             "process_{s}_request", ["payload",       "user", "req"],  "request", False),
 ]
@@ -182,6 +201,30 @@ def _record_id_param(path_vars: List[str]) -> str:
     raise ValueError(f"All standard record-ID names are taken by path_vars={path_vars}")
 
 
+_AUDITED = ("create", "update", "delete")
+
+
+def _audit_write(svc_resource: str, spec_key: str, kw: dict, pk: str, result: Any,
+                 status_code: int) -> None:
+    """`__audit__: true` models: one audit event per create/update/delete
+    (docs/LOGGING_AND_AUDIT.md). Records field NAMES only, never values — a
+    payload can hold secrets. applog.record_audit never raises; neither does this."""
+    try:
+        from applog import record_audit
+        entity_id = kw.get(pk)
+        if entity_id is None and isinstance(result, dict):
+            entity_id = result.get("id")
+        details = None
+        item = kw.get("item")
+        if isinstance(item, BaseModel):
+            details = {"fields": sorted(item.model_dump(exclude_unset=True).keys())}
+        outcome = "success" if status_code < 400 else ("denied" if status_code in (401, 403) else "failure")
+        record_audit(f"{svc_resource}.{spec_key}", entity_type=svc_resource, entity_id=entity_id,
+                     details=details, outcome=outcome, status_code=status_code)
+    except Exception:  # auditing must never break the request it describes
+        logger.exception("audit of %s.%s failed", svc_resource, spec_key)
+
+
 def _build_handler(
     spec: RouteSpec,
     slug: str,
@@ -192,6 +235,7 @@ def _build_handler(
     role_dep: Any,
     path_vars: List[str],
     create_payload_is_list: bool,
+    audit: bool = False,
 ) -> Callable:
     """
     Build a FastAPI-compatible handler for one route spec.
@@ -215,7 +259,21 @@ def _build_handler(
             elif arg == "req":     out.append(kw["request"])
         return out
 
+    audited = audit and spec.key in _AUDITED
+
     def handler(**kw):
+        if not audited:
+            return _respond(kw)
+        try:
+            out = _respond(kw)
+        except HTTPException as exc:
+            _audit_write(svc_resource, spec.key, kw, pk, None, exc.status_code)
+            raise
+        status = out.status_code if isinstance(out, Response) else 200
+        _audit_write(svc_resource, spec.key, kw, pk, out, status)
+        return out
+
+    def _respond(kw):
         try:
             ret = safe_invoke(svc_module, svc_fn, _invoke_args(kw))
         except HTTPException:
@@ -317,7 +375,7 @@ def _build_page_handler(
             "sort": sort,
             "order": order,
         }
-        return {"metadata": metadata, "records": records}
+        return {"metadata": metadata, "records": _redact(records)}
 
     # Non-default params (path vars, request) must precede the defaulted query
     # params in the synthetic signature. FastAPI resolves each param by its
@@ -394,12 +452,14 @@ def create_crud_router(
     methods: Optional[Sequence] = None,
     path_vars: Optional[List[str]] = None,
     method_roles: Optional[Dict[str, Optional[Sequence[str]]]] = None,
+    method_permissions: Optional[Dict[str, Optional[Sequence[str]]]] = None,
     openapi_extra: Optional[Dict[str, Any]] = None,
     camel_case: bool = False,
     pascal_case: bool = False,
     list_at_root: bool = False,
     create_payload_is_list: bool = False,
     paginate: bool = False,
+    audit: bool = False,
 ) -> APIRouter:
     """
     Register the standard CloudSeeder CRUD + request routes for a model.
@@ -422,6 +482,14 @@ def create_crud_router(
                    group names ('writable', 'read_only'); values follow the same
                    semantics as roles. Overrides roles for matching methods only.
                    Example: {'writable': ['Admin'], 'list': []}
+
+    method_permissions — Optional per-method fine-grained permission gate,
+                   checked against user.permissions (not user.roles). Same
+                   keys/group semantics as method_roles, and composes with it —
+                   a route with both must satisfy the role check AND the
+                   permission check. No model-wide default (unlike roles): a
+                   route only gets a permission gate when explicitly declared.
+                   Example: {'list': ['auction.calendar.view']}
 
     openapi_extra — Optional raw OpenAPI object merged into the route spec.
                     Two forms are accepted:
@@ -464,6 +532,9 @@ def create_crud_router(
                for DB push-down, falling back to get_all_<resource> + in-memory
                paging. Opt-in per model so existing bare-array clients are
                unaffected.
+    audit    — `__audit__: true`: create/update/delete each record an audit event
+               '<resource>.<verb>' via applog.record_audit (field names only,
+               outcome from the response status). docs/LOGGING_AND_AUDIT.md
     """
     router = APIRouter()
     active = _normalize_methods(methods)
@@ -496,7 +567,18 @@ def create_crud_router(
         suffix = "" if (list_at_root and spec.key == "list") else spec.suffix
 
         effective_roles = _resolve_method_roles(spec.key, roles, method_roles)
+        # method_permissions has no model-wide default (unlike roles) — a
+        # route only gets a permission gate when explicitly declared for its
+        # method or group.
+        effective_permissions = _resolve_method_roles(spec.key, None, method_permissions)
         role_dep = None if effective_roles is None else Depends(auth_deps.require_role(list(effective_roles)))
+        if effective_permissions:
+            # Compose on top of the existing role_dep (or plain auth, if this
+            # route has no role gate) — both must pass.
+            role_dep = Depends(auth_deps.require_permission(
+                list(effective_permissions),
+                base_dependency=(auth_deps.require_role(list(effective_roles)) if effective_roles is not None else None),
+            ))
         path = "/" + resource_slug + suffix.replace("{pk}", "{" + pk + "}")
 
         # Paginated 'list': swap in the page handler + Page envelope response model.
@@ -504,7 +586,8 @@ def create_crud_router(
             endpoint = _build_page_handler(resource_slug, service_module, service_resource, model_cls, role_dep, pv)
             response_model = Page
         else:
-            endpoint = _build_handler(spec, resource_slug, service_module, service_resource, pk, model_cls, role_dep, pv, create_payload_is_list)
+            endpoint = _build_handler(spec, resource_slug, service_module, service_resource, pk, model_cls, role_dep, pv,
+                                      create_payload_is_list, audit)
             response_model = response_models[spec.res_model]
 
         route_openapi_extra = _resolve_route_openapi_extra(spec.key, openapi_extra)

@@ -1,5 +1,5 @@
 # unmanaged
-"""Mapping-backend registry. See docs/TODO_SLAM.md §5.2a.
+"""Mapping-backend registry. See README.md § Mapping backends
 
 v1 ships exactly one implementation. To add another (e.g. a future
 BreezySlamBackend once the ARM/install-wizard question from §5.2a has

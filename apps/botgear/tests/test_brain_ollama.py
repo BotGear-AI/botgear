@@ -114,8 +114,8 @@ def test_encode_tools_falls_back_to_proxy_qualified_on_collision():
     """When two tools share the same action name (same method on two
     proxies), the second one falls back to ``<proxy_id>_<action>`` —
     legible and matches the operator's own words for the device —
-    instead of an opaque ``tool_NNN`` (see docs/TODO_BRAIN_GAP_FIXES.md
-    Gap 1)."""
+    instead of an opaque ``tool_NNN`` (see repo/brain/1.0.0/README.md
+    "Tool names")."""
     tools = [
         ToolDescriptor(topic="/video/video-1/control", action="capture_frame"),
         ToolDescriptor(topic="/video/video-2/control", action="capture_frame"),
@@ -174,7 +174,7 @@ def test_parse_response_unknown_tool_becomes_done():
 
 def test_parse_response_multiple_tool_calls_all_kept():
     """A model that acts AND confirms in one turn (the real failure
-    mode this fixes — see docs/TODO_BRAIN_GAP_FIXES.md Gap 5): both
+    mode this fixes — see repo/brain/1.0.0/README.md "Several tool calls"): both
     tool calls must survive in order, not just the first."""
     decode = {
         "power_set": ToolDescriptor(topic="/tasmota/sonoff-cord/control", action="power_set"),

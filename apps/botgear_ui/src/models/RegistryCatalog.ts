@@ -18,6 +18,9 @@ export interface CatalogVersion {
   min_runtime?: string
   os?: string[]
   arch?: string[]
+  // Server-computed: does this version's os/arch allow-list admit the
+  // host the runtime is on? Absent on older backends — treat as true.
+  supported?: boolean
   [k: string]: unknown
 }
 

@@ -1,7 +1,7 @@
 # unmanaged
 """SlamService — bus wiring for the slam_service core algorithm layer.
 
-See docs/TODO_SLAM.md §5.2/§8 Phase 2. Subscribes to `motor_control`'s
+See README.md § Pipeline Phase 2. Subscribes to `motor_control`'s
 `/state` for odometry and `oakd`'s `/depth_sample` for scans, drives
 the pluggable `MappingBackend` (backends/), publishes `/pose` (small,
 frequent) + `/map` (throttled, quantized+base64) for the UI.
@@ -137,14 +137,14 @@ class SlamService(SubprocessService):
         self._pose = (0.0, 0.0, 0.0)
         self._motor_control_connected = False
         self._oakd_connected = False
-        # Phase 4b (docs/TODO_SLAM.md §9) — visual odometry state.
+        # Phase 4b (README.md § Visual odometry) — visual odometry state.
         # _last_motor_speeds is cached regardless of odometry_source:
         # in "visual_flow" mode it's the fallback input (§9.7) for any
         # tick where the visual fit comes back unreliable.
         self._last_feature_flow_ts: Optional[float] = None
         self._last_motor_speeds: Tuple[float, float] = (0.0, 0.0)
         self._oakd_intrinsics: Optional[Dict[str, float]] = None
-        # Manually-placed reference points (docs/TODO_SLAM.md's
+        # Manually-placed reference points (README.md's
         # calibration-target workflow) — a name -> world (x_m, y_m), not
         # part of the occupancy grid itself. Keyed by name so re-adding
         # the same name moves it rather than accumulating duplicates.
@@ -177,7 +177,7 @@ class SlamService(SubprocessService):
     def _ensure_backend(self) -> None:
         """(Re)build the backend if its config-relevant identity
         changed — the backend owns a fixed-size grid allocated at
-        construction (docs/TODO_SLAM.md §6), so a map-size/resolution/
+        construction (README.md § Limitations), so a map-size/resolution/
         backend-choice change means starting a fresh map, not resizing
         one in place. Rebuilding loses the existing map — acceptable
         for a config change, which should be rare mid-session."""
@@ -207,7 +207,7 @@ class SlamService(SubprocessService):
                 "%s: no oakd_proxy_id/depth_sample_topic configured — no scan input", self.proxy_id
             )
 
-        # Phase 4b (docs/TODO_SLAM.md §9) — visual odometry input.
+        # Phase 4b (README.md § Visual odometry) — visual odometry input.
         # motor_control stays subscribed above regardless of mode: in
         # "visual_flow" mode it's the §9.7 fallback's input, not the
         # primary source.
@@ -228,7 +228,7 @@ class SlamService(SubprocessService):
             if self.config.oakd_proxy_id:
                 # Retained — subscribing gets the current intrinsics
                 # immediately (published once by oakd at device-open,
-                # docs/TODO_SLAM.md §9.4), no separate fetch needed.
+                # README.md § Visual odometry), no separate fetch needed.
                 await self.subscribe(f"/oakd/{self.config.oakd_proxy_id}/state", self._on_oakd_state)
 
     # ─── odometry input ─────────────────────────────────────────────────
@@ -275,7 +275,7 @@ class SlamService(SubprocessService):
 
     async def _on_oakd_state(self, payload: Any) -> None:
         """Caches oakd's intrinsics (published once at device-open,
-        docs/TODO_SLAM.md §9.4) for _on_feature_flow's back-projection.
+        README.md § Visual odometry) for _on_feature_flow's back-projection.
         Retained topic — the first delivery on subscribe already has
         whatever oakd currently knows, this just keeps it current
         across an oakd reconnect."""
@@ -283,7 +283,7 @@ class SlamService(SubprocessService):
             self._oakd_intrinsics = payload.get("intrinsics")
 
     async def _on_feature_flow(self, payload: Any) -> None:
-        """Visual-odometry tick (docs/TODO_SLAM.md §9.4/§9.5) — only
+        """Visual-odometry tick (README.md § Visual odometry) — only
         wired up when odometry_source == "visual_flow" (_subscribe_inputs
         gates the subscription itself). Same accumulate-until-flush
         pattern as _on_motor_state: composes one PoseDelta into the
@@ -585,7 +585,7 @@ class SlamService(SubprocessService):
         orientation is recorded as the robot's heading at THIS moment
         (`theta + bearing_deg`) — a snapshot, not re-derived later, same
         "known once" precedent as the camera mount extrinsics
-        (docs/TODO_SLAM.md §1) since a landmark has no pose of its own to
+        (README.md § Ownership split) since a landmark has no pose of its own to
         track. Omit both for a plain point marker (unchanged behavior).
         """
         x, y, theta = self._pose
@@ -624,7 +624,7 @@ def _quantize_grid(log_odds: np.ndarray, inflated: np.ndarray) -> np.ndarray:
     """Pack the grid into 1 byte/cell for the wire: 0=unknown,
     85=free, 170=inflated-but-not-raw-occupied, 255=occupied. Keeps the
     retained /map message small (cells^2 bytes, base64'd) instead of a
-    full float32 array — see docs/TODO_SLAM.md's low-resource goal."""
+    full float32 array — see README.md's low-resource goal."""
     out = np.zeros(log_odds.shape, dtype=np.uint8)
     out[log_odds < -0.5] = 85
     out[inflated] = 170

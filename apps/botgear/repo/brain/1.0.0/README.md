@@ -253,6 +253,33 @@ Every turn sends three components:
   the provider's wire format (Ollama/OpenAI `{type:"function", function:{…}}`;
   Anthropic `{name, input_schema}`).
 
+### Tool names
+
+Provider APIs require tool names matching `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$`,
+which brain's natural identity `<topic>::<action>` doesn't fit. Every
+adapter uses the same `adapters/base.py::resolve_tool_names()`:
+
+1. the **bare action name** when it's valid and unique in this tool list —
+   so a prompt that says "call `speak`" works whenever `speak` is live once;
+2. on a collision (e.g. two `tasmota` proxies both exposing `power_set`):
+   **`<proxy_id>_<action>`**, sanitized and truncated to 64 chars —
+   `office-cord_power_set`, `sonoff-cord_power_set` — so the model can match
+   the name against what the operator said;
+3. `tool_NNN` only as a should-never-happen fallback.
+
+Each tool's description is the method's docstring and its parameters are
+the method's `args_schema`, derived from the signature by
+`rlx_bus/introspect.py` for in-process and subprocess services alike.
+
+### Several tool calls in one response
+
+A model may return several tool calls at once (e.g. `power_set` **and**
+`speak`). Adapters parse every entry into `ModelResponse.actions` (dropping
+only individual unknown names), and the engine runs them in order as one
+step — `steps_used` counts LLM round-trips, not tool calls. A terminal
+outcome anywhere in the batch (`done`, a disallowed call, a denied approval,
+`terminate_on` satisfied) still ends the run immediately.
+
 
 ## Workflow layout
 

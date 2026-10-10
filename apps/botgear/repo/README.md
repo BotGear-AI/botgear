@@ -338,8 +338,9 @@ This is the loop CI integration tests use — no public host required.
 ### Publish to a remote target
 
 ```bash
-# GitHub Releases (default repo: supertick/botgear-services)
-./tools/publish_services.py --kind gh_release --tag services-v1
+# GitHub Releases (default: BotGear-AI/botgear, tag "services" — what a
+# runtime's default registry_url points at; CI publishes it on release)
+./tools/publish_services.py --kind gh_release
 ./tools/publish_services.py --kind gh_release --repo myorg/my-services --tag v1
 
 # Any PUT-capable HTTP host (WebDAV / S3-compatible)
@@ -352,6 +353,13 @@ optionally takes `BOTGEAR_PUBLISH_AUTH=user:pass`. Re-publishing the
 same version is idempotent (gh assets use `--clobber`); shipping a new
 version requires bumping it in the service's `package.yml`. Add
 `--dry-run` to print the catalog + upload plan without touching anything.
+
+The public catalog lives at
+`https://github.com/BotGear-AI/botgear/releases/download/services/catalog.yml`
+(the default `registry_url`). Its release is a prerelease never marked
+latest, because the framework updater reads `releases/latest` on the same
+repo. `package_botgear.yml`'s `publish-services` job republishes it on every
+release dispatch.
 
 ### Where to set the default
 

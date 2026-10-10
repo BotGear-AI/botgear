@@ -317,9 +317,11 @@ def test_forgot_password_success_sends_a_reset_email(client, fake_db, monkeypatc
     assert fake_db.get_item("user", "user@example.com")["reset_token"]
 
 
-def test_forgot_password_unknown_user_404s(client):
+def test_forgot_password_unknown_user_does_not_reveal_it(client):
+    # Non-enumerating, like /v1/login: same answer whether or not the
+    # email is registered.
     resp = client.post("/v1/forgot-password", json={"email": "ghost@example.com"})
-    assert resp.status_code == 404
+    assert resp.status_code == 200
 
 
 def test_reset_password_success(client, fake_db):
@@ -344,22 +346,12 @@ def test_reset_password_expired_token_400s(client, fake_db):
 
 
 # ─── /v1/accept-invite ───────────────────────────────────────────────
-# accept_invite itself (auth.invite_flow) has its own behavior to test
-# elsewhere; here it's mocked to isolate the route's own error mapping.
+# Invite onboarding is opt-in (app.invite_onboarding_enabled) and botgear
+# doesn't opt in, so the route must not exist at all.
 
-def test_accept_invite_success(client, monkeypatch):
-    monkeypatch.setattr("auth.invite_flow.accept_invite", lambda *a, **kw: None)
+def test_accept_invite_route_is_not_exposed(client):
     resp = client.post("/v1/accept-invite", json={"token": "t1", "newPassword": "x"})
-    assert resp.status_code == 200
-
-
-def test_accept_invite_invalid_token_maps_value_error_to_400(client, monkeypatch):
-    def _boom(*a, **kw):
-        raise ValueError("invite token expired")
-    monkeypatch.setattr("auth.invite_flow.accept_invite", _boom)
-    resp = client.post("/v1/accept-invite", json={"token": "t1", "newPassword": "x"})
-    assert resp.status_code == 400
-    assert resp.json()["detail"] == "invite token expired"
+    assert resp.status_code in (404, 405)
 
 
 # ─── /v1/refresh-token ───────────────────────────────────────────────
@@ -410,17 +402,18 @@ def test_refresh_token_unknown_token_with_no_oauth_configured_is_rejected(client
 
 # ─── /v1/logout ──────────────────────────────────────────────────────
 
-def test_logout_deletes_active_sessions_and_clears_tokens(client, fake_db):
+def test_logout_deletes_active_sessions_and_leaves_the_user_row(client, fake_db):
     _seed_user(fake_db, token="old-access", refresh_token="old-refresh")
     fake_db.insert_item("auth_session", "s1", {"id": "s1", "user_id": "user@example.com", "status": "active"})
     token = _pyjwt.encode({"sub": "user@example.com"}, get_jwt_secret(), algorithm="HS256")
 
+    before = fake_db.get_item("user", "user@example.com")
     resp = client.post("/v1/logout", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert fake_db.get_item("auth_session", "s1") is None
-    row = fake_db.get_item("user", "user@example.com")
-    assert row["token"] is None
-    assert row["refresh_token"] is None
+    # Logout revokes the presented JWT and purges sessions; it writes
+    # nothing to the user row.
+    assert fake_db.get_item("user", "user@example.com") == before
 
 
 def test_logout_without_an_authorization_header_is_rejected(client):

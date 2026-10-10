@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class ServiceConfig(BaseModel):
     id: Optional[str] = Field(None, description="Primary key - set to service_proxy_id on create", json_schema_extra={"example":"pycv"})

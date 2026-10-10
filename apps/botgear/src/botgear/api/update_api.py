@@ -110,7 +110,11 @@ def register_update_routes(app: FastAPI, get_db_provider=None) -> None:
             )
         available, reason = updater.decide(current, rel.version)
         tarball, sha = rel.platform_asset(ptag)
-        if available and not tarball:
+        if available and not updater.self_update_supported(ptag):
+            available = False
+            reason = (f"{rel.version} is available — self-update isn't supported on "
+                      f"Windows yet; download it from https://github.com/{repo}/releases")
+        elif available and not tarball:
             available = False
             reason = f"a newer release ({rel.version}) exists but has no {ptag} build"
         return UpdateCheckResponse(

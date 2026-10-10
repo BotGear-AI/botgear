@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class Script(BaseModel):
     id: Optional[str] = Field(None, description="Primary key - UUID auto-generated on create", json_schema_extra={"example":"script-123"})

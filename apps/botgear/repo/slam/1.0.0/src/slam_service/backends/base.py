@@ -2,7 +2,7 @@
 """MappingBackend — the pluggable interface between the geometry/
 odometry pipeline and grid accumulation + pose correction.
 
-See docs/TODO_SLAM.md §5.2a for the full reuse-vs-build reasoning
+See README.md § Mapping backends for the full reuse-vs-build reasoning
 behind this boundary (spiked BreezySLAM, decided to start hand-rolled,
 kept this interface so a BreezySlamBackend is a swap-in later, not a
 rewrite). v1 ships exactly one implementation, `HandRolledBackend`.
@@ -29,7 +29,7 @@ class MappingBackend(ABC):
         """Returns the backend's current best (x_m, y_m, theta_deg) in
         the map frame. `HandRolledBackend` just integrates
         `pose_change` with no correction (the named "no drift
-        correction" limitation, docs/TODO_SLAM.md §6); a scan-matching
+        correction" limitation, README.md § Limitations); a scan-matching
         backend would use `scan` to correct it against the accumulated
         map."""
 
@@ -37,10 +37,10 @@ class MappingBackend(ABC):
     def occupancy_grid(self) -> np.ndarray:
         """Current grid. `HandRolledBackend` returns a log-odds
         float32 array (positive = more likely occupied, negative =
-        more likely free, ~0 = unknown) — docs/TODO_SLAM.md §5.2a."""
+        more likely free, ~0 = unknown) — README.md § Mapping backends"""
 
     @abstractmethod
     def inflated_grid(self) -> np.ndarray:
         """Boolean grid — True where the robot's footprint could not
         be centered on that cell without overlapping an obstacle (the
-        "configuration space" trick, docs/TODO_SLAM.md §5.2 step 4)."""
+        "configuration space" trick, README.md § Pipeline step 4)."""

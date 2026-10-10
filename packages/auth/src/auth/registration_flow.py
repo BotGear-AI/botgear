@@ -55,8 +55,10 @@ def build_proto_user_from_registration(registration: dict) -> dict:
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     # The account is always the registration's email: never trust a stored
     # user_id (one written before /v1/register enforced user_id == email could
-    # name someone else's account).
-    user_id = (registration.get("email") or "").lower() or registration.get("user_id")
+    # name someone else's account). verify_and_register already refuses a
+    # registration with no email before calling this, so email is non-empty
+    # here; this is the same identity rule in one place, not a second check.
+    user_id = (registration.get("email") or "").lower()
     return {
         "id": user_id,
         "tenant_id": registration.get("tenant_id"),
@@ -90,6 +92,18 @@ def verify_and_register(db, token: str, *, hook_module: Any = None) -> dict:
     if not registration:
         raise ValueError(f"Registration not found for token: {token}")
 
+    # The account is always the registration's email: never trust a stored
+    # user_id (one written before /v1/register enforced user_id == email could
+    # name someone else's account). A registration with no email at all
+    # (the field is optional on the model; a row predating that enforcement
+    # could have one) has no trustworthy identity to verify — refuse it
+    # rather than falling back to the untrusted user_id, and before
+    # mutating state so a refused verify doesn't leave the registration
+    # stuck "verified" with no user created.
+    email = (registration.get("email") or "").lower()
+    if not email:
+        raise ValueError(f"Registration {token} has no email; cannot verify")
+
     if registration.get("state") == "verified":
         logger.info("Registration %s already verified", token)
         return {"status": "already_verified", "message": "Email already verified"}
@@ -97,10 +111,7 @@ def verify_and_register(db, token: str, *, hook_module: Any = None) -> dict:
     registration["state"] = "verified"
     db.update_item("registration", registration.get("id"), registration)
 
-    # The account is always the registration's email: never trust a stored
-    # user_id (one written before /v1/register enforced user_id == email could
-    # name someone else's account).
-    user_id = (registration.get("email") or "").lower() or registration.get("user_id")
+    user_id = email
     existing_user = db.get_item("user", user_id)
     if existing_user:
         # Don't run the hook on this path — the user record predates this

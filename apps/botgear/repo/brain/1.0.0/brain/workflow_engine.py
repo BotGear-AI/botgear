@@ -625,7 +625,7 @@ class WorkflowEngine:
         ``workflow.exit_on_phrase.listen_topics`` entry (usually just
         one — a list is only needed when more than one `messaging`-
         capability service type might be providing conversation I/O,
-        see docs/TODO_MESSAGING.md). Whichever topic sees a match first
+        see packages/rlx_messaging/README.md). Whichever topic sees a match first
         wins; cancelling ``run()``'s task cancels this watcher (and
         every sibling topic-watcher with it) via the normal
         ``run().finally`` path, so nothing needs manual cross-task
@@ -802,7 +802,7 @@ class WorkflowEngine:
 
             # A response can carry several proposed actions — a model
             # that acts and confirms in the same turn (e.g. power_set +
-            # speak) — see docs/TODO_BRAIN_GAP_FIXES.md Gap 5. Execute
+            # speak) — see README.md "Several tool calls in one response". Execute
             # each in order within this one step (they share
             # self.record.steps_used; that counter is LLM round-trips,
             # not individual tool calls). Any terminal outcome (done,

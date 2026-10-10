@@ -1,6 +1,6 @@
 # unmanaged
 """Unit tests for slam_service.service.SlamService — the bus-wiring
-layer (Phase 2, docs/TODO_SLAM.md §8). Same _FakeBus seam pattern as
+layer (Phase 2, repo/slam/1.0.0/README.md § Pipeline). Same _FakeBus seam pattern as
 test_messaging_base.py: no real websocket, direct construction, manual
 handler invocation instead of a running SubprocessService.run() loop.
 """
@@ -473,7 +473,7 @@ async def test_state_reports_connection_flags():
     assert state2["oakd_connected"] is True
 
 
-# ─── Phase 4b: visual odometry wiring — docs/TODO_SLAM.md §9 ────────────
+# ─── Phase 4b: visual odometry wiring — repo/slam/1.0.0/README.md § Visual odometry ────────────
 
 def _feature_flow(matches) -> Dict[str, Any]:
     return {"ts": 0.0, "matches": matches}

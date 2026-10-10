@@ -13,8 +13,8 @@ Used two ways, by the same functions:
     ``installer.py:_rlx_bus_local_path``) — that's what makes a single
     shared implementation possible instead of two that can drift.
 
-Closes ``docs/TODO_BRAIN_GAP_FIXES.md`` Gap 6's deliberately-deferred
-item: subprocess methods now get a real signature-derived
+Before this, subprocess methods carried no argument schema at all (a
+brain model was seen inventing arguments and guessing defaults); now they get a real signature-derived
 ``args_schema`` instead of relying only on the manual
 ``@service_method(args_schema=...)`` stopgap. That override is kept
 and takes priority — still useful for signatures this can't resolve

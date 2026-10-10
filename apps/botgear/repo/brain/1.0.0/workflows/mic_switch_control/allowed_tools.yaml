@@ -8,7 +8,7 @@ allowed:
   # The one device this workflow is allowed to touch. Exact topic, not
   # /tasmota/*/control — a new Tasmota device must not become
   # voice-controllable just by existing (same reasoning as
-  # conversation_session's Gap 2, see docs/TODO_BRAIN_GAP_FIXES.md).
+  # conversation_session's allow-list).
   # pulse/connect/disconnect deliberately excluded: different risk
   # shape, not needed for "turn switch-1 on/off".
   - topic: /tasmota/switch-1/control

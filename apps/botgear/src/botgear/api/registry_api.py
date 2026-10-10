@@ -16,9 +16,10 @@ runs arbitrary pip + executes code, not something a regular user role
 should be able to trigger. Read-only catalog lookup also requires auth
 so the catalog URL (which may be a private mirror) doesn't leak.
 
-The registry URL is read from the running app's config — Config has a
-``registry_url`` field that defaults to ``file:///tmp/repo/catalog.yml``
-for the local mirror Phase 1 produces.
+The registry URL is read from the running app's config — Config's
+``registry_url`` defaults to the public catalog on the BotGear-AI/botgear
+``services`` release; ``file:///tmp/repo/catalog.yml`` (what
+``tools/publish_services.py`` writes) is the usual dev override.
 """
 from __future__ import annotations
 
@@ -128,10 +129,11 @@ class CatalogResponse(BaseModel):
 
 def _resolve_registry_urls(db: Optional[DatabaseAdapter] = None) -> List[str]:
     """Ordered registry URLs — DB config/default.registries (user-edited
-    in the Catalog UI) wins over env; falls back to the local-mirror
-    default."""
+    in the Catalog UI) wins over env; falls back to Config's registry_url
+    default (the public catalog)."""
+    from botgear.models.config import Config
     urls = registry.effective_registries(get_settings(), db)
-    return urls or ["file:///tmp/repo/catalog.yml"]
+    return urls or [Config.model_fields["registry_url"].default]
 
 
 def _resolve_repo_dir() -> Path:
@@ -330,10 +332,14 @@ def register_registry_routes(app: FastAPI, get_db_provider) -> None:
         except registry.CatalogError as exc:
             raise HTTPException(status_code=502, detail=f"catalog fetch failed: {exc}")
         local = _local_state_map(db)
+        services = cat.get("services") or []
+        for svc in services:
+            for ver in svc.get("versions") or []:
+                ver["supported"] = registry.platform_supported(ver)
         return CatalogResponse(
             registry_version=int(cat.get("registry_version", 1)),
             registry_url=", ".join(urls),
-            services=[CatalogEntry(**svc) for svc in (cat.get("services") or [])],
+            services=[CatalogEntry(**svc) for svc in services],
             local_state=local,
         )
 
@@ -390,6 +396,8 @@ def register_registry_routes(app: FastAPI, get_db_provider) -> None:
             )
         except registry.NotInCatalogError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+        except registry.UnsupportedPlatformError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         except registry.IntegrityError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except (registry.CatalogError, registry.LoadError) as exc:

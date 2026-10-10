@@ -578,7 +578,8 @@ async def test_observe_room(workspace, tool_catalog):
 async def test_multiple_actions_in_one_step_all_execute(workspace, tool_catalog):
     """A single model turn proposing several tool calls (e.g. act, then
     confirm via speak) must execute ALL of them in order, not just the
-    first — the real bug behind docs/TODO_BRAIN_GAP_FIXES.md Gap 5,
+    first — the real bug behind repo/brain/1.0.0/README.md "Several tool
+    calls in one response",
     hit live: a model called power_set + speak together and the speak
     confirmation was silently dropped. Both actions from the same
     model turn also count as ONE step (LLM round-trip), not two."""

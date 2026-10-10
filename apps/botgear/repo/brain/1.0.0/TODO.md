@@ -23,9 +23,8 @@ same workflow. Concrete observations so far (see TESTING_RESULTS.md):
   correctly but never emit `done` — they loop until `max_steps`
   exhausts, producing rephrased re-attempts each turn. Engine
   terminates with `status: failure`.
-- **Claude opus-4-8** makes one clean call + would emit `done` on
-  the follow-up turn if the adapter weren't broken. Different
-  convergence pattern entirely.
+- **Claude opus-4-8** makes one clean call and converges (status
+  success). Different convergence pattern entirely.
 - **qwen2.5:7b** content is generic ("journaling is helpful");
   **gemma4:e4b** is jargon-y ("behavioral drift", "operational
   data"); **Claude** is concrete + accountable ("retain continuity
@@ -41,7 +40,7 @@ There's no single workflow shape that's optimal across providers.
 
 **Why this matters**
 
-The brain ships 15 bundled workflows today. If we have to author
+The brain ships 18 bundled workflows today. If we have to author
 each one N times (once per backend family), the catalog explodes
 + stays out of sync as we add models. But if we author once with
 a single shape, some providers will fail.
@@ -98,7 +97,9 @@ actually are):
    Cons: needs profile taxonomy work; mis-classification
    propagates.
 
-5. **Engine-level convergence handling.** Strip the question from
+5. **Engine-level convergence handling.** Partly built: `terminate_on`,
+   `loop_breaker` and `resume_on_done` (see README "How a run ends").
+   Strip the rest of the question from
    workflows entirely and make the engine smart enough to converge
    reasonable models. Concrete strategies:
    - **Auto-terminate on duplicate tool calls.** If the model
@@ -130,8 +131,6 @@ don't know yet:
   framing converge it?)
 - Do qwen3 / llama3.x / mistral-nemo / glm-4.7-flash differ from
   qwen2.5 on this loop pattern?
-- Does Claude actually emit `done` reliably once the follow-up
-  adapter bug is fixed?
 - Does OpenAI behave more like Claude (single-shot) or more like
   ollama (loops)? Need a live run.
 - Are the differences mostly about *prompt sensitivity* (a-b test
@@ -163,15 +162,16 @@ Until we have data, defer.
 
 ## OPEN — Engine convergence semantics: when is `done` legitimate?
 
-**Status**: partly answered (2026-10-04). Settled:
+**Status**: partly answered (2026-10-04) — the engine-owned lifecycle
+(`terminate_on` + `/brain/{id}/workflow_events`) is built. Settled:
 - `terminate_on` workflows: `done` before the required actions → failure.
 - `exit_on_phrase` workflows: `done` before any `listen` → failure; after
   it, `resume_on_done` speaks the `done` text (if unspoken) and listens
   again — small models put their reply there.
 - Runaways: `loop_breaker`.
 
-Still open: plain workflows (neither field), where `done` is taken at face
-value. Surfaced by the qwen2.5-coder:7b run:
+Still open: plain workflows (no `terminate_on`, no `exit_on_phrase`),
+where `done` is taken at face value. Surfaced by the qwen2.5-coder:7b run:
 
 When a model emits `kind=done` (either explicitly or by returning
 text-only with no tool call), the engine currently terminates the
@@ -215,61 +215,18 @@ different model families. A coder-specialized model variant might
 deliberately use text-as-tool-call and we'd need to parse it; a
 chat model uses structured calls and the current logic works fine.
 
-**Preferred direction (operator-proposed, not yet implemented).**
-Move workflow lifecycle into the engine, not the model. The
-engine publishes start + end events on a flat topic
-``/brain/{id}/workflow_events``; ``workflow.yaml`` gains a
-``terminate_on:`` field declaring when the engine should consider
-the work done — typically "after this specific tool was called
-successfully" or "after all of these tools were called." The
-model never needs to emit ``done``; it just calls tools.
-
-This converts the failed loops (qwen2.5, gemma4) into successes
-on `take_a_note` (single tool call → done) and converts
-qwen2.5-coder's false-positive success into an honest failure
-(zero real tool calls → max_steps exhausted → status: failure).
-Big win for matrix coverage.
-
-Keep ``done`` as a SECONDARY termination path for genuinely
-open-ended workflows like ``explore_room`` where the model
-decides when it's seen enough. Backwards compatible: workflows
-without ``terminate_on`` keep current behavior.
-
-Edge cases to ideate before implementing:
-- Failed tool call vs successful tool call (failed shouldn't
-  satisfy ``terminate_on``)
-- Workflows that want tool call + summary turn (a new value:
-  ``tool_call_with_summary``?)
-- Tool-call-only workflows lose the model's natural language
-  summary — is the saved tool output enough? Probably yes for
-  ``take_a_note`` (the reflection IS the artifact). Might matter
-  for workflows where the operator wants a verbal recap.
-- Migration: which existing workflows should opt in to
-  ``terminate_on``? Probably all the "tool then done" shaped ones
-  (take_a_note, inspect_object, emergency_stop, count_objects,
-  teach_object). Leave the multi-step exploratory ones alone.
-
-
 ## Other tracked items (smaller)
 
 ### Strip the in-process adapter's boot-time double dispatch
-Each tool call writes twice to disk because the stop+restart
+(Not re-verified 2026-10-10.) Each tool call writes twice to disk because the stop+restart
 sequence during `reconcile_running_proxies` doesn't fully reap
 the previous control loop. Fix in
 `framework/adapters/in_process.py::stop()` and/or the bus's
 subscriber-id dedup. Affects file contents only.
 
 ### Bump `BrainConfig.anthropic_model` default
-Current default is `claude-3-5-sonnet-20241022` which Anthropic
-has deprecated → 404. Bump to a current 4.x family id.
-
-### Bring openai + anthropic adapters to tool-name encoding parity
-The ollama adapter was fixed to use the action name directly (no
-more `tool_NNN` indexed naming) when it's unique. The openai and
-anthropic adapters still use indexed names. Same one-liner fix
-needed in each. Likely affects "model can match the prompt's
-human tool name to a tool in the catalog" — same root cause as
-the ollama fix.
+Still `claude-3-5-sonnet-20241022` (verified 2026-10-10), which
+Anthropic has retired → 404. Bump to a current model id.
 
 ### Add `enum` constraints to `kind` (and similar categorical args)
 Surfaced by the llama3.1:8b run. Models that read JSON schemas
@@ -283,9 +240,10 @@ works for Literal; would need to verify + extend the brain's
 `m_write_memory` to use `kind: Literal["reflection",
 "observation", "task_history"]` instead of plain `str`.
 
-### Run `take_a_note` against the other installed ollama models
-`qwen3-coder:30b`, `qwen3:8b`, `qwen2.5-coder:7b`, `glm-4.7-flash`,
-`deepseek-r1`, `gemma4:e2b`. Each provides a data point for the
+### Run `take_a_note` against the remaining models
+Not yet tested (per TESTING_RESULTS.md): `qwen3-coder:30b`,
+`glm-4.7-flash`, `deepseek-r1`, `gemma4:e2b`, `claude-sonnet-4-6`,
+`claude-haiku-4-5`. Each provides a data point for the
 profile-vs-provider question above. Log every result in
 TESTING_RESULTS.md.
 
@@ -307,7 +265,8 @@ That means every declared input MUST appear in the prompt as a
 operator's value is silently dropped, and the LLM sees the input
 name as a literal English word with no value attached.
 
-Concrete example: `workflows/conversation_session/workflow.yaml`
+Concrete example (since fixed — the prompt now uses
+`{remember_notable}`): `workflows/conversation_session/workflow.yaml`
 declares three inputs (`exit_phrase`, `listen_window_seconds`,
 `remember_notable`). The prompt uses `{exit_phrase}` and
 `{listen_window_seconds}` correctly, but mentions `remember_notable`
@@ -334,8 +293,3 @@ Run a script over every `repo/brain/1.0.0/workflows/*/` directory:
 Bonus: ship this as a unit test
 (`test_bundled_workflows_inputs_match_prompts`) so the audit runs
 on every CI build and catches the next instance at PR time.
-
-While doing the audit, also fix the conversation_session
-`remember_notable` instance discovered above — either reference
-it as `{remember_notable}` in the prompt or remove the input
-declaration if the operator shouldn't override it.

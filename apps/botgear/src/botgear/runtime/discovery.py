@@ -167,7 +167,7 @@ def _mask_secret_fields(type_id: Optional[str], config_dict: Dict[str, Any]) -> 
     when the config_class can't be resolved — e.g. a subprocess service
     whose module imports its third-party SDK eagerly (arduino/pymata4,
     for instance). This is a best-effort net, not a type-driven
-    guarantee, for those cases — see docs/TODO_MESSAGING.md's "known
+    guarantee, for those cases — see packages/rlx_messaging/README.md's "known
     limitations" note. discord/slack/google_chat keep their SDK imports
     lazy specifically so the type-driven path resolves for them.
     """

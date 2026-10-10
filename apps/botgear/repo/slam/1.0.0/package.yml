@@ -1,7 +1,7 @@
 name: slam
 title: SLAM (2D mapping)
 description: |
-  Cheap 2D occupancy-grid mapping for worke — see docs/TODO_SLAM.md.
+  Cheap 2D occupancy-grid mapping for worke — see README.md.
   Fuses an ``oakd`` depth camera's decimated ``depth_sample`` topic (a
   2D "virtual laser scan" derived via known camera mount geometry + a
   flat-floor assumption) with open-loop dead-reckoning odometry from
@@ -11,7 +11,7 @@ description: |
   this version — the map WILL drift on long/complex traversals. A
   pluggable mapping-backend interface keeps a future drift-correcting
   backend (e.g. BreezySLAM, spiked and documented but deliberately not
-  used yet — see docs/TODO_SLAM.md §5.2a) a swap-in rather than a
+  used yet — see README.md § Mapping backends) a swap-in rather than a
   rewrite, once that's independently verified as viable on this robot's
   actual (possibly ARM) hardware.
 
@@ -99,5 +99,5 @@ wizard_config:
       - id: wheel_speed_calibration_m_per_s
         type: string
         title: Wheel speed calibration (m/s at output=1.0)
-        description: MUST be physically measured — drive a known distance at a known commanded output, divide. See docs/TODO_SLAM.md.
+        description: MUST be physically measured — drive a known distance at a known commanded output, divide. See README.md.
         default: "0.5"

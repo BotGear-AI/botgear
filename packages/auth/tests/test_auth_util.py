@@ -3,7 +3,9 @@ Tests for auth_util module.
 Tests authentication utilities including dual authentication and role-based access control.
 """
 
+import sys
 import pytest
+from types import ModuleType
 from unittest.mock import Mock, patch, MagicMock
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
@@ -14,6 +16,7 @@ from auth.auth_util import (
     generate_timestamp_id,
     AuthDependencies,
     create_auth_dependencies,
+    has_permission,
     no_auth_required,
     no_role_required
 )
@@ -150,12 +153,27 @@ class TestAuthDependencies:
     def test_get_current_user_or_service_valid_api_key(self, auth_deps):
         """Test authentication with valid API key."""
         result = auth_deps.get_current_user_or_service(x_api_key="test-secret-123")
-        
+
         assert result["id"] == "service"
         assert result["email"] == "service@service.internal"
         assert result["username"] == "service"
         assert result["roles"] == []  # Global fallback grants no roles
         assert result["auth_type"] == "shared_secret"
+
+    def test_get_current_user_or_service_sets_applog_context_when_available(self, auth_deps, monkeypatch):
+        """_resolved's applog import is optional (ImportError -> pass); when
+        the app does depend on applog, the resolved principal must still be
+        tagged onto the request-scoped log context."""
+        applog = ModuleType("applog")
+        applog.calls = []
+        applog.set_log_context = lambda **kw: applog.calls.append(kw)
+        monkeypatch.setitem(sys.modules, "applog", applog)
+
+        auth_deps.get_current_user_or_service(x_api_key="test-secret-123")
+
+        assert applog.calls == [{
+            "user_id": "service", "user_email": "service@service.internal", "tenant_id": None,
+        }]
     
     def test_get_current_user_or_service_invalid_api_key(self, auth_deps):
         """Test authentication with invalid API key."""
@@ -455,10 +473,79 @@ class TestRoleRequirement:
         """Test that require_role_or_service is an alias for require_role."""
         role_checker1 = auth_deps.require_role(["Admin"])
         role_checker2 = auth_deps.require_role_or_service(["Admin"])
-        
+
         # Both should be the same function type
         assert callable(role_checker1)
         assert callable(role_checker2)
+
+    def test_require_permission_auth_disabled(self, auth_deps):
+        permission_checker = auth_deps.require_permission(["volumes.write"])
+
+        mock_user = {"auth_type": "none"}
+        assert permission_checker(mock_user) == mock_user
+
+    def test_require_permission_no_permissions_required(self, auth_deps):
+        permission_checker = auth_deps.require_permission([])
+
+        mock_user = {"auth_type": "token", "roles": ["User"], "permissions": []}
+        assert permission_checker(mock_user) == mock_user
+
+    def test_require_permission_admin_bypass(self, auth_deps):
+        permission_checker = auth_deps.require_permission(["volumes.write"])
+
+        mock_user = {"auth_type": "token", "roles": ["Admin"], "permissions": []}
+        assert permission_checker(mock_user) == mock_user
+
+    def test_require_permission_matching_permission(self, auth_deps):
+        permission_checker = auth_deps.require_permission(["volumes.write"])
+
+        mock_user = {
+            "auth_type": "token", "roles": ["User"],
+            "permissions": ["volumes.read", "volumes.write"],
+        }
+        assert permission_checker(mock_user) == mock_user
+
+    def test_require_permission_insufficient_permissions(self, auth_deps):
+        permission_checker = auth_deps.require_permission(["volumes.write"])
+
+        mock_user = {"auth_type": "token", "roles": ["User"], "permissions": ["volumes.read"]}
+
+        with pytest.raises(HTTPException) as exc_info:
+            permission_checker(mock_user)
+
+        assert exc_info.value.status_code == 403
+
+    def test_require_permission_missing_permissions_key_is_none_safe(self, auth_deps):
+        permission_checker = auth_deps.require_permission(["volumes.write"])
+
+        mock_user = {"auth_type": "token", "roles": ["User"]}
+
+        with pytest.raises(HTTPException):
+            permission_checker(mock_user)
+
+    def test_require_permission_composes_with_a_base_dependency(self, auth_deps):
+        role_checker = auth_deps.require_role(["Editor"])
+        permission_checker = auth_deps.require_permission(["volumes.write"], base_dependency=role_checker)
+
+        mock_user = {
+            "auth_type": "token", "roles": ["Editor"],
+            "permissions": ["volumes.write"],
+        }
+        assert permission_checker(mock_user) == mock_user
+
+
+class TestHasPermission:
+    def test_admin_role_always_has_permission(self):
+        assert has_permission({"roles": ["Admin"], "permissions": []}, "volumes.write") is True
+
+    def test_matching_permission_is_present(self):
+        assert has_permission({"roles": ["User"], "permissions": ["volumes.write"]}, "volumes.write") is True
+
+    def test_missing_permission_is_absent(self):
+        assert has_permission({"roles": ["User"], "permissions": ["volumes.read"]}, "volumes.write") is False
+
+    def test_missing_roles_and_permissions_keys_are_none_safe(self):
+        assert has_permission({}, "volumes.write") is False
 
 
 class TestFactoryFunctions:

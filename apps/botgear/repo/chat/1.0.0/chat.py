@@ -9,7 +9,7 @@ developing conversation workflows on a dev box without hooking up STT
 + TTS.
 
 Implements the ``messaging`` capability (``implements: [messaging]`` in
-package.yml — see ``docs/TODO_MESSAGING.md``), the same wire contract
+package.yml — see ``packages/rlx_messaging/README.md``), the same wire contract
 ``discord``/``slack``/``google_chat`` implement, so any of them can
 stand in for chat in a brain workflow. chat satisfies it by hand (it's
 in-process, not a subclass of ``rlx_messaging.MessagingServiceBase`` —
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 class ChatConfig(ServiceConfig):
     """``default_channel``/``echo_own_messages`` exist purely for shape
     parity with ``rlx_messaging.MessagingConfig`` (see
-    docs/TODO_MESSAGING.md) — chat has no channel concept, so
+    packages/rlx_messaging/README.md) — chat has no channel concept, so
     ``default_channel`` is always ``None`` and ignored. Kept so a future
     generic "messaging config" UI panel doesn't need a chat-specific
     exception."""
@@ -144,7 +144,7 @@ class ChatService(Service):
         after two timeouts in a row).
 
         ``channel`` is accepted for shape parity with the ``messaging``
-        capability (docs/TODO_MESSAGING.md) — chat has no channels, so
+        capability (packages/rlx_messaging/README.md) — chat has no channels, so
         it's ignored and always echoed back as ``None``. ``bearing`` is
         reserved — the speech service would report an angle to the
         speaker; chat has no audio so it's None. Both are kept in the

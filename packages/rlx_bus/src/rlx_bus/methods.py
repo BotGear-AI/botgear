@@ -53,16 +53,11 @@ class MethodInfo:
 
     ``args_schema`` — optional hand-written JSON Schema for this
     method's arguments (``{"type": "object", "properties": {...}}``).
-    Subprocess services can't get real type-hint-derived schemas the
-    way in-process services do (``types_index.py::introspect_methods``
-    needs to ``import`` the class, impossible cross-venv) — every
-    subprocess method's schema is ``{}`` otherwise, which starves a
-    brain tool call of any argument guidance. See
-    docs/TODO_BRAIN_GAP_FIXES.md Gap 6 for the concrete failure this
-    caused (a model both hallucinating a phantom argument and guessing
-    a wrong default). This is a narrow, opt-in escape hatch, not real
-    introspection — pass it explicitly on methods a brain workflow
-    needs to call reliably.
+    Normally unnecessary: ``introspect.py`` derives the schema from the
+    signature on both transports. Pass one when the signature can't say
+    enough (bare ``**kwargs``, exotic types) or to tighten it — e.g.
+    ``additionalProperties: false`` to stop a model inventing arguments.
+    An explicit schema takes priority over the derived one.
     """
 
     name: str

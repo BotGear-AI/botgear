@@ -44,7 +44,7 @@ exit_on_phrase:
   case_insensitive: true
   whole_message: true
   # A list — any of the `messaging`-capability providers (see
-  # docs/TODO_MESSAGING.md) may be the one actually running.
+  # packages/rlx_messaging/README.md) may be the one actually running.
   listen_topic:
     - /chat/+/inbox
     - /discord/+/inbox

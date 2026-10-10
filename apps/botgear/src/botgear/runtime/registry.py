@@ -27,7 +27,9 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import platform
 import shutil
+import sys
 import tarfile
 import time
 import urllib.parse
@@ -70,6 +72,50 @@ class LoadError(RegistryError):
 
 class InstallError(RegistryError):
     """LOADED → INSTALLED transition failed."""
+
+
+class UnsupportedPlatformError(RegistryError):
+    """The catalog entry's ``os`` / ``arch`` allow-list excludes this host."""
+
+
+# ─── platform compatibility ──────────────────────────────────────────
+#
+# package.yml's optional ``os`` / ``arch`` allow-lists (see
+# repo/master_template/1.0.0/package.yml) ride through build_services.py
+# into catalog.yml. Absent or ``any`` means every host. Spellings are
+# normalized so ``aarch64`` matches ``arm64`` and ``amd64`` matches
+# ``x86_64``.
+
+_OS_ALIASES = {"darwin": "macos", "osx": "macos", "mac": "macos", "win32": "windows", "win": "windows"}
+_ARCH_ALIASES = {
+    "amd64": "x86_64", "x64": "x86_64",
+    "aarch64": "arm64", "armv8": "arm64",
+    "armv7l": "arm", "armv6l": "arm", "armhf": "arm",
+    "i386": "x86", "i686": "x86",
+}
+
+
+def _norm(value: str, aliases: Dict[str, str]) -> str:
+    v = str(value).strip().lower()
+    return aliases.get(v, v)
+
+
+def host_platform() -> tuple:
+    """This host as normalized ``(os, arch)``, e.g. ``("linux", "arm64")``."""
+    plat = sys.platform
+    os_name = "linux" if plat.startswith("linux") else plat
+    return _norm(os_name, _OS_ALIASES), _norm(platform.machine(), _ARCH_ALIASES)
+
+
+def platform_supported(entry: Dict[str, Any], host: Optional[tuple] = None) -> bool:
+    """True when a catalog version entry's ``os`` and ``arch`` allow-lists
+    both admit ``host`` (default: this machine)."""
+    host_os, host_arch = host or host_platform()
+    for field, have, aliases in (("os", host_os, _OS_ALIASES), ("arch", host_arch, _ARCH_ALIASES)):
+        allowed = {_norm(v, aliases) for v in (entry.get(field) or ["any"])}
+        if "any" not in allowed and have not in allowed:
+            return False
+    return True
 
 
 # ─── catalog fetch ───────────────────────────────────────────────────
@@ -426,12 +472,18 @@ def load(
     a fresh copy — useful for reset / corruption recovery. Existing
     ``.venv`` directories are NOT touched.
 
-    Raises ``CatalogError``, ``NotInCatalogError``, ``IntegrityError``,
-    or ``LoadError`` on failure.
+    Raises ``CatalogError``, ``NotInCatalogError``,
+    ``UnsupportedPlatformError``, ``IntegrityError``, or ``LoadError``.
     """
     repo_dir = Path(repo_dir).resolve()
     urls = _as_url_list(catalog_url, catalog_urls)
     entry, serving_url = find_in_catalogs(urls, name, version)
+    if not platform_supported(entry):
+        host_os, host_arch = host_platform()
+        raise UnsupportedPlatformError(
+            f"{name}@{version} does not support this host ({host_os}/{host_arch}); "
+            f"it runs on os={entry.get('os') or ['any']} arch={entry.get('arch') or ['any']}"
+        )
     archive = entry.get("archive")
     sha = entry.get("sha256")
     if not archive or not sha:

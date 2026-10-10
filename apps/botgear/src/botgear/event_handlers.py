@@ -65,6 +65,69 @@ def _bridge_jwt_secret() -> None:
         logger.info("auth: bridged BOTGEAR_JWT_SECRET → JWT_SECRET_KEY")
 
 
+def _ensure_jwt_secret(data_dir: Optional[str]) -> None:
+    """Give this install its own JWT signing secret when none is configured.
+
+    Without one, ``packages/auth`` falls back to a short public default that
+    every botgear install shares — so any botgear (or anyone who reads the
+    source) can mint Admin tokens this runtime accepts, and PyJWT warns about
+    the key length on every token. Generate 32 random bytes once, keep them
+    owner-readable under ``<data_dir>/security/jwt_secret``, and reuse them on
+    every start. An explicit ``JWT_SECRET_KEY`` / ``BOTGEAR_JWT_SECRET`` still
+    wins — set the same value on runtimes that should trust each other's tokens.
+
+    Packaged (frozen) builds only: source checkouts keep the shared default
+    (and its warning) so an existing source-run fleet that federates over it
+    keeps working until it sets a shared ``BOTGEAR_JWT_SECRET``. mDNS
+    auto-connect between installs then needs that shared secret or per-peer
+    pairing (``peer_manager``'s api_key path).
+    """
+    import os
+    import secrets
+    import sys
+    from auth.jwt_util import is_weak_jwt_secret
+
+    if not getattr(sys, "frozen", False) or not is_weak_jwt_secret():
+        return
+    path = Path(data_dir or "data") / "security" / "jwt_secret"
+    secret = ""
+    try:
+        secret = path.read_text().strip()
+    except OSError:
+        pass
+    if len(secret) < 64:
+        secret = secrets.token_hex(32)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(secret + "\n")
+        logger.info("auth: generated this install's JWT secret at %s", path)
+    os.environ["JWT_SECRET_KEY"] = secret
+
+
+def get_ssl_paths(settings) -> tuple:
+    """Where the self-signed HTTPS cert lives (server.py's get_ssl_paths hook).
+
+    ``ssl/`` under the working directory: ``apps/botgear/ssl/`` from source
+    (where botgear_ui's dev server looks for it) and ``var/ssl/`` in a
+    packaged build, beside the rest of the install's data — so it survives
+    reboots (no new cert, and no new browser warning, after every restart),
+    is carried across self-updates with ``var/``, and isn't shared with other
+    apps on the host the way the shared default under the temp dir is.
+    """
+    import os
+    ssl_dir = Path("ssl").resolve()
+    # Owner-only directory: the key file itself is written with the default
+    # umask (often group/world-readable), so the directory is what keeps it
+    # private.
+    ssl_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(ssl_dir, 0o700)
+    except OSError:
+        pass
+    return (ssl_dir / "cert.pem", ssl_dir / "key.pem")
+
+
 def on_startup():
     # Install the runtime-log ring buffer first so it captures the rest of
     # startup (the Logs page reads it via GET /v1/logs).
@@ -91,6 +154,7 @@ def on_startup():
 
 
     settings: BotgearConfig = get_settings()
+    _ensure_jwt_secret(getattr(settings, "data_dir", None))
 
     # Resolve + cache the runtime_id BEFORE anything that might call
     # ``get_runtime_id()`` with no args (in-process service base
@@ -118,7 +182,7 @@ def on_startup():
     if settings.database_type == "sqlite":
         # TinyDB/lowdb rewrites a whole table's JSON file on every write —
         # a process killed mid-write leaves a truncated file and the whole
-        # table unreadable (see TODO_SQLITE.md for the 2026-06-20 incident).
+        # table unreadable (it happened on 2026-06-20).
         # SQLite's own journal/WAL makes a torn write impossible: a crash
         # mid-transaction leaves either the prior committed state or the
         # new one, never a corrupt file.
@@ -398,6 +462,9 @@ def on_startup():
         logger.exception("runtime.types_index: failed to start publisher")
 
     logger.info("Application has started successfully.")
+
+    from botgear import startup_banner
+    startup_banner.schedule(settings, _read_version())
 
 
 def _publish_runtime_info(db: DatabaseAdapter, runtime_id: str, settings: BotgearConfig) -> None:

@@ -63,7 +63,7 @@ exit_on_phrase:
   whole_message: false
   # A list — audio (stt_local publishes every transcript, partial+final,
   # to /stt/{id}/text) or any of the `messaging`-capability providers
-  # (see docs/TODO_MESSAGING.md) may be the one actually running.
+  # (see packages/rlx_messaging/README.md) may be the one actually running.
   listen_topic:
     - /stt/+/text
     - /chat/+/inbox

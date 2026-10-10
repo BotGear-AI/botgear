@@ -4,7 +4,6 @@ from typing import List, Any, Optional, Literal, Dict
 import time
 import json
 import yaml
-from database.types import DateTimeStr
 
 class Message(BaseModel):
     id: Optional[str] = Field(None, description="Transcription Request ID - can be created by client or will be self generated", json_schema_extra={"example":"123e4567-e89b-12d3-a456-426614174000"})

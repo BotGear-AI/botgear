@@ -507,7 +507,7 @@ export default function SlamFullView({ proxy }: { proxy: ServiceProxy }) {
             label="motor_control"
             value={state.motor_control_connected ? '● connected' : '○ waiting'}
             valueClass={state.motor_control_connected ? 'text-emerald-400' : 'text-amber-400'}
-            hint="Odometry input — from motor_control's commanded output (no wheel encoders on this robot, see docs/TODO_SLAM.md)."
+            hint="Odometry input — motor_control's commanded output (no wheel encoders on this robot); the fallback when odometry_source is visual_flow."
           />
           <Field
             label="oakd"
@@ -515,7 +515,7 @@ export default function SlamFullView({ proxy }: { proxy: ServiceProxy }) {
             valueClass={state.oakd_connected ? 'text-emerald-400' : 'text-amber-400'}
             hint="Depth-scan input — from oakd's depth_sample topic (must have publish_depth_samples enabled)."
           />
-          <Field label="backend" value={state.mapping_backend ?? '—'} hint="Pluggable mapping backend — see docs/TODO_SLAM.md §5.2a. 'hand_rolled' has no drift correction by design." />
+          <Field label="backend" value={state.mapping_backend ?? '—'} hint="Pluggable mapping backend — 'hand_rolled' has no drift correction by design." />
           <Field label="map" value={state.map_size_m != null ? `${state.map_size_m}m @ ${state.map_resolution_m}m/cell` : '—'} />
           <Field label="pose" value={poseLabel} mono />
         </div>

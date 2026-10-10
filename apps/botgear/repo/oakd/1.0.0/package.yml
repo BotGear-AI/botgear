@@ -22,7 +22,7 @@ description: |
   Optional (off by default): ``publish_depth_samples`` publishes a
   low-rate, decimated, metric-millimeter depth grid on
   ``/oakd/{id}/depth_sample`` — feeds the ``slam`` service's 2D
-  occupancy mapping (docs/TODO_SLAM.md). Zero cost when left off.
+  occupancy mapping (repo/slam/1.0.0/README.md). Zero cost when left off.
 
   REQUIRES a one-time host udev rule before the device will open — see
   "OAK-D USB permissions" in AGENTS.md. Symptom without it: the service

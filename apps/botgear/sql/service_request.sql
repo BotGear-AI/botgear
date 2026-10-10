@@ -8,6 +8,10 @@ CREATE TABLE IF NOT EXISTS "service_request" (
     "action" TEXT,
     "service_meta_id" TEXT,
     "proxy_name" TEXT,
+    "new_name" TEXT,
+    "dry_run" BOOLEAN,
+    "rewrite_references" BOOLEAN,
+    "placeholder" BOOLEAN,
     "workspace_id" TEXT,
     "service_proxy_id" TEXT,
     "config" JSONB,
@@ -22,6 +26,10 @@ ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "id" TEXT;
 ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "action" TEXT;
 ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "service_meta_id" TEXT;
 ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "proxy_name" TEXT;
+ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "new_name" TEXT;
+ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "dry_run" BOOLEAN;
+ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "rewrite_references" BOOLEAN;
+ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "placeholder" BOOLEAN;
 ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "workspace_id" TEXT;
 ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "service_proxy_id" TEXT;
 ALTER TABLE "service_request" ADD COLUMN IF NOT EXISTS "config" JSONB;

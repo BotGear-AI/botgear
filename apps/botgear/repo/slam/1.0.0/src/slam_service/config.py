@@ -1,6 +1,6 @@
 # unmanaged
 """SlamConfig — robot dimensions, camera mount geometry, and odometry
-source. See docs/TODO_SLAM.md §5.1 for the full field-by-field
+source. See README.md § Configuration for the full field-by-field
 rationale; this is deliberately where all the "enrich the localization"
 knowledge lives, not in `oakd` (which stays camera-hardware-only)."""
 from __future__ import annotations
@@ -26,7 +26,7 @@ class SlamConfig(ServiceConfig):
     # ─── camera mount extrinsics, relative to robot center ─────────────
     # Meters/degrees. Must be physically measured once at mount time —
     # this is a one-time calibration, not something the software infers
-    # (see docs/TODO_SLAM.md §1's "known once, not detected per-frame").
+    # (see README.md § Ownership split's "known once, not detected per-frame").
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
     camera_height_m: float = 0.2
@@ -42,7 +42,7 @@ class SlamConfig(ServiceConfig):
 
     # ─── robot geometry ─────────────────────────────────────────────────
     footprint_radius_m: float = Field(
-        0.25, description="Circular footprint approximation used for obstacle inflation — see docs/TODO_SLAM.md §6."
+        0.25, description="Circular footprint approximation used for obstacle inflation — see README.md § Limitations"
     )
     track_width_m: float = Field(
         0.3, description="Distance between the two drive wheels — differential-drive kinematics."
@@ -52,8 +52,8 @@ class SlamConfig(ServiceConfig):
     odometry_source: Literal["motor_control", "visual_flow"] = Field(
         "motor_control",
         description="'motor_control' (default, unchanged v1 behavior) integrates commanded "
-                    "motor output — open-loop, no feedback, drifts on slip/stall (docs/TODO_SLAM.md "
-                    "§2/§6). 'visual_flow' (docs/TODO_SLAM.md §9, Phase 4b) instead estimates motion "
+                    "motor output — open-loop, no feedback, drifts on slip/stall (README.md "
+                    "§2/§6). 'visual_flow' (README.md § Visual odometry, Phase 4b) instead estimates motion "
                     "from oakd's feature_flow_sample via a Kabsch/RANSAC rigid-motion fit, falling "
                     "back to commanded dead-reckoning for any single tick where too few reliable "
                     "matches are found (§9.7) — motor_control is still subscribed in this mode "
@@ -63,7 +63,7 @@ class SlamConfig(ServiceConfig):
         8,
         description="RANSAC inlier floor below which a feature_flow_sample tick is treated as "
                     "unreliable and skipped in favor of the commanded-dead-reckoning fallback. "
-                    "Placeholder default — docs/TODO_SLAM.md §9.10 flags this as needing real-data "
+                    "Placeholder default — docs/TODO_SLAM.md flags this as needing real-data "
                     "tuning, not a researched constant.",
     )
     motor_control_proxy_id: Optional[str] = None
@@ -73,7 +73,7 @@ class SlamConfig(ServiceConfig):
         0.5,
         description="MUST be physically measured (drive a known distance at a known commanded "
                     "output, divide) — the software cannot infer this without additional sensing. "
-                    "See docs/TODO_SLAM.md §5.1/§6. Still used as the odometry source in "
+                    "See README.md § Configuration Still used as the odometry source in "
                     "'motor_control' mode, and as the visual-flow fallback's input in "
                     "'visual_flow' mode (§9.7).",
     )
@@ -119,7 +119,7 @@ class SlamConfig(ServiceConfig):
     map_size_m: float = Field(
         6.0,
         description="Fixed-size square grid, centered on the robot's pose at startup — see "
-                    "docs/TODO_SLAM.md §6. Sized to comfortably cover max_scan_range_m in every "
+                    "README.md § Limitations Sized to comfortably cover max_scan_range_m in every "
                     "direction plus room for the robot to move around within it before hitting the "
                     "(non-growing, by design) edge — not sized for the sensor's theoretical max "
                     "range, which this robot's mount angle doesn't actually reach usefully anyway.",
@@ -134,7 +134,7 @@ class SlamConfig(ServiceConfig):
     # ─── backend selection ──────────────────────────────────────────────
     mapping_backend: str = Field(
         "hand_rolled",
-        description="Which MappingBackend implementation to use — see docs/TODO_SLAM.md §5.2a. "
+        description="Which MappingBackend implementation to use — see README.md § Mapping backends "
                     "'hand_rolled' is the only implementation in v1.",
     )
 

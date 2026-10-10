@@ -2,7 +2,9 @@
 // Config interface for use across the project
 export interface Config {
   id?: string;
-  database_type: "postgres" | "lowdb" | "filesystem" | "none";
+  port?: number;
+  ssl_enabled?: boolean;
+  database_type: "postgres" | "lowdb" | "sqlite" | "filesystem" | "none";
   data_dir?: string;
   repo_dir?: string;
   repo_paths?: any;
@@ -17,14 +19,16 @@ export interface Config {
 export function createEmptyConfig(): Config {
   return {
     id: "default",
-    database_type: "lowdb",
+    port: 8998,
+    ssl_enabled: true,
+    database_type: "sqlite",
     data_dir: "data",
     repo_dir: "repo",
     repo_paths: undefined,
     registries: undefined,
     jwt_access_token_ttl_minutes: 1440,
     runtime_id: undefined,
-    registry_url: "file:///tmp/repo/catalog.yml",
+    registry_url: "https://github.com/BotGear-AI/botgear/releases/download/services/catalog.yml",
     update_repo: "BotGear-AI/botgear",
     auth_bootstrap: "first_user_claim",
   };
@@ -51,16 +55,27 @@ export const ConfigSchema = {
       "description": "Config record id (use 'default' for the singleton app config)",
       "example": "default"
     },
+    "port": {
+      "type": "integer",
+      "description": "HTTP(S) listen port. Overrides ConfigBase's generic 8001 default with botgear's assigned slot in the monorepo's port registry (tools/PORTS.md), so a fresh checkout doesn't collide with sibling apps run side-by-side.",
+      "example": 8998
+    },
+    "ssl_enabled": {
+      "type": "boolean",
+      "description": "Serve HTTPS/WSS using a self-signed cert (ssl/cert.pem, ssl/key.pem \u2014 auto-generated on first boot if missing). Overrides ConfigBase's default-off so a fresh clone matches botgear_ui's dev server, which auto-detects and reuses that same cert and derives ws vs wss from its own https/http choice \u2014 leaving this False while the UI has picked up an https cert breaks the WebSocket handshake (endless 'disconnected \u2014 retrying').",
+      "example": true
+    },
     "database_type": {
       "type": "string",
       "enum": [
         "postgres",
         "lowdb",
+        "sqlite",
         "filesystem",
         "none"
       ],
-      "description": "Database backend",
-      "example": "lowdb"
+      "description": "Database backend. sqlite is the default \u2014 lowdb/TinyDB rewrites a whole table's JSON file on every write, so a process killed mid-write (SIGKILL, crash) leaves a truncated, unreadable table; sqlite's journal/WAL makes that impossible.",
+      "example": "sqlite"
     },
     "data_dir": {
       "type": "string",
@@ -86,7 +101,7 @@ export const ConfigSchema = {
     "registries": {
       "description": "Ordered list of remote catalog.yml URLs searched for ABSENT types (those not present in any local repo root). The first registry that has a requested type@version serves it. Supports file:// (local mirror) and http(s)://. When empty/None, falls back to the single registry_url. Lets a runtime pull from the public registry plus a private mirror.",
       "example": [
-        "https://repo.botgear.ai/catalog.yml",
+        "https://github.com/BotGear-AI/botgear/releases/download/services/catalog.yml",
         "file:///tmp/repo/catalog.yml"
       ],
       "type": "array",
@@ -101,13 +116,13 @@ export const ConfigSchema = {
     },
     "runtime_id": {
       "type": "string",
-      "description": "Override the runtime's federation id (the adjective-noun handle peers address us by). Set via BOTGEAR_RUNTIME_ID in .env. When None, identity.py auto-generates + persists one to data/runtime_id.",
+      "description": "Override the runtime's federation id (the handle peers address us by; defaults to the sanitized machine hostname). Set via BOTGEAR_RUNTIME_ID in .env. When None, identity.py auto-generates + persists one to data/runtime_id.",
       "example": "funny-droid"
     },
     "registry_url": {
       "type": "string",
-      "description": "URL of the remote service registry's catalog.yml. The Registry API endpoints (/v1/registry/*) read from here; tools/publish_services.py --target local writes a catalog.yml that this default resolves against. Supports file:// (local mirror) and http(s):// (Phase 5 remote targets).",
-      "example": "file:///tmp/repo/catalog.yml"
+      "description": "URL of the remote service registry's catalog.yml, consulted for service types not present locally. Defaults to the public catalog published with each release to the BotGear-AI/botgear 'services' release. Supports file:// (a local mirror, e.g. file:///tmp/repo/catalog.yml from tools/publish_services.py --kind file) and http(s)://.",
+      "example": "https://github.com/BotGear-AI/botgear/releases/download/services/catalog.yml"
     },
     "update_repo": {
       "type": "string",
