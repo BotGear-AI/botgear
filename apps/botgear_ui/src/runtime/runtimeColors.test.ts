@@ -34,7 +34,7 @@ describe('runtimePrimary / runtimeMuted / runtimeFaint', () => {
   })
 
   it('usually assigns different runtimes different hues', () => {
-    const ids = ['worke', 'cerebellum', 'axon', 'dealflow', 'hyrule']
+    const ids = ['worke', 'cerebellum', 'axon', 'funny-droid', 'witty-gizmo']
     const hues = new Set(ids.map((id) => runtimePrimary(id)))
     // Not a uniqueness guarantee (it's a hash into 360 buckets) — just
     // confirms the function isn't secretly constant.

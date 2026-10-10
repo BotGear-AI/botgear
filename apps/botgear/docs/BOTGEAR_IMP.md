@@ -128,7 +128,7 @@ boot, serve `/health`, authenticate a user, persist `config`.
 
 1. Confirm `botgear.yml` declares `language_types: ["python", "typescript"]`
    and a paired UI app (e.g. `typescript_app: "botgear_ui"`) — see
-   `cannamatic_dutchie.yml` for the reference shape.
+   an existing `templates/apps/*.yml` that uses the flag for the reference shape.
 2. Run the generator:
    `python templates/create_app.py --app_name=botgear --javascript-models=botgear_ui`
 3. Wire `.env`, `docker-compose`, Postgres migrations from `sql/`.

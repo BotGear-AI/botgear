@@ -508,12 +508,13 @@ def create_crud_router(
     camel_case — When True the model is expected to have alias_generator=to_camel
                  and all routes are registered with response_model_by_alias=True so
                  GET responses are serialized with camelCase keys.  Use when the
-                 external API contract requires camelCase (e.g. Dutchie POS).
+                 external API contract requires camelCase (e.g. a vendor POS API).
 
     pascal_case — When True the model is expected to have alias_generator=to_pascal
                   and all routes are registered with response_model_by_alias=True so
                   GET responses are serialized with PascalCase keys.  Use when the
-                  external API contract requires PascalCase (e.g. METRC).
+                  external API contract requires PascalCase (e.g. a government
+                  reporting API).
                   Mutually exclusive with camel_case.
 
     list_at_root — When True the 'list' route is registered at the root slug with

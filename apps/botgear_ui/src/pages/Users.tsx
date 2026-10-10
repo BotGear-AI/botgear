@@ -10,7 +10,7 @@ import Banner from '../components/Banner'
 //
 // Kept deliberately small — botgear has a single role universe
 // ("Admin") and no multi-tenant, so this file is ~250 lines instead of
-// the 700+ in cannamatic_ui. The intent is the cannamatic file's good
+// the 700+ in a larger app's version. The intent is that file's good
 // idea minus the multi-tenant noise.
 
 interface UserDraft {

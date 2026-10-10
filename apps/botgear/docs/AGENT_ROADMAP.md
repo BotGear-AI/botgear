@@ -16,7 +16,7 @@ Last updated 2026-10-04. Status per phase is in [Roadmap](#roadmap).
 | [`repo/brain/1.0.0/README_ENGINE.md`](../repo/brain/1.0.0/README_ENGINE.md) | `WorkflowEngine` internals, guards, termination paths |
 | [`repo/brain/1.0.0/TODO.md`](../repo/brain/1.0.0/TODO.md) | brain's open engine questions |
 | [`packages/agent_harness/README.md`](../../../packages/agent_harness/README.md) | the harness: skills, workflows, drivers, checks |
-| [`docs/AGENT_HARNESS_COMPARISON.md`](../../../docs/AGENT_HARNESS_COMPARISON.md) (repo root) | how the harness was unified from dealflow + continuous_mfa |
+| [`docs/AGENT_HARNESS_COMPARISON.md`](../../../docs/AGENT_HARNESS_COMPARISON.md) (repo root) | how the harness was unified from two earlier apps |
 | [`AGENTS.md`](../AGENTS.md) § Runtime-wide HALT | the stop signal every agent must obey |
 
 ---
@@ -78,7 +78,7 @@ evaluation; rent the agent harness."
 - **No live tools:** the Claude Code driver runs with `--strict-mcp-config`
   and no MCP servers. Mid-run, an agent can only run the skill scripts it was
   handed. `Capabilities.mcp` exists but nothing uses it.
-- In production in dealflow and continuous_mfa. Not used by botgear.
+- In production in other cloudseeder apps. Not used by botgear.
 
 ### The gap
 
@@ -219,7 +219,7 @@ live state. (First task to confirm; see [Decisions](#open-decisions).)
   MCP refused; Claude Code gets an inline `--mcp-config` with `${NAME}`
   header refs (expanded by the CLI from the process env, verified live) and
   exact `mcp__<server>__<tool>` allowlists; checks receive the declared
-  secrets and their output is redacted. dealflow and continuous_mfa agent
+  secrets and their output is redacted. Other apps' agent
   tests unchanged.
 - **botgear** (now `repo/agent/1.0.0/`, see its README): the
   `robot-health` workflow (read-only tools only; facts.json + report.md),

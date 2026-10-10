@@ -288,7 +288,7 @@ class AppServer:
         if _configured_jwt_secret:
             os.environ["JWT_SECRET_KEY"] = _configured_jwt_secret
         # require_jwt_secret (DSL flag): True -> fail hard when the secret is weak
-        # (hyrule_api); False -> warn only and run on the fallback (localhost-first
+        # (apps that must never run on the fallback); False -> warn only and run on the fallback (localhost-first
         # default). Passing the flag explicitly means it's controlled by codegen,
         # not a deploy-time env var that can be forgotten.
         try:
@@ -624,8 +624,8 @@ class AppServer:
             user["totp_secret"] = secret
             user["is_mfa_enabled"] = True
             db.update_item("user", user_id, user)
-            # getattr: base_url is not a field on every app's Config (hyrule_api's
-            # has none), and a bare attribute access 500'd here AFTER the update
+            # getattr: base_url is not a field on every app's Config (some apps
+            # have none), and a bare attribute access 500'd here AFTER the update
             # above had already enabled MFA with a secret the caller never saw.
             uri = get_totp_uri(user_id, secret, getattr(self.settings, "base_url", None))
             return {"secret": secret, "otp_auth_url": uri}
@@ -1138,7 +1138,7 @@ class AppServer:
             This is the IdP-redirect half of sign-out (a top-level browser
             redirect). Since 00d78834 (2026-06-03) the SPA calls POST
             /v1/logout first and then follows this redirect
-            (apps/hyrule_ui/hooks/useAuth.tsx), and POST is what guarantees the
+            (the UI's sign-out hook), and POST is what guarantees the
             server-side teardown.
 
             This route purges too, but only for a caller it can verify, which in

@@ -85,7 +85,7 @@ async def run():
     # Diagnostics: Log config source for each setting - removed to avoid logging sensitive config values
     # logger.info("Configuration diagnostics:")
     # for field, value in settings.model_dump().items():
-    #     env_var_name = f"HYRULE_API_{field.upper()}"
+    #     env_var_name = f"APP_{field.upper()}"  # the app's env prefix
     #     config_val_str = str(value).strip()
     #     pre_dotenv_val = pre_dotenv_env.get(env_var_name)
     #     pre_dotenv_val_str = str(pre_dotenv_val).strip() if pre_dotenv_val is not None else None

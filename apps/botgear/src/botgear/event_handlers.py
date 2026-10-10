@@ -594,7 +594,7 @@ def on_first_user(user: dict, db) -> None:
 
     botgear grants the first claimer Admin. Other apps that opt into
     the same flow (via the ``auth_bootstrap: first_user_claim`` config
-    field) override this with their own role model — e.g. cannamatic
+    field) override this with their own role model — e.g. an app
     would assign ``["tenant_admin"]`` and link a tenant row here.
     """
     user["roles"] = ["Admin"]

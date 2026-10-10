@@ -8,7 +8,7 @@ shared secret in the ``X-API-Key`` request header. The packages/auth
 up in the api_client table and returns a synthetic principal whose ``roles``
 drive the same role gates as the JWT-authenticated path.
 
-NOTE on the DB call: the Postgres reference apps (continuous_mfa, hyrule_api)
+NOTE on the DB call: the Postgres-backed reference apps
 do this lookup with raw SQL (``db.query("select ... where secret = %s")``).
 botgear runs the lowdb / TinyDB backend by default, whose ``query()`` raises
 NotImplementedError — so the lookup here uses the backend-agnostic
